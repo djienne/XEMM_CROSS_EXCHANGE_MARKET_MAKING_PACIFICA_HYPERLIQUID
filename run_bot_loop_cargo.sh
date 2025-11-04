@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# XEMM Bot Continuous Runner (using cargo run)
+# Runs the bot in a loop using cargo run, waiting 20 seconds between cycles
+# Each cycle completes one fill + hedge, then the bot restarts
+#
+# This version rebuilds on each run (slower but picks up code changes)
+
+set -e  # Exit on error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+DELAY_SECONDS=20
+USE_RELEASE=true  # Set to false for debug builds
+
+# Build flag
+if [ "$USE_RELEASE" = true ]; then
+    BUILD_FLAG="--release"
+    BUILD_MODE="Release (optimized)"
+else
+    BUILD_FLAG=""
+    BUILD_MODE="Debug"
+fi
+
+echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}  XEMM Bot - Continuous Runner (cargo run)${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Build mode:${NC} ${BUILD_MODE}"
+echo -e "${BLUE}Delay between cycles:${NC} ${DELAY_SECONDS}s"
+echo -e "${YELLOW}Press Ctrl+C to stop${NC}"
+echo ""
+
+# Trap Ctrl+C to exit gracefully
+trap 'echo -e "\n${YELLOW}Stopping bot loop...${NC}"; exit 0' INT TERM
+
+# Cycle counter
+CYCLE=1
+
+# Main loop
+while true; do
+    echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}  Starting Cycle #${CYCLE}${NC}"
+    echo -e "${CYAN}  $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # Run the bot with cargo run
+    if cargo run $BUILD_FLAG; then
+        echo ""
+        echo -e "${GREEN}✓ Cycle #${CYCLE} completed successfully${NC}"
+    else
+        EXIT_CODE=$?
+        echo ""
+        echo -e "${RED}✗ Cycle #${CYCLE} failed with exit code ${EXIT_CODE}${NC}"
+        echo -e "${YELLOW}Continuing to next cycle after delay...${NC}"
+    fi
+
+    # Increment cycle counter
+    ((CYCLE++))
+
+    # Wait before next cycle
+    echo ""
+    echo -e "${BLUE}Waiting ${DELAY_SECONDS} seconds before next cycle...${NC}"
+    sleep $DELAY_SECONDS
+    echo ""
+done

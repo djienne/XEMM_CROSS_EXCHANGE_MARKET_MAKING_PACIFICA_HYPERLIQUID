@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python dashboard.py:*)",
+      "Bash(timeout 10 python:*)",
+      "Bash(pip install:*)",
+      "Bash(timeout 15 python:*)",
+      "Read(//c/Users/david/Desktop/FT/XEMM/xemm_js_saved/**)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

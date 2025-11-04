@@ -1,0 +1,2084 @@
+# API
+
+Welcome to Pacifica's API documentation. We offer complete REST and Websocket APIs to suit your trading needs. \
+\
+The documentation includes clear descriptions, parameter requirements, example responses, and code snippets to help developers quickly implement these endpoints in their applications.\
+\
+You can also use the API via the Pacifica Python SDK: <https://github.com/pacifica-fi/python-sdk>\
+\
+For any feedback, suggestions, and additional help with integration into Pacifica's API, please let us know in our [discord API channel](https://discord.com/channels/1325864651816435822/1378723526957334548)!\
+\\
+# API
+
+Welcome to Pacifica's API documentation. We offer complete REST and Websocket APIs to suit your trading needs. \
+\
+The documentation includes clear descriptions, parameter requirements, example responses, and code snippets to help developers quickly implement these endpoints in their applications.\
+\
+You can also use the API via the Pacifica Python SDK: <https://github.com/pacifica-fi/python-sdk>\
+\
+For any feedback, suggestions, and additional help with integration into Pacifica's API, please let us know in our [discord API channel](https://discord.com/channels/1325864651816435822/1378723526957334548)!\
+\\
+
+# Signing
+
+All POST requests require signing, whereas GET and websocket subscriptions do not.\
+\
+We *strongly* recommend following the [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk) to generate signatures and submit trading requests. The following example explains the key steps in constructing valid signatures.&#x20;
+
+# Signing
+
+All POST requests require signing, whereas GET and websocket subscriptions do not.\
+\
+We *strongly* recommend following the [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk) to generate signatures and submit trading requests. The following example explains the key steps in constructing valid signatures.&#x20;
+
+# Operation Types
+
+| Operation Type          | API Endpoint                          |
+| ----------------------- | ------------------------------------- |
+| `"create_order"`        | `/api/v1/orders/create`               |
+| `"create_stop_order"`   | `/api/v1/orders/stop/create`          |
+| `"cancel_order"`        | `/api/v1/orders/cancel`               |
+| `"cancel_all_orders"`   | `/api/v1/orders/cancel_all`           |
+| `"cancel_stop_order"`   | `/api/v1/orders/stop/cancel`          |
+| `"update_leverage"`     | `/api/v1/account/leverage`            |
+| `"update_margin_mode"`  | `/api/v1/account/margin`              |
+| `"set_position_tpsl"`   | `/api/v1/positions/tpsl`              |
+| `"withdraw"`            | `/api/v1/account/withdraw`            |
+| `"subaccount_initiate"` | `/api/v1/account/subaccount/create`   |
+| `"subaccount_confirm"`  | `/api/v1/account/subaccount/create`   |
+| `"create_market_order"` | `/api/v1/orders/create_market`        |
+| `"subaccount_transfer"` | `/api/v1/account/subaccount/transfer` |
+| `"bind_agent_wallet"`   | `/api/v1/agent/bind`                  |
+| `"create_api_key"`      | `/api/v1/account/api_keys/create`     |
+| `"revoke_api_key"`      | `/api/v1/account/api_keys/revoke`     |
+| `"list_api_keys"`       | `/api/v1/account/api_keys`            |
+
+Note: Pacifica's batch order endpoint does NOT have a corresponding operation type as all individual operations within the batch are signed independently with their own operation types.
+
+# Error Handling
+
+<table><thead><tr><th width="218">Error Message</th><th>Potential Causes</th></tr></thead><tbody><tr><td><code>"Invalid signature"</code></td><td><ul><li>Invalid signature format (not valid base58)</li><li>Signature bytes don't form a valid Ed25519 signature</li><li>Malformed signature data</li></ul></td></tr><tr><td><code>"Invalid message"</code></td><td><ul><li>Message has expired (timestamp + expiry_window &#x3C; current time)</li><li>Message cannot be serialized to JSON</li><li>Message structure is malformed</li></ul></td></tr><tr><td><code>"Invalid public key"</code></td><td><ul><li>Account address doesn't represent a valid Ed25519 public key</li><li>Public key bytes are malformed</li></ul></td></tr><tr><td><code>"Verification failed"</code></td><td><ul><li>Signature doesn't match the message content</li><li>Wrong private key was used to sign</li><li>Message content was modified after signing</li></ul></td></tr></tbody></table>
+
+While we have provided several different error message types in order to aid debugging, an incorrectly generated signed message is still relatively ambiguous when it comes to troubleshooting the root cause of the issue, making debugging more challenging.\
+\
+As such, the following guide and/or the [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk), when followed closely, should make signing relatively straightforward to implement.
+
+# API Agent Keys
+
+The signature verification process in both REST API and Websocket allow user generated API Agent Keys (also called "Agent Wallets") to sign on behalf of the original account. This is similar to the API Keys used for most leading exchanges. This way, API users can trade programmably without exposing the private key of the original wallet to the trading program.&#x20;
+
+### Generate API Agent Keys
+
+Agent wallets can be generated on the [frontend](https://app.pacifica.fi/apikey), or using this [Python SDK example](https://github.com/pacifica-fi/python-sdk/blob/main/rest/api_agent_keys.py#L31-L79).&#x20;
+
+### Use API Agent Keys
+
+For all POST requests, follow these steps in request construction
+
+* Still use the original wallet's public key for `account`,
+* Use API Agent Private Key to sign the message payload to generate `signature`, and&#x20;
+* Add `agent_wallet: [AGENT_WALLET_PUBLIC_KEY]` to the request header.
+
+As an example, this [Python SDK program](https://github.com/pacifica-fi/python-sdk/blob/main/rest/api_agent_keys.py#L81-L135) uses API Agent Key to place a market order.
+
+# Rate limits
+
+Pacifica implements IP and API Config Key based rate limiting.\
+\\
+
+**For REST API:**\\
+
+1. every IP address begins with 300 credits
+2. any http method except c used will decrement the credit by one (for now all requests have the same weighting)
+3. if user makes request while credit < 0, then return HTTP429
+4. credits reset back to 300 at the end of each 60 second interval
+5. cancellations use ½ credits\\
+
+**For Websocket API:**\\
+
+1. every IP address is limited to 300 concurrent WS connections.
+2. If an IP tries to exceed 300 connections, returns HTTP 429
+3. each connection is limited to 20 subscriptions per channel\\
+
+**Pacifica API Key:**
+
+For Websocket API, Pacifica also provides additional rate-limiting options via API Config Keys.\\
+
+\
+\\
+
+# API Config Keys
+
+Pacifica offers API Config Key rate limiting on APIs that allows for more flexible limits.\
+For more information around API Config Key limits, please reach out to us in the [Discord API channel](https://discord.com/channels/1325864651816435822/1378723526957334548).\
+\
+API Config Keys are generated via REST API. The Python SDK provides examples for how API Config Key can be generated, listed and revoked: <https://github.com/pacifica-fi/python-sdk/blob/main/rest/api_config_keys.py>.\
+\
+Each account can have up to 5 API Config Keys.
+
+```
+POST /api/v1/account/api_keys/create
+POST /api/v1/account/api_keys/revoke
+POST /api/v1/account/api_keys
+```
+
+#### Request Body:
+
+<table><thead><tr><th width="184">Field</th><th width="98">Type</th><th width="123">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><p></p><p><code>"expiry_window"</code></p></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+#### Response
+
+```json
+{
+  "data": {
+    "api_key": "AbCdEfGh_2mT8x..."
+  }
+}
+```
+
+Note:  \
+API Config Keys are generated with a prefix for fast lookup\
+Format: `"{8_char_prefix}_{base58_encoded_uuid}"`&#x20;
+
+### Using a Pacifica API Config Key
+
+Pacifica's API Config Keys are used to enhance websocket rate-limiting. The default rate for an API Config Key follows the same restrictions as IP-based rate limits.\
+\
+Pacifica API Config Keys are used in the connection header to specify API Config Key rate limiting. Using the Python SDK as an example,
+
+* for Websockets, add `extra_headers={"PF-API-KEY": "your_rate_limit_key"}`into `websockets.connect`&#x20;
+* for REST APIs, add `"PF-API-KEY": "your_rate_limit_key"` into `headers` with `{"Content-Type": "application/json"}`&#x20;
+
+# Market Symbols
+
+For example, `'BTC'` is the expected form in requests, whereas requests with symbol field `'Btc'` or`'btc'`  will fail.\
+\
+All markets symbols are capitalized, except for markets with abbreviated numerical prefixes such as `'kBONK'` and `'kPEPE'` , which have the prefix in lower-case. Requests containing symbol fields such as `'KBONK'`, `'kbonk'`, or `'kBonk'` will fail.
+
+# Market Symbols
+
+For example, `'BTC'` is the expected form in requests, whereas requests with symbol field `'Btc'` or`'btc'`  will fail.\
+\
+All markets symbols are capitalized, except for markets with abbreviated numerical prefixes such as `'kBONK'` and `'kPEPE'` , which have the prefix in lower-case. Requests containing symbol fields such as `'KBONK'`, `'kbonk'`, or `'kBonk'` will fail.
+
+# Market Symbols
+
+For example, `'BTC'` is the expected form in requests, whereas requests with symbol field `'Btc'` or`'btc'`  will fail.\
+\
+All markets symbols are capitalized, except for markets with abbreviated numerical prefixes such as `'kBONK'` and `'kPEPE'` , which have the prefix in lower-case. Requests containing symbol fields such as `'KBONK'`, `'kbonk'`, or `'kBonk'` will fail.
+
+
+# Markets
+
+- [Get market info](/api-documentation/api/rest-api/markets/get-market-info.md): This endpoint allows users to get exchange information, including market specifications for all available trading pairs.
+- [Get prices](/api-documentation/api/rest-api/markets/get-prices.md): This endpoint allows users to get price information for all symbols, including mark prices, funding rates, and market statistics.
+- [Get kline (candle) data](/api-documentation/api/rest-api/markets/get-kline-candle-data.md): This endpoint allows users to get historical price candles for a specific market and time interval.
+- [Get orderbook](/api-documentation/api/rest-api/markets/get-orderbook.md): This endpoint allows users to retrieve the current orderbook (bid/ask levels) for a specified trading symbol.
+- [Get recent trades](/api-documentation/api/rest-api/markets/get-recent-trades.md): This endpoint allows users to get recent trades for a specific market.
+- [Get historical funding](/api-documentation/api/rest-api/markets/get-historical-funding.md): This endpoint retrieves the historical funding for a particular symbol
+# Get market info
+
+```
+GET /api/v1/info
+```
+
+#### Response
+
+* Status 200: Success
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "symbol": "ETH",
+      "tick_size": "0.1",
+      "min_tick": "0",
+      "max_tick": "1000000",
+      "lot_size": "0.0001",
+      "max_leverage": 50,
+      "isolated_only": false,
+      "min_order_size": "10",
+      "max_order_size": "5000000",
+      "funding_rate": "0.0000125",
+      "next_funding_rate": "0.0000125"
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"tick_size"</code></td><td>decimal string</td><td>Tick size. All prices are denominated as a multiple of this.</td></tr><tr><td><code>"min_tick"</code></td><td>decimal string</td><td>Minimum tick. API submitted price cannot be below this value</td></tr><tr><td><code>"max_tick"</code></td><td>decimal string</td><td>Maximum tick. API submitted price cannot be above this value</td></tr><tr><td><code>"lot_size"</code></td><td>decimal string</td><td>Lot size. All order sizes (token denominated) are denominated as a multiple of this.</td></tr><tr><td><code>"max_leverage"</code></td><td>integer</td><td>Maximum leverage allowed on this symbol when opening positions</td></tr><tr><td><code>"isolated_only"</code></td><td>boolean</td><td>If the market is set to only allow isolated positions</td></tr><tr><td><code>"min_order_size"</code></td><td>decimal string</td><td>Minimum order size (denominated in USD)</td></tr><tr><td><code>"max_order_size"</code></td><td>decimal string</td><td>Maximum order size (denominated in USD)</td></tr><tr><td><code>"funding_rate"</code></td><td>decimal string</td><td>funding rate paid in the past funding epoch (hour)</td></tr><tr><td><code>"next_funding_rate"</code></td><td>decimal string</td><td>estimated funding rate to be paid in the next funding epoch (hour)</td></tr></tbody></table>
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```json
+import requests
+
+response = requests.get(
+    "/api/v1/info",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get market info
+
+```
+GET /api/v1/info
+```
+
+#### Response
+
+* Status 200: Success
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "symbol": "ETH",
+      "tick_size": "0.1",
+      "min_tick": "0",
+      "max_tick": "1000000",
+      "lot_size": "0.0001",
+      "max_leverage": 50,
+      "isolated_only": false,
+      "min_order_size": "10",
+      "max_order_size": "5000000",
+      "funding_rate": "0.0000125",
+      "next_funding_rate": "0.0000125"
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"tick_size"</code></td><td>decimal string</td><td>Tick size. All prices are denominated as a multiple of this.</td></tr><tr><td><code>"min_tick"</code></td><td>decimal string</td><td>Minimum tick. API submitted price cannot be below this value</td></tr><tr><td><code>"max_tick"</code></td><td>decimal string</td><td>Maximum tick. API submitted price cannot be above this value</td></tr><tr><td><code>"lot_size"</code></td><td>decimal string</td><td>Lot size. All order sizes (token denominated) are denominated as a multiple of this.</td></tr><tr><td><code>"max_leverage"</code></td><td>integer</td><td>Maximum leverage allowed on this symbol when opening positions</td></tr><tr><td><code>"isolated_only"</code></td><td>boolean</td><td>If the market is set to only allow isolated positions</td></tr><tr><td><code>"min_order_size"</code></td><td>decimal string</td><td>Minimum order size (denominated in USD)</td></tr><tr><td><code>"max_order_size"</code></td><td>decimal string</td><td>Maximum order size (denominated in USD)</td></tr><tr><td><code>"funding_rate"</code></td><td>decimal string</td><td>funding rate paid in the past funding epoch (hour)</td></tr><tr><td><code>"next_funding_rate"</code></td><td>decimal string</td><td>estimated funding rate to be paid in the next funding epoch (hour)</td></tr></tbody></table>
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```json
+import requests
+
+response = requests.get(
+    "/api/v1/info",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get kline (candle) data
+
+```
+/api/v1/kline
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol </td><td><code>BTC</code></td></tr><tr><td><code>"interval"</code></td><td>string</td><td>required</td><td>Candlestick interval<br>Valid values: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d</td><td><code>1m</code></td></tr><tr><td><code>"start_time"</code></td><td>integer</td><td>required</td><td>Start time in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"end_time"</code></td><td>integer</td><td>optional</td><td>End time in milliseconds, defaults to current time if not provided</td><td><code>1742243220000</code></td></tr></tbody></table>
+
+```
+/api/v1/kline?symbol=BTC&interval=1m&start_time=1742243160000&end_time=1742243220000
+```
+
+#### Response
+
+* Status 200: Successfully retrieved kline data
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "t": 1748954160000,
+      "T": 1748954220000,
+      "s": "BTC",
+      "i": "1m",
+      "o": "105376",
+      "c": "105376",
+      "h": "105376",
+      "l": "105376",
+      "v": "0.00022",
+      "n": 2
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+| Field | Type           | Description                                       |
+| ----- | -------------- | ------------------------------------------------- |
+| `'t'` | number         | Candle start time                                 |
+| `'T'` | number         | Candle end time                                   |
+| `'s'` | string         | Symbol                                            |
+| `'i'` | string         | Time interval of candles                          |
+| `'o'` | decimal string | Open price                                        |
+| `'c'` | decimal string | Close price                                       |
+| `'h'` | decimal string | High price                                        |
+| `'l'` | decimal string | Low price                                         |
+| `'v'` | decimal string | Volume                                            |
+| `'n'` | number         | Number of trades on Pacifica for specified symbol |
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/kline?symbol=BTC&interval=1m&start_time=1742243160000&end_time=1742243220000",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get orderbook
+
+```
+/api/v1/book
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol </td><td><code>BTC</code></td></tr><tr><td><code>"agg_level"</code></td><td>integer</td><td>no</td><td>Aggregation level for price grouping. Defaults to <code>1</code></td><td><code>1</code></td></tr></tbody></table>
+
+```
+api/v1/book?symbol=BTC
+```
+
+#### Response
+
+* Status 200: Successfully retrieved book data
+
+```json
+{
+  "success": true,
+  "data": {
+    "s": "BTC",
+    "l": [
+      [
+        {
+          "p": "106504",
+          "a": "0.26203",
+          "n": 1
+        },
+        {
+          "p": "106498",
+          "a": "0.29281",
+          "n": 1
+        }
+      ],
+      [
+        {
+          "p": "106559",
+          "a": "0.26802",
+          "n": 1
+        },
+        {
+          "p": "106564",
+          "a": "0.3002",
+          "n": 1
+        },
+      ]
+    ],
+    "t": 1751370536325
+  },
+  "error": null,
+  "code": null
+}
+```
+
+| Field | Type           | Description                                                                                              |
+| ----- | -------------- | -------------------------------------------------------------------------------------------------------- |
+| `'s'` | string         | Symbol                                                                                                   |
+| `'l'` | array          | Two-dimensional array containing bids (index 0) and asks (index 1). Each index contains up to 10 levels. |
+| `'t'` | string         | Response timestamp in milliseconds                                                                       |
+| `'p'` | decimal string | Price level                                                                                              |
+| `'a'` | decimal string | Total amount at price level                                                                              |
+| `'n'` | integer        | Number of orders at level                                                                                |
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "api.pacifica.fi/api/v1/book?symbol=BTC",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get recent trades
+
+```
+GET /api/v1/trades
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol </td><td><code>BTC</code></td></tr></tbody></table>
+
+```
+/api/v1/trades?symbol=BTC
+```
+
+#### Response
+
+* Status 200: Successfully retrieved recent trades
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "event_type": "fulfill_taker",
+      "price": "104721",
+      "amount": "0.0001",
+      "side": "close_long",
+      "cause": "normal",
+      "created_at": 1749289837752
+    }
+}
+```
+
+| Field          | Type           | Description                                                                                                                                                                                                                                                                                                                                            |
+| -------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `'event_type'` | string         | <p><code>"fulfill\_taker"</code> if maker<br><code>"fulfill\_maker"</code> if taker</p>                                                                                                                                                                                                                                                                |
+| `'price'`      | decimal string | Price in USD at which trade event has occurred                                                                                                                                                                                                                                                                                                         |
+| `'amount'`     | decimal string | Amount in token denomination for which the trade has occurred for.                                                                                                                                                                                                                                                                                     |
+| `'side'`       | string         | <p><code>"open\_long"</code><br><code>"open\_short"</code><br><code>"close\_long"</code><br><code>"close\_short"</code></p>                                                                                                                                                                                                                            |
+| `'cause'`      | string         | <p><code>"normal"</code> <br>regular user-initiated trading<br><code>"market\_liquidation"</code> position was liquidated due to insufficient margin<br><code>"backstop\_liquidation"</code> position was liquidated by backstop mechanism<br><code>"settlement"</code> <br>position was closed due to Auto-Deleveraging (ADL) or other settlement</p> |
+| `'created_at'` | integer        | Timestamp in milliseconds of trade event                                                                                                                                                                                                                                                                                                               |
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/trades?symbol=BTC",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get historical funding
+
+```
+GET /api/v1/funding_rate/history
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="239">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Market symbol to query </td><td><code>BTC</code></td></tr><tr><td><code>"limit"</code></td><td>integer</td><td>optional</td><td>Number of records to show (default 200, max 4000)</td><td><code>200</code></td></tr><tr><td><code>"offset"</code></td><td>integer</td><td>optional</td><td>Pagination to access older records. Default to 0</td><td><code>0</code></td></tr></tbody></table>
+
+```
+/api/v1/funding_rate/history?symbol=BTC&limit=200&offset=0
+```
+
+#### Response
+
+* Status 200: Successfully retrieved funding history
+
+```json
+{
+  "success": true,
+  "data": [ 
+    {
+      "oracle_price": "117170.410304",
+      "bid_impact_price": "117126",
+      "ask_impact_price": "117142",
+      "funding_rate": "0.0000125",
+      "next_funding_rate": "0.0000125",
+      "created_at": 1753806934249
+    },
+    ... 
+  ]
+}
+    
+```
+
+| Field                 | Type           | Description                                                                                                  |
+| --------------------- | -------------- | ------------------------------------------------------------------------------------------------------------ |
+| `'oracle_price'`      | decimal string | Oracle price used for [funding rate calculation](https://docs.pacifica.fi/trading-on-pacifica/funding-rates) |
+| `'bid_impact_price'`  | decimal string | Bid impact price at time of calculation (see funding rate docs)                                              |
+| `'ask_impact_price'`  | decimal string | Ask impact price at time of calculation (see funding rate docs)                                              |
+| `'funding_rate'`      | decimal string | Last settled funding rate                                                                                    |
+| `'next_funding_rate'` | decimal string | Predicted funding rate for next settlement                                                                   |
+| `'created_at'`        | integer        | Timestamp in milliseconds                                                                                    |
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/funding_rate/history?symbol=BTC,"
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Account
+
+- [Get account info](/api-documentation/api/rest-api/account/get-account-info.md): This endpoint allows users to get all high-level account info such as balance, fee level, equity, etc.
+- [Get account settings](/api-documentation/api/rest-api/account/get-account-settings.md): This endpoint allows users to get account margin and leverage settings (if they are not at default values)
+- [Update leverage](/api-documentation/api/rest-api/account/update-leverage.md): This endpoint allows users to change their account leverage for a specific trading pair. For open positions, users can only increase the leverage setting.
+- [Update margin mode](/api-documentation/api/rest-api/account/update-margin-mode.md): This endpoint allows users to switch between isolated and cross margin modes for a specific trading pair. For open positions, users cannot change the margin mode.
+- [Get positions](/api-documentation/api/rest-api/account/get-positions.md): This endpoint allows users to get current positions.
+- [Get trade history](/api-documentation/api/rest-api/account/get-trade-history.md)
+- [Get funding history](/api-documentation/api/rest-api/account/get-funding-history.md): This endpoint allows users to get funding history.
+- [Get account equity history](/api-documentation/api/rest-api/account/get-account-equity-history.md): This endpoint allows users to get account equity history (account equity over time).
+- [Get account balance history](/api-documentation/api/rest-api/account/get-account-balance-history.md): This endpoint allows users to get account balance history. Returns all balance effects that affects the queried account.
+- [Request withdrawal](/api-documentation/api/rest-api/account/request-withdrawal.md): This endpoint allows users to request withdrawal.
+# Account
+
+- [Get account info](/api-documentation/api/rest-api/account/get-account-info.md): This endpoint allows users to get all high-level account info such as balance, fee level, equity, etc.
+- [Get account settings](/api-documentation/api/rest-api/account/get-account-settings.md): This endpoint allows users to get account margin and leverage settings (if they are not at default values)
+- [Update leverage](/api-documentation/api/rest-api/account/update-leverage.md): This endpoint allows users to change their account leverage for a specific trading pair. For open positions, users can only increase the leverage setting.
+- [Update margin mode](/api-documentation/api/rest-api/account/update-margin-mode.md): This endpoint allows users to switch between isolated and cross margin modes for a specific trading pair. For open positions, users cannot change the margin mode.
+- [Get positions](/api-documentation/api/rest-api/account/get-positions.md): This endpoint allows users to get current positions.
+- [Get trade history](/api-documentation/api/rest-api/account/get-trade-history.md)
+- [Get funding history](/api-documentation/api/rest-api/account/get-funding-history.md): This endpoint allows users to get funding history.
+- [Get account equity history](/api-documentation/api/rest-api/account/get-account-equity-history.md): This endpoint allows users to get account equity history (account equity over time).
+- [Get account balance history](/api-documentation/api/rest-api/account/get-account-balance-history.md): This endpoint allows users to get account balance history. Returns all balance effects that affects the queried account.
+- [Request withdrawal](/api-documentation/api/rest-api/account/request-withdrawal.md): This endpoint allows users to request withdrawal.
+# Get account settings
+
+```
+GET /api/v1/account/settings
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Account address</td><td><code>42trU9A5...</code></td></tr></tbody></table>
+
+```
+/api/v1/account/settings?account=42trU9A5...
+```
+
+#### Response
+
+NOTE: Upon account creation, all markets have margin settings default to cross margin and leverage default to max. When querying this endpoint, all markets with default margin and leverage settings on this account will return blank.
+
+* Status 200: Successfully retrieved account settings
+
+```json
+  {
+  "success": true,
+  "data": [
+    {
+      "symbol": "WLFI",
+      "isolated": false,
+      "leverage": 5,
+      "created_at": 1758085929703,
+      "updated_at": 1758086074002
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"isolated"</code></td><td>boolean</td><td>If the account is set to isolated margining for this symbol</td></tr><tr><td><code>"leverage"</code></td><td>integer</td><td>Current leverage set by the user (default to max)</td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when these settings were adjusted from their default</td></tr><tr><td><code>"updated_at"</code></td><td>integer</td><td>Timestamp in milliseconds when these settings were last updated</td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/account/settings?account=42trU9A5...",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Update leverage
+
+```
+POST /api/v1/account/leverage
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content             |
+| ------------ | ------ | ------------------- |
+| `"type"`     | string | `"update_leverage"` |
+
+Request Body
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"leverage"</code></td><td>integer</td><td>required</td><td>New leverage value</td><td><code>10</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "symbol": "BTC",
+  "leverage": 10,
+  "timestamp": 1716200000000,
+  "expiry_window": 30000,
+  "agent_wallet": "69trU9A5...",
+  "signature": "5j1Vy9UqY..."
+}
+```
+
+#### Response
+
+* Status 200: Leverage updated successfully
+
+```json
+ {
+    "success": true
+  }
+```
+
+* Status 400: Invalid request parameters
+
+```json
+  {
+    "error": "Invalid leverage",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "leverage": 10
+}
+
+response = requests.post(
+    "/api/v1/account/leverage",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Update leverage
+
+```
+POST /api/v1/account/leverage
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content             |
+| ------------ | ------ | ------------------- |
+| `"type"`     | string | `"update_leverage"` |
+
+Request Body
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"leverage"</code></td><td>integer</td><td>required</td><td>New leverage value</td><td><code>10</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "symbol": "BTC",
+  "leverage": 10,
+  "timestamp": 1716200000000,
+  "expiry_window": 30000,
+  "agent_wallet": "69trU9A5...",
+  "signature": "5j1Vy9UqY..."
+}
+```
+
+#### Response
+
+* Status 200: Leverage updated successfully
+
+```json
+ {
+    "success": true
+  }
+```
+
+* Status 400: Invalid request parameters
+
+```json
+  {
+    "error": "Invalid leverage",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "leverage": 10
+}
+
+response = requests.post(
+    "/api/v1/account/leverage",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Get positions
+
+```
+GET /api/v1/positions
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Connected wallet address</td><td><code>42trU9A5...</code></td></tr></tbody></table>
+
+```
+/api/v1/positions?account=42trU9A5...
+```
+
+#### Response
+
+* Status 200: Successfully retrieved account information
+
+```json
+  {
+  "success": true,
+  "data": [
+    {
+      "symbol": "AAVE",
+      "side": "ask",
+      "amount": "223.72",
+      "entry_price": "279.283134",
+      "margin": "0", // only shown for isolated margin
+      "funding": "13.159593",
+      "isolated": false,
+      "created_at": 1754928414996,
+      "updated_at": 1759223365538
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"side"</code></td><td>string</td><td>Whether the position is long/short</td></tr><tr><td><code>"entry_price"</code></td><td>decimal string</td><td>Entry price of the position. Takes VWAP if position was opened by multiple trades executed at different prices.</td></tr><tr><td><code>"margin"</code></td><td>decimal string</td><td>Amount of margin allocated to an isolated position (only shown when isolated)</td></tr><tr><td><code>"funding"</code></td><td>decimal string</td><td>Funding paid by this position since open</td></tr><tr><td><code>"isolated"</code></td><td>boolean</td><td>If the position is opened in isolated margin mode</td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when these settings were adjusted from their default</td></tr><tr><td><code>"updated_at"</code></td><td>integer</td><td>Timestamp in milliseconds when these settings were last updated</td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/positions?account=42trU9A5...",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get trade history
+
+```
+GET /api/v1/positions/history
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>User's wallet address</td><td><code>42trU9A5...</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>optional</td><td>Market symbol to filter by</td><td><code>BTC</code></td></tr><tr><td><code>"start_time"</code></td><td>integer</td><td>optional</td><td>Start time in milliseconds</td><td><code>1625097600000</code></td></tr><tr><td><code>"end_time"</code></td><td>integer</td><td>optional</td><td>End time in milliseconds</td><td><code>1625184000000</code></td></tr><tr><td><code>"limit"</code></td><td>integer</td><td>optional</td><td>Maximum number of records to return, defaults to system defined limit</td><td><code>100</code></td></tr><tr><td><code>"offset"</code></td><td>integer</td><td>optional</td><td>Number of records to skip</td><td><code>0</code></td></tr></tbody></table>
+
+```
+/api/v1/positions/history?account=42trU9A5...&start_time=1625097600000&end_time=1625184000000&granularity_in_minutes=60&limit=100"
+```
+
+#### Response
+
+* Status 200: Successfully retrieved portfolio position history
+
+```json
+  {
+  "success": true,
+  "data": [
+    {
+      "history_id": 19329801,
+      "order_id": 315293920,
+      "client_order_id": "acf...",
+      "symbol": "LDO",
+      "amount": "0.1",
+      "price": "1.1904",
+      "entry_price": "1.176247",
+      "fee": "0",
+      "pnl": "-0.001415",
+      "event_type": "fulfill_maker",
+      "side": "close_short",
+      "created_at": 1759215599188,
+      "cause": "normal"
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"history_id"</code></td><td>integer</td><td>History id of trade</td></tr><tr><td><code>"order_id"</code></td><td>integer</td><td>Order id of order that resulted in the trade</td></tr><tr><td><code>"client_order_id"</code></td><td>UUID</td><td>CLOID of order that resulted in the trade</td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the trade event</td></tr><tr><td><code>"price"</code></td><td>decimal string</td><td>Current price of the specified symbol</td></tr><tr><td><code>"entry_price"</code></td><td>decimal string</td><td>Price at which the trade event was executed</td></tr><tr><td><code>"fee"</code></td><td>decimal string</td><td>Fee paid by the trade event</td></tr><tr><td><code>"pnl"</code></td><td>decimal string</td><td>PnL generated by the trade event</td></tr><tr><td><code>"event_type"</code></td><td>string</td><td><code>"fulfill_taker"</code> if maker<br><code>"fulfill_maker"</code> if taker</td></tr><tr><td><code>"side"</code></td><td>string</td><td><code>"open_long"</code><br><code>"open_short"</code><br><code>"close_long"</code><br><code>"close_short"</code></td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the trade event occurred</td></tr><tr><td><code>"cause"</code></td><td>string</td><td><code>"normal"</code> <br>regular user-initiated trading<br><code>"market_liquidation"</code> position was liquidated due to insufficient margin<br><code>"backstop_liquidation"</code> position was liquidated by backstop mechanism<br><code>"settlement"</code> <br>position was closed due to Auto-Deleveraging (ADL) or other settlement</td></tr></tbody></table>
+
+| Field          | Type   | Description                                                                                                                                                                                                                                                                                                                                            |
+| -------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `'event_type'` | string | <p><code>"fulfill\_taker"</code> if maker<br><code>"fulfill\_maker"</code> if taker</p>                                                                                                                                                                                                                                                                |
+| `'side'`       | string | <p><code>"open\_long"</code><br><code>"open\_short"</code><br><code>"close\_long"</code><br><code>"close\_short"</code></p>                                                                                                                                                                                                                            |
+| `'cause'`      | string | <p><code>"normal"</code> <br>regular user-initiated trading<br><code>"market\_liquidation"</code> position was liquidated due to insufficient margin<br><code>"backstop\_liquidation"</code> position was liquidated by backstop mechanism<br><code>"settlement"</code> <br>position was closed due to Auto-Deleveraging (ADL) or other settlement</p> |
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/positions/history?account=42trU9A5...&symbol=BTC&limit=100&offset=0",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get funding history
+
+```
+GET /api/v1/funding/history
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Trading pair symbol </td><td><code>42trU9A5...</code></td></tr><tr><td><code>"limit"</code></td><td>integer</td><td>optional</td><td>Maximum number of records to return default system defined limit</td><td><code>100</code></td></tr><tr><td><code>"offset"</code></td><td>integer</td><td>optional</td><td>Number of records to skip</td><td><code>0</code></td></tr></tbody></table>
+
+```
+/api/v1/funding/history?account=42trU9A5...&limit=100&offset=0
+```
+
+#### Response
+
+* Status 200: Successfully retrieved funding history
+
+```json
+  {
+  "success": true,
+  "data": [
+    {
+      "history_id": 2287920,
+      "symbol": "PUMP",
+      "side": "ask",
+      "amount": "39033804",
+      "payout": "2.617479",
+      "rate": "0.0000125",
+      "created_at": 1759222804122
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"history_id"</code></td><td>integer</td><td>History id of trade</td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"side"</code></td><td>string</td><td>If the position resulting in the funding payment was long or short (bid or ask)</td></tr><tr><td><code>"amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the position that resulted in the funding payment</td></tr><tr><td><code>"payout"</code></td><td>decimal string</td><td>Funding paid (in USD)</td></tr><tr><td><code>"rate"</code></td><td>decimal string</td><td>Funding rate that was used to calculate the payput</td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the funding payment was logged</td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/funding/history?account=42trU9A5...&limit=100&offset=0",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get funding history
+
+```
+GET /api/v1/funding/history
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Trading pair symbol </td><td><code>42trU9A5...</code></td></tr><tr><td><code>"limit"</code></td><td>integer</td><td>optional</td><td>Maximum number of records to return default system defined limit</td><td><code>100</code></td></tr><tr><td><code>"offset"</code></td><td>integer</td><td>optional</td><td>Number of records to skip</td><td><code>0</code></td></tr></tbody></table>
+
+```
+/api/v1/funding/history?account=42trU9A5...&limit=100&offset=0
+```
+
+#### Response
+
+* Status 200: Successfully retrieved funding history
+
+```json
+  {
+  "success": true,
+  "data": [
+    {
+      "history_id": 2287920,
+      "symbol": "PUMP",
+      "side": "ask",
+      "amount": "39033804",
+      "payout": "2.617479",
+      "rate": "0.0000125",
+      "created_at": 1759222804122
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"history_id"</code></td><td>integer</td><td>History id of trade</td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"side"</code></td><td>string</td><td>If the position resulting in the funding payment was long or short (bid or ask)</td></tr><tr><td><code>"amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the position that resulted in the funding payment</td></tr><tr><td><code>"payout"</code></td><td>decimal string</td><td>Funding paid (in USD)</td></tr><tr><td><code>"rate"</code></td><td>decimal string</td><td>Funding rate that was used to calculate the payput</td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the funding payment was logged</td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/funding/history?account=42trU9A5...&limit=100&offset=0",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get funding history
+
+```
+GET /api/v1/funding/history
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Trading pair symbol </td><td><code>42trU9A5...</code></td></tr><tr><td><code>"limit"</code></td><td>integer</td><td>optional</td><td>Maximum number of records to return default system defined limit</td><td><code>100</code></td></tr><tr><td><code>"offset"</code></td><td>integer</td><td>optional</td><td>Number of records to skip</td><td><code>0</code></td></tr></tbody></table>
+
+```
+/api/v1/funding/history?account=42trU9A5...&limit=100&offset=0
+```
+
+#### Response
+
+* Status 200: Successfully retrieved funding history
+
+```json
+  {
+  "success": true,
+  "data": [
+    {
+      "history_id": 2287920,
+      "symbol": "PUMP",
+      "side": "ask",
+      "amount": "39033804",
+      "payout": "2.617479",
+      "rate": "0.0000125",
+      "created_at": 1759222804122
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"history_id"</code></td><td>integer</td><td>History id of trade</td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"side"</code></td><td>string</td><td>If the position resulting in the funding payment was long or short (bid or ask)</td></tr><tr><td><code>"amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the position that resulted in the funding payment</td></tr><tr><td><code>"payout"</code></td><td>decimal string</td><td>Funding paid (in USD)</td></tr><tr><td><code>"rate"</code></td><td>decimal string</td><td>Funding rate that was used to calculate the payput</td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the funding payment was logged</td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/funding/history?account=42trU9A5...&limit=100&offset=0",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Request withdrawal
+
+```
+POST /api/v1/account/withdraw
+```
+
+#### Request Body
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"amount"</code></td><td>string</td><td>required</td><td>Amount to withdraw in USDC</td><td><code>100.50</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq...",
+  "timestamp": 1716200000000,
+  "amount": "100.50",
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000,
+}
+```
+
+#### Response
+
+* Status 200: Success
+
+```json
+ {
+    "success": true
+  }
+```
+
+* Status 400: Invalid request parameters
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "amount": "100.50"
+}
+
+response = requests.post(
+    "/api/v1/account/withdraw",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Subaccounts
+
+- [Create subaccount](/api-documentation/api/rest-api/subaccounts/create-subaccount.md): This endpoint allows regular accounts to create subaccounts with a secure authentication scheme. Both the main account and subaccount must sign to establish the relationship.
+- [Subaccount fund transfer](/api-documentation/api/rest-api/subaccounts/subaccount-fund-transfer.md): This endpoint allows transfer of funds between main and subaccounts
+# Create subaccount
+
+The subaccount creation process follows the below steps.
+
+1. The main account must authorize the creation of a subaccount under its control
+2. The subaccount must consent to being controlled by the main account
+3. The API server must verify both signatures to prevent unauthorized subaccount creation
+
+Please refer to the [Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/rest/create_subaccount.py) for a comprehensive guide on subaccount creation via API
+
+```
+POST /api/v1/account/subaccount/create
+```
+
+#### Request Body
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"main_account"</code></td><td>string</td><td>required</td><td>Main account wallet address</td><td><code>42trU9A5...</code></td></tr><tr><td><code>"subaccount"</code></td><td>string</td><td>required</td><td>Subaccount wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"main_signature"</code></td><td>string</td><td>required</td><td>Main account signature</td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"sub_signature"</code></td><td>string</td><td>required</td><td>Subaccount signature</td><td><code>4k2Wx8Zq...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "main_account": "42trU9A5...",
+  "subaccount": "69trU9A5...",
+  "main_signature": "5j1Vy9Uq...",
+  "sub_signature": "4k2Wx8Zq...",
+  "timestamp": 1716200000000,
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: Subaccount created successfully
+
+```json
+{
+  "success": true,
+  "data": null,
+  "error": null,
+  "code": null,
+}
+```
+
+* Status 400: Bad request
+
+```json
+{
+  "success": false,
+  "data": null,
+  "error": "Account already exists: CRTxBM...",
+  "code": 2
+}
+```
+
+* Status 500: Internal server error
+# Subaccount fund transfer
+
+Please refer to the [Python SDK](https://github.com/pacifica-fi/python-sdk/blob/main/rest/transfer_subaccount_fund.py) for a comprehensive guide on subaccount fund transfer via API
+
+```
+POST /api/v1/account/subaccount/transfer
+```
+
+#### Request Body
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Sender account address</td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td>Sender account signature</td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr><tr><td><code>"to_account"</code></td><td>string</td><td>required</td><td>Recipient wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"amount"</code></td><td>decimal string</td><td>required</td><td>Transfer amount (in USDC)</td><td><code>420.69</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "AwX6321...",
+  "signature": "65L9qPp...",
+  "timestamp": 1749228826313,
+  "expiry_window": 5000,
+  "to_account": "CRTxBM...",
+  "amount": "420.69"
+}
+```
+
+#### Response
+
+* Status 200: Subaccount created successfully
+
+```json
+Status Code: 200
+{
+  "success": true,
+  "data": {
+    "success": true,
+    "error": null
+  },
+  "error": null,
+  "code": null
+}
+```
+
+* Status 400: Bad request
+
+```json
+Status Code: 400
+{
+  "success": false,
+  "data": null,
+  "error": "Insufficient balance for AwX6321: 420.69 (account value: 336.9100000000000000000000)",
+  "code": 5
+}
+```
+
+* Status 500: Internal server error
+# Orders
+
+- [Create market order](/api-documentation/api/rest-api/orders/create-market-order.md): This endpoint allows users to create a new market order with optional take profit and stop loss levels.
+- [Create limit order](/api-documentation/api/rest-api/orders/create-limit-order.md): This endpoint allows users to create a new limit order with optional take profit and stop loss levels.
+- [Create stop order](/api-documentation/api/rest-api/orders/create-stop-order.md): This endpoint allows users to create stop order.
+- [Create position TP/SL](/api-documentation/api/rest-api/orders/create-position-tp-sl.md): This endpoint allows users to set take profit and stop loss levels for an existing position.
+- [Cancel order](/api-documentation/api/rest-api/orders/cancel-order.md): This endpoint allows users to cancel an existing order.
+- [Cancel all orders](/api-documentation/api/rest-api/orders/cancel-all-orders.md): This endpoint allows users to cancel all orders for all/given symbol(s).
+- [Cancel stop order](/api-documentation/api/rest-api/orders/cancel-stop-order.md): This endpoint allows users to cancel a stop order by its (CL)OID.
+- [Batch order](/api-documentation/api/rest-api/orders/batch-order.md): This endpoint allows users to submit multiple order operations in a single request. Batched orders are executed in the order they are batched in, and will not be split up by other users' orders.
+- [Get open orders](/api-documentation/api/rest-api/orders/get-open-orders.md): This endpoint allows users to get open orders on their account.
+- [Get order history](/api-documentation/api/rest-api/orders/get-order-history.md): This endpoint allows users to get a summarized order history.
+- [Get order history by ID](/api-documentation/api/rest-api/orders/get-order-history-by-id.md): This endpoint allows users to get order history by id.
+# Create market order
+
+```
+POST /api/v1/orders/create_market
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content                 |
+| ------------ | ------ | ----------------------- |
+| `"type"`     | string | `"create_market_order"` |
+
+#### Request Body
+
+<table><thead><tr><th width="194">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"amount"</code></td><td>string</td><td>required</td><td>Order amount</td><td><code>0.1</code></td></tr><tr><td><code>"side"</code></td><td>string</td><td>required</td><td>Order side (bid/ask)</td><td><code>bid</code></td></tr><tr><td><code>"slippage_percent"</code></td><td>string</td><td>required</td><td>Maximum slippage tolerance in percentage, e.g. "0.5" means 0.5% max slippage</td><td><code>0.5</code></td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>required</td><td>Whether the order is reduce-only</td><td><code>false</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID</td><td><code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"take_profit"</code></td><td>object</td><td>optional</td><td>Take profit stop order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required</td><td>Stop trigger price</td><td><code>55000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>54950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>e36ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"stop_loss"</code></td><td>object</td><td>optional</td><td>Stop loss order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required</td><td>Stop trigger price</td><td><code>48000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>47950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>d25ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq",
+  "timestamp": 1716200000000,
+  "symbol": "BTC",
+  "amount": "0.1",
+  "side": "bid",
+  "slippage_percent": "0.5",
+  "reduce_only": false,
+  "client_order_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "take_profit": {
+    "stop_price": "55000",
+    "limit_price": "54950",
+    "client_order_id": "e36ac10b-58cc-4372-a567-0e02b2c3d479"
+  },
+  "stop_loss": {
+    "stop_price": "48000",
+    "limit_price": "47950",
+    "client_order_id": "d25ac10b-58cc-4372-a567-0e02b2c3d479"
+  },
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: Order created successfully
+
+```json
+  {
+    "order_id": 12345
+  }
+```
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Invalid order parameters",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "amount": "0.1",
+    "side": "bid",
+    "slippage_percent": 1,
+    "reduce_only": False,
+    "client_order_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+}
+
+response = requests.post(
+    "/api/v1/orders/create_market",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Create market order
+
+```
+POST /api/v1/orders/create_market
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content                 |
+| ------------ | ------ | ----------------------- |
+| `"type"`     | string | `"create_market_order"` |
+
+#### Request Body
+
+<table><thead><tr><th width="194">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"amount"</code></td><td>string</td><td>required</td><td>Order amount</td><td><code>0.1</code></td></tr><tr><td><code>"side"</code></td><td>string</td><td>required</td><td>Order side (bid/ask)</td><td><code>bid</code></td></tr><tr><td><code>"slippage_percent"</code></td><td>string</td><td>required</td><td>Maximum slippage tolerance in percentage, e.g. "0.5" means 0.5% max slippage</td><td><code>0.5</code></td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>required</td><td>Whether the order is reduce-only</td><td><code>false</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID</td><td><code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"take_profit"</code></td><td>object</td><td>optional</td><td>Take profit stop order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required</td><td>Stop trigger price</td><td><code>55000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>54950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>e36ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"stop_loss"</code></td><td>object</td><td>optional</td><td>Stop loss order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required</td><td>Stop trigger price</td><td><code>48000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>47950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>d25ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq",
+  "timestamp": 1716200000000,
+  "symbol": "BTC",
+  "amount": "0.1",
+  "side": "bid",
+  "slippage_percent": "0.5",
+  "reduce_only": false,
+  "client_order_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "take_profit": {
+    "stop_price": "55000",
+    "limit_price": "54950",
+    "client_order_id": "e36ac10b-58cc-4372-a567-0e02b2c3d479"
+  },
+  "stop_loss": {
+    "stop_price": "48000",
+    "limit_price": "47950",
+    "client_order_id": "d25ac10b-58cc-4372-a567-0e02b2c3d479"
+  },
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: Order created successfully
+
+```json
+  {
+    "order_id": 12345
+  }
+```
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Invalid order parameters",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "amount": "0.1",
+    "side": "bid",
+    "slippage_percent": 1,
+    "reduce_only": False,
+    "client_order_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+}
+
+response = requests.post(
+    "/api/v1/orders/create_market",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Create stop order
+
+```
+POST /api/v1/orders/stop/create
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content               |
+| ------------ | ------ | --------------------- |
+| `"type"`     | string | `"create_stop_order"` |
+
+#### Request Body
+
+<table><thead><tr><th width="188">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"side"</code></td><td>string</td><td>required</td><td>Order side (bid/ask)</td><td><code>bid</code></td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>required</td><td>Whether the order is reduce-only</td><td><code>false</code></td></tr><tr><td><code>"stop_order"</code></td><td>object</td><td>required</td><td>Stop order configuration</td><td>See next four rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required</td><td>Stop trigger price</td><td><code>48000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>47950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>d25ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"amount"</code></td><td>string</td><td>required</td><td>Order amount</td><td><code>0.1</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq...",
+  "timestamp": 1716200000000,
+  "symbol": "BTC",
+  "side": "long",
+  "reduce_only": true,
+  "stop_order": {
+    "stop_price": "48000",
+    "limit_price": "47950",
+    "client_order_id": "d25ac10b-58cc-4372-a567-0e02b2c3d479",
+    "amount": "0.1"
+  },
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: Stop order created successfully
+
+```json
+  {
+    "order_id": 12345
+  }
+```
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Invalid stop order parameters",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "side": "long",
+    "reduce_only": True,
+    "stop_order": {
+        "stop_price": "48000",
+        "limit_price": "47950",
+        "amount": "0.1"
+    }
+}
+
+response = requests.post(
+    "/api/v1/orders/stop/create",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Create position TP/SL
+
+```
+POST /api/v1/positions/tpsl
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content               |
+| ------------ | ------ | --------------------- |
+| `"type"`     | string | `"set_position_tpsl"` |
+
+#### Request Body
+
+<table><thead><tr><th width="188">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"side"</code></td><td>string</td><td>required</td><td>Order side (bid/ask)</td><td><code>bid</code></td></tr><tr><td><code>"take_profit"</code></td><td>object</td><td>optional (if there is SL)</td><td>Take profit stop order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required</td><td>Stop trigger price</td><td><code>55000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>54950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>e36ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"stop_loss"</code></td><td>object</td><td>optional (if there is TP)</td><td>Stop loss order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required</td><td>Stop trigger price</td><td><code>48000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>47950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>d25ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq...",
+  "timestamp": 1716200000000,
+  "symbol": "BTC",
+  "side": "bid",
+  "take_profit": {
+    "stop_price": "55000",
+    "limit_price": "54950",
+    "client_order_id": "e36ac10b-58cc-4372-a567-0e02b2c3d479"
+  },
+  "stop_loss": {
+    "stop_price": "48000",
+    "limit_price": "47950",
+    "client_order_id": "d25ac10b-58cc-4372-a567-0e02b2c3d479"
+  },
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: Take profit and stop loss set successfully
+
+```json
+  {
+    "success": true
+  }
+```
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Position not found",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "side": "bid",
+    "take_profit": {
+        "stop_price": "55000",
+        "limit_price": "54950"
+    },
+    "stop_loss": {
+        "stop_price": "48000",
+        "limit_price": "47950"
+    }
+}
+
+response = requests.post(
+    "/api/v1/positions/tpsl",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Cancel order
+
+The [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/rest/cancel_order.py) provides a comprehensive example on using this endpoint.
+
+```
+POST /api/v1/orders/cancel
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content          |
+| ------------ | ------ | ---------------- |
+| `"type"`     | string | `"cancel_order"` |
+
+#### Request Body
+
+<table><thead><tr><th width="188">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"order_id"</code></td><td>integer</td><td>required (if no CLOID)</td><td>Exchange-assigned order ID</td><td><code>123</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>required (if no OID)</td><td>Client-defined order ID</td><td><code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq...",
+  "timestamp": 1716200000000,
+  "symbol": "BTC",
+  "order_id": 123,
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: Order cancelled successfully
+
+```json
+  {
+    "success": true
+  }
+```
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Order not found",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "order_id": 123
+}
+
+response = requests.post(
+    "/api/v1/orders/cancel",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Cancel all orders
+
+The [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/rest/cancel_all_orders.py) provides a comprehensive example on using this endpoint
+
+```
+POST /api/v1/orders/cancel_all
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content               |
+| ------------ | ------ | --------------------- |
+| `"type"`     | string | `"cancel_all_orders"` |
+
+#### Request Body
+
+<table><thead><tr><th width="184">Field</th><th width="98">Type</th><th width="123">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"all_symbols"</code></td><td>boolean</td><td>required</td><td>Whether to cancel orders for all symbols</td><td><code>true</code></td></tr><tr><td><code>"exclude_reduce_only"</code></td><td>boolean</td><td>required</td><td>Whether to exclude reduce-only orders</td><td><code>false</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required<br>(if all_symbols is false)</td><td>Trading pair symbol</td><td></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq...",
+  "timestamp": 1716200000000,
+  "all_symbols": true,
+  "exclude_reduce_only": false,
+  "symbol": "BTC",
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: All orders cancelled successfully
+
+```json
+  {
+    "cancelled_count": 5
+  }
+```
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Invalid parameters",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "all_symbols": True,
+    "exclude_reduce_only": False
+}
+
+response = requests.post(
+    "/api/v1/orders/cancel_all",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Cancel stop order
+
+```
+POST /api/v1/orders/stop/cancel
+```
+
+#### Operation Type (for signing)
+
+| Header Field | Type   | Content               |
+| ------------ | ------ | --------------------- |
+| `"type"`     | string | `"cancel_stop_order"` |
+
+#### Request Body
+
+<table><thead><tr><th width="188">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"order_id"</code></td><td>integer</td><td>required (if no CLOID)</td><td>Exchange-assigned order ID</td><td><code>123</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>required (if no OID)</td><td>Client-defined order ID</td><td><code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr></tbody></table>
+
+```json
+{
+  "account": "42trU9A5...",
+  "signature": "5j1Vy9Uq...",
+  "timestamp": 1716200000000,
+  "symbol": "BTC",
+  "order_id": 123,
+  "agent_wallet": "69trU9A5...",
+  "expiry_window": 30000
+}
+```
+
+#### Response
+
+* Status 200: Stop order cancelled successfully
+
+```json
+  {
+    "success": true
+  }
+```
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Stop order not found",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+payload = {
+    "account": "42trU9A5...",
+    "signature": "5j1Vy9Uq...",
+    "timestamp": 1716200000000,
+    "symbol": "BTC",
+    "order_id": 123
+}
+
+response = requests.post(
+    "/api/v1/orders/stop/cancel",
+    json=payload,
+    headers={"Content-Type": "application/json"}
+)
+
+data = response.json()
+```
+# Batch order
+
+The [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/rest/batch_orders.py) provides a comprehensive example on using this endpoint
+
+```
+POST /api/v1/orders/batch
+```
+
+#### Operation Type (for signing)
+
+<table><thead><tr><th width="220">Header Field</th><th width="123">Type</th><th>Content</th></tr></thead><tbody><tr><td>None</td><td>-</td><td>Batch orders are not signed as a whole, but rather by its individual actions components.</td></tr></tbody></table>
+
+#### Request Body
+
+<table><thead><tr><th width="118">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"actions"</code></td><td>array</td><td>required</td><td>List of order actions to perform<br><br>Each action has an "type" field and action-specific "data"</td><td>See next two rows</td></tr><tr><td><code>"type"</code></td><td>string</td><td>required</td><td>Specifies type of action. This is DIFFERENT to the "type" used in signature headers</td><td><p>"Create"<br>"Cancel"</p><p><br>(case sensitive)</p></td></tr><tr><td><code>"data"</code></td><td>object</td><td>required</td><td>Contains signed request payloads of individual "Create" or "Cancel" actions</td><td>See code block below. Messages and corresponding fields are identical to <a href="create-limit-order">create</a> and <a href="cancel-order">cancel</a> requests.</td></tr></tbody></table>
+
+```json
+{
+   "actions":[
+      {
+         "type":"Create",
+         "data":{
+            "account":"42trU9A5...",
+            "signature":"5UpRZ14Q...",
+            "timestamp":1749190500355,
+            "expiry_window":5000,
+            "symbol":"BTC",
+            "price":"100000",
+            "reduce_only":false,
+            "amount":"0.1",
+            "side":"bid",
+            "tif":"GTC",
+            "client_order_id":"57a5efb1-bb96-49a5-8bfd-f25d5f22bc7e"
+         }
+      },
+      {
+         "type":"Cancel",
+         "data":{
+            "account":"42trU9A5...",
+            "signature":"4NDFHyTG...",
+            "timestamp":1749190500355,
+            "expiry_window":5000,
+            "symbol":"BTC",
+            "order_id":42069
+         }
+      }
+   ]
+}
+```
+
+#### Response
+
+* Status 200: Batch operations processed successfully
+
+<pre class="language-json"><code class="lang-json">{
+  "success": true,
+  "data": {
+    "results": [
+      {
+        "success": true,
+        "order_id": 470506,
+        "error": null
+      },
+      {
+        "success": true,
+      }
+    ]
+  },
+    "error": null,
+    "code": null
+<strong>}
+</strong></code></pre>
+
+* Status 400: Bad request
+
+```json
+  {
+    "error": "Invalid batch operation parameters",
+    "code": 400
+  }
+```
+
+* Status 500: Internal server error
+# Get open orders
+
+```
+GET /api/v1/orders
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Account address to filter orders</td><td><code>42trU9A5...</code></td></tr></tbody></table>
+
+```
+/api/v1/orders?account=42trU9A5...
+```
+
+#### Response
+
+* Status 200: Successfully retrieved open orders
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "order_id": 315979358,
+      "client_order_id": "add9a4b5-c7f7-4124-b57f-86982d86d479",
+      "symbol": "ASTER",
+      "side": "ask",
+      "price": "1.836",
+      "initial_amount": "85.33",
+      "filled_amount": "0",
+      "cancelled_amount": "0",
+      "stop_price": null,
+      "order_type": "limit",
+      "stop_parent_order_id": null,
+      "reduce_only": false,
+      "created_at": 1759224706737,
+      "updated_at": 1759224706737
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"order_id"</code></td><td>integer</td><td>Order id assigned to order </td></tr><tr><td><code>"client_order_id"</code></td><td>UUID</td><td>CLOID of order if assigned by user</td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"side"</code></td><td>string</td><td>Whether the order is a bid or an ask</td></tr><tr><td><code>"price"</code></td><td>decimal string</td><td>Price set by the order</td></tr><tr><td><code>"initial_amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed</td></tr><tr><td><code>"filled_amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed that has been filled</td></tr><tr><td><code>"cancelled_amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed that has been cancelled</td></tr><tr><td><code>"stop_price"</code></td><td>decimal string</td><td>Stop price assigned upon order creation for subsequent position if order is filled if specified by user.</td></tr><tr><td><code>"order_type"</code></td><td>string</td><td><code>"limit"</code><br><code>"market"</code><br><code>"stop_limit"</code><br><code>"stop_market"</code><br><code>"take_profit_limit"</code><br><code>"stop_loss_limit"</code><br><code>"take_profit_market"</code><br><code>"stop_loss_market"</code></td></tr><tr><td><code>"stop_parent_order_id"</code></td><td>integer</td><td>Order id of stop order attached to original order</td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>If the order is reduce only</td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the order was created on Pacifica</td></tr><tr><td><code>"updated_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the order was last modified (by a fill)</td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/orders?account=42trU9A5...",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get order history
+
+```
+GET /api/v1/orders/history
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"account"</code></td><td>string</td><td>required</td><td>Account address to filter orders</td><td><code>42trU9A5...</code></td></tr><tr><td><code>"limit"</code></td><td>integer</td><td>optional</td><td>Maximum number of records to return default system defined limit</td><td><code>100</code></td></tr></tbody></table>
+
+```
+/api/v1/orders/history?account=42trU9A5...&limit=100
+```
+
+#### Response
+
+* Status 200: Successfully retrieved order history
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "order_id": 315992721,
+      "client_order_id": "ade",
+      "symbol": "XPL",
+      "side": "ask",
+      "initial_price": "1.0865",
+      "average_filled_price": "0",
+      "amount": "984",
+      "filled_amount": "0",
+      "order_status": "open",
+      "order_type": "limit",
+      "stop_price": null,
+      "stop_parent_order_id": null,
+      "reduce_only": false,
+      "reason": null,
+      "created_at": 1759224893638,
+      "updated_at": 1759224893638
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"order_id"</code></td><td>integer</td><td>Order id assigned to order </td></tr><tr><td><code>"client_order_id"</code></td><td>UUID</td><td>CLOID of order if assigned by user</td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"side"</code></td><td>string</td><td>Whether the order is a bid or an ask</td></tr><tr><td><code>"price"</code></td><td>decimal string</td><td>Price set by the order</td></tr><tr><td><code>"initial_price"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed</td></tr><tr><td><code>"average_filled_price"</code></td><td>decimal string</td><td>VWAP of price at which the order was filled at</td></tr><tr><td><code>"amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed </td></tr><tr><td><code>"filled_amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed that was filled</td></tr><tr><td><code>"order_status"</code></td><td>string</td><td><code>"open"</code><br><code>"partially_filled"</code><br><code>"filled"</code><br><code>"cancelled"</code><br><code>"rejected"</code></td></tr><tr><td><code>"order_type"</code></td><td>string</td><td><code>"limit"</code><br><code>"market"</code><br><code>"stop_limit"</code><br><code>"stop_market"</code><br><code>"take_profit_limit"</code><br><code>"stop_loss_limit"</code><br><code>"take_profit_market"</code><br><code>"stop_loss_market"</code></td></tr><tr><td><code>"stop_price"</code></td><td>decimal string</td><td>Stop price assigned upon order creation for subsequent position if order is filled if specified by user.</td></tr><tr><td><code>"stop_parent_order_id"</code></td><td>integer</td><td>Order id of stop order attached to original order</td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>If the order is reduce only</td></tr><tr><td><code>"reason"</code></td><td>string</td><td>Provides reason for an order being <code>"cancelled"</code> or <code>"rejected"</code>:<br><code>"cancel"</code><br><code>"force_cancel"</code><br><code>"expired"</code><br><code>"post_only_rejected"</code><br><code>"self_trade_prevented"</code></td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the order was created on Pacifica</td></tr><tr><td><code>"updated_at"</code></td><td>integer</td><td>Timestamp in milliseconds when any of the order was last modified </td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/orders/history?account=42trU9A5...&limit=100&offset=0",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```
+# Get order history by ID
+
+```
+GET /api/v1/orders/history_by_id
+```
+
+#### Query Parameters
+
+<table><thead><tr><th width="176">Field</th><th width="98">Type</th><th width="95">Need</th><th width="189">Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"order_id"</code></td><td>integer</td><td>required</td><td>Order ID to retrieve history for</td><td><code>13753364</code></td></tr></tbody></table>
+
+```
+/api/v1/orders/history_by_id?order_id=13753364
+```
+
+#### Response
+
+* Status 200: Successfully retrieved open orders
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "history_id": 641452639,
+      "order_id": 315992721,
+      "client_order_id": "ade1aa6...",
+      "symbol": "XPL",
+      "side": "ask",
+      "price": "1.0865",
+      "initial_amount": "984",
+      "filled_amount": "0",
+      "cancelled_amount": "984",
+      "event_type": "cancel",
+      "order_type": "limit",
+      "order_status": "cancelled",
+      "stop_price": null,
+      "stop_parent_order_id": null,
+      "reduce_only": false,
+      "created_at": 1759224895038
+    },
+    {
+      "history_id": 641452513,
+      "order_id": 315992721,
+      "client_order_id": "ade1aa6...",
+      "symbol": "XPL",
+      "side": "ask",
+      "price": "1.0865",
+      "initial_amount": "984",
+      "filled_amount": "0",
+      "cancelled_amount": "0",
+      "event_type": "make",
+      "order_type": "limit",
+      "order_status": "open",
+      "stop_price": null,
+      "stop_parent_order_id": null,
+      "reduce_only": false,
+      "created_at": 1759224893638
+    }
+  ],
+  "error": null,
+  "code": null
+}
+```
+
+<table><thead><tr><th width="208">Field</th><th width="186">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>"history_id"</code></td><td>integer</td><td>History ID assigned to the order</td></tr><tr><td><code>"order_id"</code></td><td>integer</td><td>Order ID assigned to order </td></tr><tr><td><code>"client_order_id"</code></td><td>UUID</td><td>CLOID of order if assigned by user</td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>Trading pair symbol</td></tr><tr><td><code>"side"</code></td><td>string</td><td>Whether the order is a bid or an ask</td></tr><tr><td><code>"price"</code></td><td>decimal string</td><td>Price set by the order</td></tr><tr><td><code>"initial_amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed </td></tr><tr><td><code>"filled_amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed that was filled</td></tr><tr><td><code>"cancelled_amount"</code></td><td>decimal string</td><td>Amount (in token denomination) of the order placed that was cancelled</td></tr><tr><td><code>"event_type"</code></td><td>decimal string</td><td>Make if user was on maker side.<br>Take if on taker.</td></tr><tr><td><code>"order_type"</code></td><td>string</td><td><code>"limit"</code><br><code>"market"</code><br><code>"stop_limit"</code><br><code>"stop_market"</code><br><code>"take_profit_limit"</code><br><code>"stop_loss_limit"</code><br><code>"take_profit_market"</code><br><code>"stop_loss_market"</code></td></tr><tr><td><code>"order_status"</code></td><td>string</td><td><code>"open"</code><br><code>"partially_filled"</code><br><code>"filled"</code><br><code>"cancelled"</code><br><code>"rejected"</code></td></tr><tr><td><code>"stop_price"</code></td><td>decimal string</td><td>Stop price assigned upon order creation for subsequent position if order is filled if specified by user.</td></tr><tr><td><code>"stop_parent_order_id"</code></td><td>integer</td><td>Order id of stop order attached to original order</td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>If the order is reduce only</td></tr><tr><td><code>"created_at"</code></td><td>integer</td><td>Timestamp in milliseconds when the order was created on Pacifica</td></tr></tbody></table>
+
+* Status 400: Invalid request parameters
+* Status 401: Unauthorized access
+* Status 500: Internal server error
+
+#### Code Example (Python)
+
+```python
+import requests
+
+response = requests.get(
+    "/api/v1/orders/history_by_id?order_id=13753364",
+    headers={"Accept": "*/*"},
+)
+
+data = response.json()
+```

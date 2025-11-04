@@ -1,0 +1,61 @@
+services:
+  xemm-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xemm-bot:latest
+    container_name: xemm-bot
+    restart: unless-stopped
+
+    # Graceful shutdown: give bot time to cancel orders
+    stop_grace_period: 15s
+    
+    # Environment variables (loaded from .env file)
+    env_file:
+      - .env
+    
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    
+    # Volume mounts
+    volumes:
+      # Mount config file
+      - ./config.json:/app/config.json:ro
+      # Mount .env file for credentials
+      - ./.env:/app/.env:ro
+      # Mount logs directory (optional)
+      - ./logs:/app/logs
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Health check (optional - checks if process is running)
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "xemm_bot"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Network mode (use host network or create custom network)
+    # network_mode: "host"  # Uncomment if you need host network access
+    
+    # Resource limits (optional - adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+# Optional: Create a custom network
+# networks:
+#   xemm-network:
+#     driver: bridge
