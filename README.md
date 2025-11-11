@@ -200,7 +200,7 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `pacifica_maker_fee_bps` | 1.5 | Pacifica maker fee in basis points |
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
-| `profit_rate_bps` | 10.0 | Target profit in basis points (0.1%) |
+| `profit_rate_bps` | 15.0 | Target profit in basis points (0.1%) |
 | `order_notional_usd` | 20.0 | Order size in USD |
 | `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates ±3 bps |
 | `order_refresh_interval_secs` | 30 | Auto-cancel orders older than 30s |
