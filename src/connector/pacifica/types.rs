@@ -268,6 +268,18 @@ pub enum FillEvent {
         reason: String,
         timestamp: u64,
     },
+    /// Fill detected from position change (redundancy layer)
+    PositionFill {
+        symbol: String,
+        side: String,              // "buy" or "sell" (derived from position delta)
+        filled_amount: String,     // Absolute value of position delta
+        avg_price: String,         // Entry price from position
+        timestamp: u64,
+        position_delta: String,    // Signed position change for diagnostics
+        prev_position: String,     // Previous position size
+        new_position: String,      // New position size
+        cross_validated: bool,     // Whether fill was also detected by order updates
+    },
 }
 
 impl OrderUpdate {
@@ -392,4 +404,62 @@ pub struct WsErrorResponse {
     pub t: i64,
     #[serde(rename = "type")]
     pub response_type: String,
+}
+
+// ═══════════════════════════════════════════════════
+// Account Positions WebSocket
+// ═══════════════════════════════════════════════════
+
+/// Account positions subscription parameters
+#[derive(Debug, Serialize)]
+pub struct AccountPositionsParams {
+    pub source: String,
+    pub account: String,
+}
+
+/// Account positions subscription message
+#[derive(Debug, Serialize)]
+pub struct AccountPositionsSubscribe {
+    pub method: String,
+    pub params: AccountPositionsParams,
+}
+
+impl AccountPositionsSubscribe {
+    pub fn new(account: String) -> Self {
+        Self {
+            method: "subscribe".to_string(),
+            params: AccountPositionsParams {
+                source: "account_positions".to_string(),
+                account,
+            },
+        }
+    }
+}
+
+/// Position data from WebSocket stream
+#[derive(Debug, Clone, Deserialize)]
+pub struct PositionData {
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "a")]
+    pub amount: String,         // Position size (always positive)
+    #[serde(rename = "p")]
+    pub entry_price: String,    // Average entry price
+    #[serde(rename = "t")]
+    pub timestamp: u64,         // Timestamp in milliseconds
+    #[serde(rename = "d")]
+    pub side: String,           // "bid" (long) or "ask" (short)
+    #[serde(rename = "m")]
+    pub margin: String,         // Position margin
+    #[serde(rename = "f")]
+    pub funding: String,        // Funding fee
+    #[serde(rename = "i")]
+    pub isolated: bool,         // Is isolated position
+}
+
+/// Account positions response
+#[derive(Debug, Deserialize)]
+pub struct AccountPositionsResponse {
+    pub channel: String,
+    pub data: Vec<PositionData>,
 }
