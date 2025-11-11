@@ -1,6 +1,19 @@
-# XEMM Rust - Cross-Exchange Market Making Bot
+# XEMM Rust - Cross-Exchange Market Making Bot on Pacifica (Maker) and Hyperliquid (Taker)
 
 A high-performance Rust trading bot that performs single-cycle arbitrage between Pacifica (maker) and Hyperliquid (taker). The bot continuously monitors orderbook feeds from both exchanges, places limit orders on Pacifica when profitable opportunities arise, and immediately hedges fills on Hyperliquid.
+The main rationale is to use Hyperliquid's better liquidity, namely lower spreads, to do arbitrage trades on Pacifica immediately hedged on Hyperliquid.
+
+**💰 Support this project**:
+- **Hyperliquid**: Sign up with [this referral link](https://app.hyperliquid.xyz/join/FREQTRADE) for 10% fee reduction
+- **Pacifica**: Sign up at [app.pacifica.fi](https://app.pacifica.fi/) and use one of the following referral codes when registering (if one is already taken, try another):
+  ```
+  411J9J7CYNFZN3SX
+  2K7D40A9H53M2TJT
+  S1G3A2063Q7410BV
+  5KH0XDRD8BDGTBCT
+  S1YHDS2GWAJTWJ4M
+  7KB69JEC3BSA6GTR
+  ```
 
 ## Features
 
@@ -86,7 +99,7 @@ Edit `config.json`:
 
 ```json
 {
-  "symbol": "ENA",
+  "symbol": "SOL",
   "agg_level": 1,
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
@@ -191,14 +204,14 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `symbol` | "ENA" | Trading symbol (must exist on both exchanges) |
+| `symbol` | "SOL" | Trading symbol (must exist on both exchanges) |
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `pacifica_maker_fee_bps` | 1.5 | Pacifica maker fee in basis points |
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
-| `profit_rate_bps` | 10.0 | Target profit in basis points (0.1%) |
+| `profit_rate_bps` | 15.0 | Target profit in basis points (0.15%), should overcome fees, slippage, and latency |
 | `order_notional_usd` | 20.0 | Order size in USD |
 | `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates ±3 bps |
-| `order_refresh_interval_secs` | 30 | Auto-cancel orders older than 30s |
+| `order_refresh_interval_secs` | 60 | Auto-cancel orders older than 60s |
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
 | `pacifica_rest_poll_interval_secs` | 4 | REST API fallback polling interval |
 | `ping_interval_secs` | 15 | WebSocket ping interval (max 30s) |
@@ -419,11 +432,11 @@ The bot features colorized terminal output for easy monitoring:
 ### Example Output
 ```
 [INIT] ✓ Credentials loaded successfully
-[OPPORTUNITY] BUY @ $0.391200 → HL $0.392500 | Profit: 12.50 bps
-[ORDER] ✓ Placed BUY #12345 @ $0.3912 | cloid: abc123...xyz9
-[FILL_DETECTION] ✓ FULL FILL: buy 51.2048 ENA @ $0.3912
-[ENA HEDGE] Executing SELL 51.2048 on Hyperliquid
-[ENA HEDGE] ✓ Hedge executed successfully
+[OPPORTUNITY] BUY @ $156.12 → HL $156.35 | Profit: 12.50 bps
+[ORDER] ✓ Placed BUY #12345 @ $156.12 | cloid: abc123...xyz9
+[FILL_DETECTION] ✓ FULL FILL: buy 0.1281 SOL @ $156.12
+[SOL HEDGE] Executing SELL 0.1281 on Hyperliquid
+[SOL HEDGE] ✓ Hedge executed successfully
 ═══════════════════════════════════════════════════
   BOT CYCLE COMPLETE!
 ═══════════════════════════════════════════════════
@@ -437,54 +450,3 @@ The bot features colorized terminal output for easy monitoring:
 - **Graceful shutdown**: Ctrl+C cancels remaining orders before exit
 - **Credentials**: Never commit `.env` file to version control
 - **Testing**: Always test with small `order_notional_usd` first (e.g., 5.0)
-
-## Troubleshooting
-
-**Signature verification failed (Pacifica):**
-- Check Ed25519 key is correct (first 32 bytes of Solana key)
-- Verify JSON canonicalization
-- Ensure timestamp is current (within 5s)
-
-**Order rejected:**
-- Verify price is rounded to tick_size
-- Verify size is rounded to lot_size
-- Check market info is up to date
-
-**WebSocket disconnects:**
-- Ensure ping interval ≤30 seconds (default: 15s)
-- Check network stability
-- Review logs for specific errors
-
-**No opportunities detected:**
-- Verify both orderbook feeds are connected
-- Check fee configuration (maker + taker fees)
-- Ensure profit_rate_bps is realistic (default: 10 bps)
-- Review spread between exchanges
-
-**Fill not detected:**
-- The bot uses 5 independent fill detection methods for redundancy
-- Check fill detection WebSocket is connected (Task 3):
-  - Verify `account_order_updates` subscription (primary)
-  - Verify `account_positions` subscription (redundancy)
-- Verify REST API order polling is working (Task 5)
-- Check position monitor is running (Task 5.5)
-- Look for cross-validation warnings (⚠) - indicates primary detection missed fill
-- Verify account address matches credentials
-- Enable debug logging: `RUST_LOG=debug`
-- Check that deduplication HashSet isn't preventing detection
-
-## Deployment
-
-See `DEPLOYMENT.md` for Docker deployment instructions.
-
-## Documentation
-
-For detailed architecture and development guidelines, see `CLAUDE.md`.
-
-## License
-
-MIT
-
-## Contributing
-
-Contributions welcome! Please open an issue or PR.
