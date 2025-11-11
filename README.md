@@ -203,7 +203,7 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 | `profit_rate_bps` | 15.0 | Target profit in basis points (0.15%), should overcome fees, slippage, and latency |
 | `order_notional_usd` | 20.0 | Order size in USD |
 | `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates ±3 bps |
-| `order_refresh_interval_secs` | 30 | Auto-cancel orders older than 30s |
+| `order_refresh_interval_secs` | 60 | Auto-cancel orders older than 60s |
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
 | `pacifica_rest_poll_interval_secs` | 4 | REST API fallback polling interval |
 | `ping_interval_secs` | 15 | WebSocket ping interval (max 30s) |
