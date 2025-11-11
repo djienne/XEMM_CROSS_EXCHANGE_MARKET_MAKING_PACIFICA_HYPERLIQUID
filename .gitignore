@@ -38,6 +38,13 @@ docker-compose.override.yml
 # Temporary files
 NUL
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
 # Documentation (except main README)
 *.md
 !README.md

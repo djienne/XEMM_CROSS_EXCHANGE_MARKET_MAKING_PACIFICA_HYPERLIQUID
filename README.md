@@ -25,28 +25,35 @@ The main rationale is to use Hyperliquid's better liquidity, namely lower spread
 - ✅ **Order Refresh** - Auto-cancels stale orders based on age
 - ✅ **Single-cycle Mode** - Exits after one successful arbitrage cycle
 
-### Fill Detection (4 Layers)
+### Fill Detection (5 Layers)
 
 The bot uses a multi-layered fill detection system for maximum reliability:
 
 1. **WebSocket Fill Detection** (primary, real-time) - Monitors Pacifica's `account_order_updates` channel
-2. **REST API Order Polling** (backup, 500ms) - Polls order status via REST API
-3. **Position Monitor** (ground truth, 500ms) - Detects fills by monitoring position changes
-4. **Monitor Safety Check** (defensive) - Pre-cancellation verification in monitoring task
+2. **WebSocket Position Detection** (redundancy, real-time) - Monitors Pacifica's `account_positions` channel for position deltas
+3. **REST API Order Polling** (backup, 500ms) - Polls order status via REST API
+4. **Position Monitor** (ground truth, 500ms) - Detects fills by monitoring position changes via REST
+5. **Monitor Safety Check** (defensive) - Pre-cancellation verification in monitoring task
 
 All methods deduplicate via shared HashSet to ensure only one hedge executes per fill.
+
+**Position-Based Detection Cross-Validation:**
+- ✓ **Cross-validated** - Position change detected AND order update received (redundancy working)
+- ⚠ **Not cross-validated** - Position change detected BUT no order update (safety net activated - primary missed it!)
 
 ### Exchange Connectivity
 
 **Pacifica:**
 - WebSocket orderbook (real-time bid/ask feed)
-- WebSocket fill detection (monitors order fills/cancellations)
+- WebSocket fill detection (monitors order fills/cancellations via `account_order_updates`)
+- WebSocket position monitoring (detects fills from position changes via `account_positions`)
 - WebSocket trading (ultra-fast order cancellation, no rate limits)
 - REST API trading (authenticated order placement/cancellation)
 - REST API polling (fallback orderbook data)
 - REST API positions (position monitoring for fill detection)
 - Ed25519 authenticated operations (both WebSocket and REST)
 - **Dual cancellation safety** - Uses both REST + WebSocket for redundancy
+- **Cross-validation** - Position-based detection validates order-based detection
 
 **Hyperliquid:**
 - WebSocket orderbook (real-time L2 book)
@@ -155,7 +162,7 @@ examples/
 ├── pacifica_orderbook.rs                      # View Pacifica orderbook (live)
 ├── pacifica_orderbook_rest_test.rs            # Test REST API orderbook
 ├── fill_detection_test.rs                     # Test fill detection
-├── test_aggressive_fill_detection.rs          # Test all 4 fill detection methods
+├── test_aggressive_fill_detection.rs          # Test all 5 fill detection methods
 ├── hyperliquid_market_test.rs                 # Test Hyperliquid trading
 ├── hyperliquid_orderbook.rs                   # View Hyperliquid orderbook
 ├── xemm_calculator.rs                         # Price calculator (no trading)
@@ -216,10 +223,11 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 3. **Evaluate**: Check both BUY and SELL opportunities every 100ms
 4. **Place**: If profitable (>target profit), place limit order on Pacifica
 5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >30s
-6. **Fill Detection**: 4-layer system detects when order fills
-   - WebSocket fill detection (primary, real-time)
+6. **Fill Detection**: 5-layer system detects when order fills
+   - WebSocket fill detection (primary, real-time via account_order_updates)
+   - WebSocket position detection (redundancy, real-time via account_positions)
    - REST API order polling (backup, 500ms)
-   - Position monitor (ground truth, 500ms)
+   - Position monitor (ground truth, 500ms via REST)
    - Monitor safety check (pre-cancellation)
    - **Dual Cancellation**: Immediately cancel all orders via REST + WebSocket
 7. **Hedge**: Execute market order on Hyperliquid (opposite direction)
@@ -276,10 +284,10 @@ cargo run --example low_latency --release
 
 ### Fill Detection Testing
 
-Comprehensive test for the 4-layer fill detection system:
+Comprehensive test for the 5-layer fill detection system:
 
 ```bash
-# Test all 4 fill detection methods with aggressive limit order
+# Test all 5 fill detection methods with aggressive limit order
 # Places order at 0.05% spread to ensure quick fill
 # Verifies deduplication and position verification on both exchanges
 cargo run --example test_aggressive_fill_detection --release
@@ -287,11 +295,17 @@ cargo run --example test_aggressive_fill_detection --release
 
 This test:
 - Places an aggressive post-only limit order (5 bps spread)
-- Monitors all 4 detection methods simultaneously
+- Monitors all 5 detection methods simultaneously:
+  1. WebSocket order updates (primary)
+  2. WebSocket position delta (redundancy)
+  3. REST order polling (backup)
+  4. REST position monitor (ground truth)
+  5. Monitor pre-cancel check (defensive)
 - Tracks which method detects first with timing analysis
+- Shows cross-validation status for position-based detection
 - Verifies only one hedge executes (deduplication works)
 - Checks positions on both Pacifica and Hyperliquid after hedge
-- Shows comprehensive detection method summary
+- Shows comprehensive detection method summary with timestamps
 
 ### Trading Examples
 
@@ -435,4 +449,4 @@ The bot features colorized terminal output for easy monitoring:
 - **No position accumulation**: Always hedges immediately after fill
 - **Graceful shutdown**: Ctrl+C cancels remaining orders before exit
 - **Credentials**: Never commit `.env` file to version control
-- **Testing**: Always test with small `order_notional_usd` first (e.g., 12.0)
+- **Testing**: Always test with small `order_notional_usd` first (e.g., 5.0)
