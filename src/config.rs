@@ -84,7 +84,7 @@ fn default_hyperliquid_taker_fee() -> f64 {
 }
 
 fn default_profit_rate() -> f64 {
-    10.0 // 10 bps = 0.1%
+    15.0 // 15 bps = 0.15%
 }
 
 fn default_order_notional() -> f64 {
@@ -96,7 +96,7 @@ fn default_profit_cancel_threshold() -> f64 {
 }
 
 fn default_order_refresh_interval() -> u64 {
-    30 // 30 seconds
+    60 // 60 seconds
 }
 
 fn default_hyperliquid_slippage() -> f64 {
@@ -104,7 +104,7 @@ fn default_hyperliquid_slippage() -> f64 {
 }
 
 fn default_pacifica_rest_poll_interval() -> u64 {
-    4 // 4 seconds
+    2 // 2 seconds
 }
 
 impl Default for Config {

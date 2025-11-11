@@ -105,7 +105,7 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
 /// 1. Evaluates opportunities between Pacifica and Hyperliquid
 /// 2. Places limit order on Pacifica
 /// 3. Monitors profitability (cancels if profit drops >3 bps)
-/// 4. Auto-refreshes orders older than 30 seconds
+/// 4. Auto-refreshes orders based on configured interval (default 60 seconds)
 /// 5. Hedges on Hyperliquid when filled (WebSocket + REST API detection)
 /// 6. Hedges partial fills above $10 notional
 /// 7. Exits after successful hedge
