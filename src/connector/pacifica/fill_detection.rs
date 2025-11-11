@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use super::types::{
-    AccountOrderUpdatesResponse, AccountOrderUpdatesSubscribe, FillEvent, PingMessage,
+    AccountOrderUpdatesResponse, AccountOrderUpdatesSubscribe, AccountPositionsResponse,
+    AccountPositionsSubscribe, FillEvent, PingMessage,
 };
 
 /// Configuration for fill detection client
@@ -17,12 +21,26 @@ pub struct FillDetectionConfig {
     pub reconnect_attempts: u32,
     /// Ping interval in seconds
     pub ping_interval_secs: u64,
+    /// Enable position-based fill detection (redundancy layer)
+    pub enable_position_fill_detection: bool,
+}
+
+/// Position snapshot for tracking changes
+#[derive(Debug, Clone)]
+struct PositionSnapshot {
+    quantity: f64,      // Signed quantity (+ for long, - for short)
+    entry_price: f64,
+    timestamp: u64,
 }
 
 /// WebSocket client for monitoring order fills and updates
 pub struct FillDetectionClient {
     config: FillDetectionConfig,
     ws_url: String,
+    /// Position snapshots per symbol for delta detection
+    position_snapshots: Arc<Mutex<HashMap<String, PositionSnapshot>>>,
+    /// Track last order fill time for cross-validation (symbol -> timestamp)
+    last_order_fill_time: Arc<Mutex<Instant>>,
 }
 
 impl FillDetectionClient {
@@ -38,7 +56,12 @@ impl FillDetectionClient {
             "wss://ws.pacifica.fi/ws".to_string()
         };
 
-        Ok(Self { config, ws_url })
+        Ok(Self {
+            config,
+            ws_url,
+            position_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            last_order_fill_time: Arc::new(Mutex::new(Instant::now())),
+        })
     }
 
     /// Start the fill detection client with a callback for fill events
@@ -110,6 +133,17 @@ impl FillDetectionClient {
             self.config.account
         );
 
+        // Subscribe to account positions (for position-based fill detection)
+        if self.config.enable_position_fill_detection {
+            let positions_subscribe = AccountPositionsSubscribe::new(self.config.account.clone());
+            let positions_json = serde_json::to_string(&positions_subscribe)?;
+            write.send(Message::Text(positions_json)).await?;
+            info!(
+                "Subscribed to account_positions for account: {}",
+                self.config.account
+            );
+        }
+
         // Set up ping interval
         let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
 
@@ -173,6 +207,11 @@ impl FillDetectionClient {
                         updates.data.len()
                     );
 
+                    // Update last order fill time for cross-validation
+                    if let Ok(mut last_time) = self.last_order_fill_time.lock() {
+                        *last_time = Instant::now();
+                    }
+
                     // Process each order update
                     for update in updates.data {
                         debug!(
@@ -190,6 +229,23 @@ impl FillDetectionClient {
                         }
                     }
                 }
+                "account_positions" => {
+                    if self.config.enable_position_fill_detection {
+                        // Parse as account positions response
+                        let positions: AccountPositionsResponse = serde_json::from_str(text)?;
+                        debug!(
+                            "Received {} position update(s)",
+                            positions.data.len()
+                        );
+
+                        // Process each position update
+                        for position in positions.data {
+                            if let Some(fill_event) = self.detect_fill_from_position(&position) {
+                                callback(fill_event);
+                            }
+                        }
+                    }
+                }
                 _ => {
                     debug!("Received message on channel: {}", channel);
                 }
@@ -197,5 +253,96 @@ impl FillDetectionClient {
         }
 
         Ok(())
+    }
+
+    /// Detect fill from position change (redundancy layer)
+    fn detect_fill_from_position(&self, position: &super::types::PositionData) -> Option<FillEvent> {
+        // Parse position data
+        let amount: f64 = position.amount.parse().ok()?;
+        let entry_price: f64 = position.entry_price.parse().ok()?;
+
+        // Convert to signed quantity (+ for long, - for short)
+        let quantity = if position.side == "ask" {
+            -amount  // Short position
+        } else {
+            amount   // Long position
+        };
+
+        // Get previous position snapshot
+        let mut snapshots = self.position_snapshots.lock().ok()?;
+        let prev_snapshot = snapshots.get(&position.symbol);
+
+        let prev_qty = prev_snapshot.map(|s| s.quantity).unwrap_or(0.0);
+        let delta = quantity - prev_qty;
+
+        // Only detect fills if there's a significant change (> 0.0001 for floating point tolerance)
+        if delta.abs() < 0.0001 {
+            // Update snapshot even if no change
+            snapshots.insert(
+                position.symbol.clone(),
+                PositionSnapshot {
+                    quantity,
+                    entry_price,
+                    timestamp: position.timestamp,
+                },
+            );
+            return None;
+        }
+
+        // Determine fill side from delta
+        let side = if delta > 0.0 { "buy" } else { "sell" };
+
+        // Cross-validate: check if we received order fills recently (within 10 seconds)
+        let cross_validated = if let Ok(last_time) = self.last_order_fill_time.lock() {
+            last_time.elapsed().as_secs() < 10
+        } else {
+            false
+        };
+
+        // Log based on cross-validation result
+        if cross_validated {
+            info!(
+                "[POSITION FILL ✓] {} {:.4} {} @ {:.4} (pos delta: {:.4} → {:.4}, cross-validated)",
+                side.to_uppercase(),
+                delta.abs(),
+                position.symbol,
+                entry_price,
+                prev_qty,
+                quantity
+            );
+        } else {
+            warn!(
+                "[POSITION FILL ⚠] {} {:.4} {} @ {:.4} (pos delta: {:.4} → {:.4}, MISSED BY PRIMARY!)",
+                side.to_uppercase(),
+                delta.abs(),
+                position.symbol,
+                entry_price,
+                prev_qty,
+                quantity
+            );
+        }
+
+        // Update snapshot before returning
+        snapshots.insert(
+            position.symbol.clone(),
+            PositionSnapshot {
+                quantity,
+                entry_price,
+                timestamp: position.timestamp,
+            },
+        );
+
+        // Create position-based fill event
+        Some(FillEvent::PositionFill {
+            symbol: position.symbol.clone(),
+            side: side.to_string(),
+            filled_amount: delta.abs().to_string(),
+            avg_price: entry_price.to_string(),
+            timestamp: position.timestamp,
+            position_delta: delta.to_string(),
+            prev_position: prev_qty.to_string(),
+            new_position: quantity.to_string(),
+            cross_validated,
+        })
     }
 }

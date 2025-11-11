@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use tokio::signal;
 
 use xemm_rust::bot::{ActiveOrder, BotState, BotStatus};
@@ -320,6 +320,7 @@ async fn main() -> Result<()> {
         account: pacifica_credentials.account.clone(),
         reconnect_attempts: config.reconnect_attempts,
         ping_interval_secs: config.ping_interval_secs,
+        enable_position_fill_detection: true,  // Enable position-based fill detection redundancy
     };
 
     let mut fill_client = FillDetectionClient::new(fill_config, false)
@@ -689,6 +690,109 @@ async fn main() -> Result<()> {
                                 "[FILL_DETECTION]".magenta().bold(),
                                 notional_value
                             );
+                        }
+                    }
+                    FillEvent::PositionFill {
+                        symbol,
+                        side,
+                        filled_amount,
+                        avg_price,
+                        cross_validated,
+                        position_delta,
+                        prev_position,
+                        new_position,
+                        ..
+                    } => {
+                        // Log position-based fill detection
+                        if cross_validated {
+                            info!(
+                                "[POSITION FILL ✓] {} {} {} @ {} (pos delta: {} → {}, cross-validated)",
+                                side, filled_amount, symbol, avg_price, prev_position, new_position
+                            );
+                        } else {
+                            warn!(
+                                "[POSITION FILL ⚠] {} {} {} @ {} (pos delta: {} → {}, MISSED BY PRIMARY!)",
+                                side, filled_amount, symbol, avg_price, prev_position, new_position
+                            );
+                        }
+
+                        // For cross-validated fills, this is just informational
+                        // The order-based fill detection already triggered the hedge
+                        // For non-cross-validated fills, this serves as a critical safety net
+                        if !cross_validated {
+                            // This fill was NOT detected by order updates - critical case!
+                            tprintln!(
+                                "{} {} POSITION-BASED FILL (SAFETY NET): {} {} {} @ {}",
+                                "[FILL_DETECTION]".magenta().bold(),
+                                "⚠".yellow().bold(),
+                                side.bright_yellow(),
+                                filled_amount.bright_white(),
+                                symbol.bright_white().bold(),
+                                avg_price.cyan()
+                            );
+
+                            // Spawn async task to handle like a regular fill
+                            // This is the redundancy layer catching a missed fill
+                            let bot_state_clone = bot_state_fill.clone();
+                            let hedge_tx = hedge_tx_clone.clone();
+                            let side_str = side.clone();
+                            let filled_amount_str = filled_amount.clone();
+                            let avg_price_str = avg_price.clone();
+
+                            let pac_trading_clone = pacifica_trading_fill.clone();
+                            let pac_ws_trading_clone = pacifica_ws_trading_fill.clone();
+                            let symbol_clone = symbol_fill.clone();
+                            let processed_fills_clone = processed_fills_ws.clone();
+
+                            tokio::spawn(async move {
+                                // Check deduplication (unlikely for position-based, but be safe)
+                                let fill_id = format!("pos_{}_{}", position_delta, new_position);
+                                {
+                                    let mut processed = processed_fills_clone.lock().await;
+                                    if processed.contains(&fill_id) {
+                                        debug!("[POSITION FILL] Already processed, skipping");
+                                        return;
+                                    }
+                                    processed.insert(fill_id);
+                                }
+
+                                // Update state
+                                let order_side = match side_str.as_str() {
+                                    "buy" => OrderSide::Buy,
+                                    "sell" => OrderSide::Sell,
+                                    _ => {
+                                        warn!("[POSITION FILL] Unknown side: {}", side_str);
+                                        return;
+                                    }
+                                };
+
+                                let filled_size: f64 = filled_amount_str.parse().unwrap_or(0.0);
+
+                                {
+                                    let mut state = bot_state_clone.write().await;
+                                    state.mark_filled(filled_size, order_side);
+                                }
+
+                                tprintln!(
+                                    "{} {} Position-based fill detected - State updated",
+                                    "[POSITION FILL]".magenta().bold(),
+                                    "✓".green().bold()
+                                );
+
+                                // Cancel all orders (dual method)
+                                pac_trading_clone
+                                    .cancel_all_orders(false, Some(&symbol_clone), false)
+                                    .await
+                                    .ok();
+                                pac_ws_trading_clone
+                                    .cancel_all_orders_ws(false, Some(&symbol_clone), false)
+                                    .await
+                                    .ok();
+
+                                // Trigger hedge
+                                let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
+                                hedge_tx.send((order_side, filled_size, avg_px)).await.ok();
+                            });
                         }
                     }
                 }
