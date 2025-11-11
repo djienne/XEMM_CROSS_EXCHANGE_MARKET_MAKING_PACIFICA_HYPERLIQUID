@@ -405,10 +405,10 @@ The bot features colorized terminal output for easy monitoring:
 ### Example Output
 ```
 [INIT] ✓ Credentials loaded successfully
-[OPPORTUNITY] BUY @ $0.391200 → HL $0.392500 | Profit: 12.50 bps
-[ORDER] ✓ Placed BUY #12345 @ $0.3912 | cloid: abc123...xyz9
-[FILL_DETECTION] ✓ FULL FILL: buy 51.2048 SOL @ $0.3912
-[SOL HEDGE] Executing SELL 51.2048 on Hyperliquid
+[OPPORTUNITY] BUY @ $156.12 → HL $156.35 | Profit: 12.50 bps
+[ORDER] ✓ Placed BUY #12345 @ $156.12 | cloid: abc123...xyz9
+[FILL_DETECTION] ✓ FULL FILL: buy 0.1281 SOL @ $156.12
+[SOL HEDGE] Executing SELL 0.1281 on Hyperliquid
 [SOL HEDGE] ✓ Hedge executed successfully
 ═══════════════════════════════════════════════════
   BOT CYCLE COMPLETE!
