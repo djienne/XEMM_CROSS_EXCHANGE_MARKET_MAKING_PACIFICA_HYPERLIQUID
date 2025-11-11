@@ -1,2 +1,0 @@
-timestamp,symbol,pacifica_side,hyperliquid_side,pacifica_price,pacifica_size,pacifica_notional,pacifica_fee,hyperliquid_price,hyperliquid_size,hyperliquid_notional,hyperliquid_fee,total_fees,expected_profit_bps,actual_profit_bps,actual_profit_usd,gross_pnl
-2025-11-04T12:34:56.789Z,ENA,BUY,SELL,0.3900,50.0,19.50,0.0029,0.3920,50.0,19.60,0.0078,0.0107,10.0,8.5,0.0021,0.10
