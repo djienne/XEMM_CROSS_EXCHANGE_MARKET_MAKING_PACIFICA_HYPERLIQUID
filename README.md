@@ -100,18 +100,16 @@ Edit `config.json`:
 ```json
 {
   "symbol": "SOL",
-  "agg_level": 1,
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
-  "low_latency_mode": false,
   "pacifica_maker_fee_bps": 1.5,
   "hyperliquid_taker_fee_bps": 4.0,
-  "profit_rate_bps": 10.0,
+  "profit_rate_bps": 15.0,
   "order_notional_usd": 20.0,
   "profit_cancel_threshold_bps": 3.0,
-  "order_refresh_interval_secs": 30,
+  "order_refresh_interval_secs": 60,
   "hyperliquid_slippage": 0.05,
-  "pacifica_rest_poll_interval_secs": 4
+  "pacifica_rest_poll_interval_secs": 2
 }
 ```
 
@@ -205,7 +203,8 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `symbol` | "SOL" | Trading symbol (must exist on both exchanges) |
-| `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
+| `reconnect_attempts` | 5 | Number of WebSocket reconnection attempts with exponential backoff |
+| `ping_interval_secs` | 15 | WebSocket ping interval in seconds (max 30s) |
 | `pacifica_maker_fee_bps` | 1.5 | Pacifica maker fee in basis points |
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
 | `profit_rate_bps` | 15.0 | Target profit in basis points (0.15%), should overcome fees, slippage, and latency |
@@ -213,8 +212,7 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 | `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates ±3 bps |
 | `order_refresh_interval_secs` | 60 | Auto-cancel orders older than 60s |
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
-| `pacifica_rest_poll_interval_secs` | 4 | REST API fallback polling interval |
-| `ping_interval_secs` | 15 | WebSocket ping interval (max 30s) |
+| `pacifica_rest_poll_interval_secs` | 2 | REST API fallback polling interval in seconds |
 
 ## Trading Workflow
 
