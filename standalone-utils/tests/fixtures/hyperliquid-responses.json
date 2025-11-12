@@ -1,0 +1,103 @@
+{
+  "openOrders": [
+    {
+      "coin": "BTC",
+      "limitPx": "29792.0",
+      "oid": 91490942,
+      "side": "A",
+      "sz": "0.05",
+      "timestamp": 1681247412573
+    },
+    {
+      "coin": "SOL",
+      "limitPx": "145.50",
+      "oid": 91490943,
+      "side": "B",
+      "sz": "10.0",
+      "timestamp": 1681247512573
+    }
+  ],
+  "userFills": [
+    {
+      "closedPnl": "5.25",
+      "coin": "AVAX",
+      "crossed": false,
+      "dir": "Open Long",
+      "hash": "0xa166e3fa",
+      "oid": 90542681,
+      "px": "18.435",
+      "side": "B",
+      "startPosition": "26.86",
+      "sz": "93.53",
+      "time": 1681222254710,
+      "fee": "0.01",
+      "feeToken": "USDC",
+      "builderFee": "0.01",
+      "tid": 118906512037719
+    },
+    {
+      "closedPnl": "-2.10",
+      "coin": "SOL",
+      "crossed": false,
+      "dir": "Close Short",
+      "hash": "0xb277f4gb",
+      "oid": 90542682,
+      "px": "145.20",
+      "side": "B",
+      "startPosition": "-50.0",
+      "sz": "25.0",
+      "time": 1681222354710,
+      "fee": "0.02",
+      "feeToken": "USDC",
+      "builderFee": "0.01",
+      "tid": 118906512037720
+    }
+  ],
+  "clearinghouseState": {
+    "marginSummary": {
+      "accountValue": "1250.50",
+      "totalNtlPos": "850.25",
+      "totalRawUsd": "1250.50",
+      "totalMarginUsed": "125.30"
+    },
+    "crossMarginSummary": {
+      "accountValue": "1250.50",
+      "totalNtlPos": "850.25",
+      "totalRawUsd": "1250.50",
+      "totalMarginUsed": "125.30"
+    },
+    "crossMaintenanceMarginUsed": "62.65",
+    "withdrawable": "1125.20",
+    "assetPositions": [
+      {
+        "position": {
+          "coin": "SOL",
+          "szi": "50.5",
+          "entryPx": "145.30",
+          "unrealizedPnl": "12.50",
+          "returnOnEquity": "0.01",
+          "leverage": {
+            "value": "2.5"
+          },
+          "marginUsed": "50.20",
+          "liquidationPx": "100.00"
+        }
+      },
+      {
+        "position": {
+          "coin": "BTC",
+          "szi": "-0.05",
+          "entryPx": "30000.00",
+          "unrealizedPnl": "-10.00",
+          "returnOnEquity": "-0.008",
+          "leverage": {
+            "value": "1.5"
+          },
+          "marginUsed": "75.10",
+          "liquidationPx": "35000.00"
+        }
+      }
+    ],
+    "time": 1733968369395
+  }
+}

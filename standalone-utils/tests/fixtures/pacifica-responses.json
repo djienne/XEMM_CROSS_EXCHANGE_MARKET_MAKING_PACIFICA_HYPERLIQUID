@@ -1,0 +1,154 @@
+{
+  "positions": {
+    "success": true,
+    "data": [
+      {
+        "symbol": "AAVE",
+        "side": "ask",
+        "amount": "223.72",
+        "entry_price": "279.283134",
+        "margin": "0",
+        "funding": "13.159593",
+        "isolated": false,
+        "created_at": 1754928414996,
+        "updated_at": 1759223365538
+      },
+      {
+        "symbol": "SOL",
+        "side": "bid",
+        "amount": "50.0",
+        "entry_price": "145.50",
+        "margin": "0",
+        "funding": "5.234567",
+        "isolated": false,
+        "created_at": 1754928414996,
+        "updated_at": 1759223365538
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "orders": {
+    "success": true,
+    "data": [
+      {
+        "order_id": 315992721,
+        "client_order_id": "ade",
+        "symbol": "XPL",
+        "side": "ask",
+        "initial_price": "1.0865",
+        "average_filled_price": "0",
+        "amount": "984",
+        "filled_amount": "0",
+        "order_status": "open",
+        "order_type": "limit",
+        "stop_price": null,
+        "stop_parent_order_id": null,
+        "reduce_only": false,
+        "reason": null,
+        "created_at": 1759224893638,
+        "updated_at": 1759224893638
+      },
+      {
+        "order_id": 315992722,
+        "client_order_id": "adf",
+        "symbol": "SOL",
+        "side": "bid",
+        "initial_price": "145.30",
+        "average_filled_price": "0",
+        "amount": "25.5",
+        "filled_amount": "0",
+        "order_status": "open",
+        "order_type": "limit",
+        "stop_price": null,
+        "stop_parent_order_id": null,
+        "reduce_only": false,
+        "reason": null,
+        "created_at": 1759224893638,
+        "updated_at": 1759224893638
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "orderHistory": {
+    "success": true,
+    "data": [
+      {
+        "order_id": 315293920,
+        "client_order_id": "acf",
+        "symbol": "LDO",
+        "side": "bid",
+        "initial_price": "1.1904",
+        "average_filled_price": "1.1904",
+        "amount": "100",
+        "filled_amount": "100",
+        "order_status": "filled",
+        "order_type": "limit",
+        "stop_price": null,
+        "stop_parent_order_id": null,
+        "reduce_only": false,
+        "reason": null,
+        "created_at": 1759215599188,
+        "updated_at": 1759215699188
+      },
+      {
+        "order_id": 315293921,
+        "client_order_id": "acg",
+        "symbol": "SOL",
+        "side": "ask",
+        "initial_price": "145.80",
+        "average_filled_price": "145.75",
+        "amount": "10.0",
+        "filled_amount": "10.0",
+        "order_status": "filled",
+        "order_type": "limit",
+        "stop_price": null,
+        "stop_parent_order_id": null,
+        "reduce_only": false,
+        "reason": null,
+        "created_at": 1759215599188,
+        "updated_at": 1759215799188
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "tradeHistory": {
+    "success": true,
+    "data": [
+      {
+        "history_id": 19329801,
+        "order_id": 315293920,
+        "client_order_id": "acf",
+        "symbol": "LDO",
+        "amount": "0.1",
+        "price": "1.1904",
+        "entry_price": "1.176247",
+        "fee": "0",
+        "pnl": "-0.001415",
+        "event_type": "fulfill_maker",
+        "side": "close_short",
+        "created_at": 1759215599188,
+        "cause": "normal"
+      },
+      {
+        "history_id": 19329802,
+        "order_id": 315293921,
+        "client_order_id": "acg",
+        "symbol": "SOL",
+        "amount": "10.0",
+        "price": "145.75",
+        "entry_price": "145.30",
+        "fee": "0.05",
+        "pnl": "4.50",
+        "event_type": "fulfill_taker",
+        "side": "close_long",
+        "created_at": 1759215799188,
+        "cause": "normal"
+      }
+    ],
+    "error": null,
+    "code": null
+  }
+}

@@ -1,0 +1,890 @@
+# Websocket
+
+Mainnet websocket URL: <wss://ws.pacifica.fi/ws>\
+Testnet websocket URL: <wss://test-ws.pacifica.fi/ws>
+
+The API service provides a universal endpoint for websocket streams. The subscribed data will be streamed in the corresponding channel after the connection is established.
+
+### Subscription Message
+
+```
+{
+    "method": "subscribe",
+    "params": { ... }
+}
+```
+
+### Unsubscription Message
+
+```
+{
+    "method": "unsubscribe",
+    "params": { ... }
+}
+```
+
+### Heartbeat and Timeout
+
+A webscoket connection will be closed if no message is sent for the past 60 seconds, or the connection has been alive for 24 hours.&#x20;
+
+To keep the connection alive without messages in 60 seconds, we can send a heartbeat message&#x20;
+
+```
+{
+    "method": "ping"
+}
+```
+
+and alive connection will respond with
+
+```
+{
+    "channel": "pong"
+}
+```
+# Websocket
+
+Mainnet websocket URL: <wss://ws.pacifica.fi/ws>\
+Testnet websocket URL: <wss://test-ws.pacifica.fi/ws>
+
+The API service provides a universal endpoint for websocket streams. The subscribed data will be streamed in the corresponding channel after the connection is established.
+
+### Subscription Message
+
+```
+{
+    "method": "subscribe",
+    "params": { ... }
+}
+```
+
+### Unsubscription Message
+
+```
+{
+    "method": "unsubscribe",
+    "params": { ... }
+}
+```
+
+### Heartbeat and Timeout
+
+A webscoket connection will be closed if no message is sent for the past 60 seconds, or the connection has been alive for 24 hours.&#x20;
+
+To keep the connection alive without messages in 60 seconds, we can send a heartbeat message&#x20;
+
+```
+{
+    "method": "ping"
+}
+```
+
+and alive connection will respond with
+
+```
+{
+    "channel": "pong"
+}
+```
+# Prices
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "prices"
+    }
+}
+```
+
+### Stream
+
+```json
+{
+    "channel": "prices",
+    "data": [
+        {
+            "funding": "0.0000125",
+            "mark": "105473",
+            "mid": "105476",
+            "next_funding": "0.0000125",
+            "open_interest": "0.00524",
+            "oracle": "105473",
+            "symbol": "BTC",
+            "timestamp": 1749051612681,
+            "volume_24h": "63265.87522",
+            "yesterday_price": "955476"
+        }
+        // ... other symbol prices
+    ],
+}
+```
+
+| Field               | Type           | Description               |
+| ------------------- | -------------- | ------------------------- |
+| `'funding'`         | decimal string | Funding rate              |
+| `'mark'`            | decimal string | Mark price                |
+| `'timestamp'`       | number         | Timestamp in milliseconds |
+| `'mid'`             | decimal string | Mid price                 |
+| `'next_funding'`    | decimal string | Next funding rate         |
+| `'open_interest'`   | decimal string | Open interest amount      |
+| `'oracle'`          | decimal string | Oracle price              |
+| `'symbol'`          | string         | Symbol                    |
+| `'volume_24h'`      | decimal string | 24 hour volume in USD     |
+| `'yesterday_price'` | decimal string | Previous day price        |
+# Orderbook
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "book",
+        "symbol": "SOL",
+        "agg_level": 1  // Aggregation level
+    }
+}
+```
+
+where `agg_level`can be one of `1, 2, 5, 10, 100, 1000`.
+
+### Stream
+
+```json
+{
+  "channel": "book",
+  "data": {
+    "l": [
+      [
+        {
+          "a": "37.86",
+          "n": 4,
+          "p": "157.47"
+        },
+        // ... other aggegated bid levels
+      ],
+      [
+        {
+          "a": "12.7",
+          "n": 2,
+          "p": "157.49"
+        },
+        {
+          "a": "44.45",
+          "n": 3,
+          "p": "157.5"
+        },
+        // ... other aggregated ask levels
+      ]
+    ],
+    "s": "SOL",
+    "t": 1749051881187
+  }
+}
+```
+
+| Field | Type           | Description                                                                                                                                   |
+| ----- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `'l'` | array          | \[Bids, Asks]                                                                                                                                 |
+| `'a'` | decimal string | Total amount in aggregation level.                                                                                                            |
+| `'n'` | integer        | Number of orders in aggregation level.                                                                                                        |
+| `'p'` | decimal string | <ul><li>In bids array, this is highest price in aggregation level.</li><li>In asks array, this is lowest price is aggregation level</li></ul> |
+| `'s'` | string         | Symbol                                                                                                                                        |
+| `'t'` | number         | Timestamp in milliseconds                                                                                                                     |
+# Trades
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "trades",
+        "symbol": "SOL"
+    }
+}
+```
+
+### Stream
+
+```json
+{
+  "channel": "trades",
+  "data": [
+      {
+        "h": 29369352,
+        "a": "0.16",
+        "d": "open_long",
+        "p": "157.43",
+        "s": "SOL",
+        "t": 1749052438829,
+        "tc": "normal",
+        "u": "C1obSQwr..."
+      },
+       // ... other trades
+  ]
+}
+```
+
+| Field  | Type           | Description                                                                                                                                    |
+| ------ | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `'h'`  | integer        | History ID                                                                                                                                     |
+| `'a'`  | decimal string | Amount                                                                                                                                         |
+| `'d'`  | string         | <p>Trade side</p><p><code>open\_long</code></p><p><code>open\_short</code> </p><p><code>close\_long</code></p><p><code>close\_short</code></p> |
+| `'p'`  | decimal string | Price                                                                                                                                          |
+| `'s'`  | string         | Symbol                                                                                                                                         |
+| `'t'`  | number         | Timestamp in milliseconds                                                                                                                      |
+| `'tc'` | string         | <p>Trade cause</p><p><code>normal</code> <code>market\_liquidation</code> <code>backstop\_liquidation</code> <code>settlement</code></p>       |
+| `'u'`  | string         | Account address                                                                                                                                |
+# Candle
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "candle",
+        "symbol": "SOL",
+        "interval": "1m"  
+    }
+}
+```
+
+Where `"interval"` can be `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d`
+
+### Stream
+
+```json
+{
+  "channel": "candle",
+  "data": {
+    "t": 1749052260000,
+    "T": 1749052320000,
+    "s": "SOL",
+    "i": "1m",
+    "o": "157.3",
+    "c": "157.32",
+    "h": "157.32",
+    "l": "157.3",
+    "v": "1.22",
+    "n": 8
+  }
+}
+```
+
+| Field | Type           | Description                     |
+| ----- | -------------- | ------------------------------- |
+| `'t'` | number         | Start time (milliseconds)       |
+| `'T'` | number         | End time (milliseconds)         |
+| `'s'` | string         | Symbol                          |
+| `'i'` | string         | Candle interval                 |
+| `'o'` | decimal string | Open price                      |
+| `'c'` | decimal string | Close price                     |
+| `'h'` | decimal string | High price                      |
+| `'l'` | decimal string | Low price                       |
+| `'v'` | decimal string | Volume                          |
+| `'n'` | number         | Number of trades in this period |
+# Account margin
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+## Margin
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "account_margin",
+        "account": "42trU9A5..."
+    }
+}
+```
+
+### Stream
+
+```json
+{
+    "channel": "account_margin",
+    "data": {
+        "u": "42trU9A5...",
+        "s": "ETH",
+        "i": true,
+        "t": 1234567890
+    }
+}
+```
+
+| Field | Type    | Description                                |
+| ----- | ------- | ------------------------------------------ |
+| `'u'` | string  | Account address                            |
+| `'t'` | number  | Timestamp in milliseconds                  |
+| `'s'` | string  | Symbol                                     |
+| `'i'` | boolean | New margin mode (isolated or not isolated) |
+# Account leverage
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+## Leverage
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "account_leverage",
+        "account": "42trU9A5..."
+    }
+}
+```
+
+### Stream
+
+```json
+{
+    "channel": "account_leverage",
+    "data": {
+        "u": "42trU9A5..."
+        "s": "BTC",
+        "l": "12",
+        "t": 1234567890
+    }
+}
+```
+
+<table><thead><tr><th width="249">Field</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>'u'</code></td><td>string</td><td>Account address</td></tr><tr><td><code>'s'</code></td><td>string</td><td>Symbol</td></tr><tr><td><code>'l'</code></td><td>integer string</td><td>New leverage</td></tr><tr><td><code>'t'</code></td><td>number</td><td>Timestamp in milliseconds</td></tr></tbody></table>
+# Account info
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+## Leverage
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "account_info",
+        "account": "42trU9A5..."
+    }
+}
+```
+
+### Stream
+
+```json
+{
+    "channel": "account_info",
+    "data": {
+        "ae": "2000",
+        "as": "1500",
+        "aw": "1400",
+        "b": "2000",
+        "f": 1,
+        "mu": "500",
+        "cm": "400",
+        "oc": 10,
+        "pb": "0",
+        "pc": 2,
+        "sc": 2,
+        "t": 1234567890
+    }
+}
+```
+
+<table><thead><tr><th width="249">Field</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>'ae'</code></td><td>string</td><td>Account equity</td></tr><tr><td><code>'as'</code></td><td>string</td><td>Available to spend</td></tr><tr><td><code>'aw'</code></td><td>string</td><td>Availale to withdraw</td></tr><tr><td><code>'b'</code></td><td>string</td><td>Account balance</td></tr><tr><td><code>'f'</code></td><td>integer</td><td>Account fee tier</td></tr><tr><td><code>'mu'</code></td><td>string</td><td>Total margin used</td></tr><tr><td><code>'cm'</code></td><td>string</td><td>Maintenance margin required in cross mode</td></tr><tr><td><code>'oc'</code></td><td>integer</td><td>Orders count</td></tr><tr><td><code>'pb'</code></td><td>string</td><td>Pending balance</td></tr><tr><td><code>'pc'</code></td><td>integer</td><td>Positions count</td></tr><tr><td><code>'sc'</code></td><td>integer</td><td>Stop order count</td></tr><tr><td><code>'t'</code></td><td>number</td><td>Timestamp in milliseconds</td></tr></tbody></table>
+# Account positions
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "account_positions",
+        "account": "42trU9A5..."
+    }
+}
+```
+
+### Stream
+
+```json
+{
+    "channel": "account_positions",
+    "data": [
+        {
+            "a": "3.1",
+            "d": "ask",
+            "f": "0",
+            "i": false,
+            "m": "0",
+            "p": "14.156000000000",
+            "s": "LINK",
+            "t": 1749051466633
+        },
+        {
+            "a": "1.3",
+            "d": "ask",
+            "f": "0",
+            "i": false,
+            "m": "0",
+            "p": "3.226700000000",
+            "s": "SUI",
+            "t": 1749051466633
+        },
+        // ... other positions
+    ]
+}
+```
+
+| Field | Type           | Description               |
+| ----- | -------------- | ------------------------- |
+| `'s'` | string         | Symbol                    |
+| `'a'` | decimal string | Position amount           |
+| `'p'` | decimal string | Average entry price       |
+| `'t'` | number         | Timestamp in milliseconds |
+| `'d'` | string         | Position side (bid, ask)  |
+| `'m'` | decimal string | Position margin           |
+| `'f'` | decimal string | Position funding fee      |
+| `'i'` | bool           | Is position isolated?     |
+# Account orders
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "account_orders",
+        "account": "42trU9A5..."
+    }
+}
+```
+
+### Stream
+
+```json
+{
+  "channel": "account_orders",
+  "data": [
+    {
+      "I": null,
+      "a": "29580",
+      "c": "0",
+      "d": "bid",
+      "f": "0",
+      "i": 560509,
+      "p": "0.27046",
+      "ot": "limit",
+      "ro": false,
+      "s": "XLM",
+      "sp": null,
+      "st": null,
+      "t": 1749054246822
+    },
+    // ... other account orders
+  ]
+}
+```
+
+| Field  | Type                   | Description                     |
+| ------ | ---------------------- | ------------------------------- |
+| `'I'`  | Full UUID string       | Client order ID                 |
+| `'a'`  | decimal string         | Original amount                 |
+| `'c'`  | decimal string         | Cancelled amount                |
+| `'d'`  | string                 | Side: \[`bid`, `ask`]           |
+| `'f'`  | decimal string         | Filled amount                   |
+| `'p'`  | decimal string         | Average filled price            |
+| `'i'`  | integer                | Order ID                        |
+| `'ot'` | string                 | Order type \[`market`, `limit`] |
+| `'ro'` | bool                   | Reduce only                     |
+| `'s'`  | string                 | Symbol                          |
+| `'sp'` | string                 | Stop price                      |
+| `'st'` | string                 | Stop type (TP/SL)               |
+| `'u'`  | base58 encoded address | Account                         |
+| `'ip'` | decimal string         | Initial price                   |
+| `'oe'` | string                 | Order event (see below)         |
+| `'os'` | string                 | Order status (see below)        |
+| `'t'`  | integer                | Timestamp (milliseconds)        |
+
+| Field  | Value                      | Description                    |
+| ------ | -------------------------- | ------------------------------ |
+| `'oe'` | `make`                     | Order placed on book           |
+|        | `stop_created`             | Stop order created             |
+|        | `fulfill_market`           | User filled by market order    |
+|        | `fulfill_limit`            | User filled others limit order |
+|        | `adjust`                   | Order modified                 |
+|        | `stop_parent_order_filled` | Parent order filled            |
+|        | `stop_triggered`           | Stop order activated           |
+|        | `stop_upgrade`             | Stop order upgraded            |
+|        | `cancel`                   | User cancelled                 |
+|        | `force_cancel`             | Cancelled by system            |
+|        | `expired`                  | Time expired                   |
+|        | `post_only_rejected`       | Cannot execute ALO             |
+|        | `self_trade_prevented`     | Cannot execute self-trade      |
+| `'os'` | `open`                     | Active on orderbook            |
+|        | `partially_filled`         | Partially filled               |
+|        | `filled`                   | Completely filled              |
+|        | `cancelled`                | Cancelled                      |
+|        | `rejected`                 | Rejected                       |
+# Account order updates
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "account_order_updates",
+        "account": "42trU9A5..."
+    }
+}
+```
+
+### Stream
+
+```json
+{
+  "channel": "account_order_updates",
+  "data": [
+    {
+      "I": null,
+      "a": "91.1",
+      "ct": 1749054643721,
+      "d": "bid",
+      "f": "2.1",
+      "i": 622900,
+      "ip": "10.979",
+      "oe": "fulfill_limit",
+      "os": "partially_filled",
+      "ot": "limit",
+      "p": "10.979",
+      "r": false,
+      "s": "TRUMP",
+      "si": null,
+      "sp": null,
+      "u": "42trU9A5...",
+      "ut": 1749054645220
+    },
+    // ... other order updates
+  ]
+}
+```
+
+| Field  | Type                   | Description                    |
+| ------ | ---------------------- | ------------------------------ |
+| `'i'`  | integer                | Order ID                       |
+| `'I'`  | Full UUID string       | Client order ID                |
+| `'u'`  | base58 encoded address | Account                        |
+| `'s'`  | string                 | Symbol                         |
+| `'d'`  | string                 | Side: \[`bid`, `ask`]          |
+| `'p'`  | decimal string         | Average filled price           |
+| `'ip'` | decimal string         | Initial price                  |
+| `'a'`  | decimal string         | Original amount                |
+| `'f'`  | decimal string         | Filled amount                  |
+| `'oe'` | string                 | Order event (see below)        |
+| `'os'` | string                 | Order status (see below)       |
+| `'ot'` | string                 | Order type (see below)         |
+| `'sp'` | string                 | Stop price                     |
+| `'si'` | string                 | Stop parent order ID           |
+| `'r'`  | bool                   | Reduce only                    |
+| `'ut'` | integer                | Updated at time (milliseconds) |
+| `'ct'` | integer                | Created at time (milliseconds) |
+
+| Field  | Value                      | Description                    |
+| ------ | -------------------------- | ------------------------------ |
+| `'oe'` | `make`                     | Order placed on book           |
+|        | `stop_created`             | Stop order created             |
+|        | `fulfill_market`           | User filled by market order    |
+|        | `fulfill_limit`            | User filled others limit order |
+|        | `adjust`                   | Order modified                 |
+|        | `stop_parent_order_filled` | Parent order filled            |
+|        | `stop_triggered`           | Stop order activated           |
+|        | `stop_upgrade`             | Stop order upgraded            |
+|        | `cancel`                   | User cancelled                 |
+|        | `force_cancel`             | Cancelled by system            |
+|        | `expired`                  | Time expired                   |
+|        | `post_only_rejected`       | Cannot execute ALO             |
+|        | `self_trade_prevented`     | Cannot execute self-trade      |
+| `'os'` | `open`                     | Active on orderbook            |
+|        | `partially_filled`         | Partially filled               |
+|        | `filled`                   | Completely filled              |
+|        | `cancelled`                | Cancelled                      |
+|        | `rejected`                 | Rejected                       |
+| `'ot'` | `limit`                    | Limit                          |
+|        | `market`                   | Market                         |
+# Account trades
+
+Refer to [Websocket](https://docs.pacifica.fi/api-documentation/api/websocket) for establishing the websocket connection.
+
+### Params
+
+```json
+{
+    "method": "subscribe",
+    "params": {
+        "source": "account_trades",
+        "account": "42trU9A5..."
+    }
+}
+```
+
+### Stream
+
+```json
+{
+  "channel": "account_trades",
+  "data": [
+    {
+      "I": null,
+      "a": "7.8",
+      "f": "0.00501618",
+      "h": 9020975,
+      "i": 484871,
+      "n": "-0.00501618",
+      "o": "3.215567",
+      "p": "3.2155",
+      "s": "SUI",
+      "t": 1749053764375,
+      "tc": "normal",
+      "te": "fulfill_maker",
+      "ts": "open_long",
+      "u": "42trU9A5..."
+    },
+    // ... other trades
+  ]
+}
+```
+
+<table><thead><tr><th width="213">Field</th><th width="239">Type</th><th>Description</th></tr></thead><tbody><tr><td><code>'I'</code></td><td>Full UUID string</td><td>Client order ID</td></tr><tr><td><code>'h'</code></td><td>integer</td><td>History ID</td></tr><tr><td><code>'i'</code></td><td>integer</td><td>Order ID</td></tr><tr><td><code>'s'</code></td><td>string</td><td>Symbol</td></tr><tr><td><code>'ts'</code></td><td>string</td><td>Trade side</td></tr><tr><td><code>'p'</code></td><td>decimal string</td><td>Price</td></tr><tr><td><code>'a'</code></td><td>decimal string</td><td>Trade amount</td></tr><tr><td><code>'u'</code></td><td>sting</td><td>Account address</td></tr><tr><td><code>'t'</code></td><td>number</td><td>Timestamp in milliseconds</td></tr><tr><td><code>'o'</code></td><td>decimal string</td><td>Entry price</td></tr><tr><td><code>'te'</code></td><td>string</td><td><code>'fulfill_maker'</code> - provided liquidity<br><code>'fulfill_taker'</code> - took liquidity</td></tr><tr><td><code>'tc'</code></td><td>string</td><td><code>'normal'</code> - Regular trade<br><code>'market_liquidation'</code> - liquidated by market order<br><code>'backstop_liquidation'</code> - liquidated by backstop liquidator<br><code>'settlement'</code> - ADL/settlement</td></tr><tr><td><code>'n'</code></td><td>decimal string</td><td>PnL</td></tr><tr><td><code>'f'</code></td><td>decimal string</td><td>Trade fee</td></tr></tbody></table>
+# Trading operations
+
+- [Create market order](/api-documentation/api/websocket/trading-operations/create-market-order.md): This request type allows users to place market orders through Pacifica's websocket API.
+- [Create limit order](/api-documentation/api/websocket/trading-operations/create-limit-order.md): This request type allows users to place limit orders through Pacifica's websocket API.
+- [Cancel order](/api-documentation/api/websocket/trading-operations/cancel-order.md): This request type allows users to cancel orders through Pacifica's websocket API.
+- [Cancel all orders](/api-documentation/api/websocket/trading-operations/cancel-all-orders.md): This request type allows users to cancel all orders through Pacifica's websocket API.
+# Create market order
+
+The [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/ws/create_order.py) provides a comprehensive example on using this endpoint.
+
+### Request
+
+```json
+{
+  "id": "660065de-8f32-46ad-ba1e-83c93d3e3966",
+  "params": {
+    "create_market_order": {
+      "account": "AwX6321...",
+      "signature": "5vnYpt...",
+      "timestamp": 1749223025396,
+      "expiry_window": 5000,
+      "symbol": "BTC",
+      "reduce_only": false,
+      "amount": "0.001",
+      "side": "bid",
+      "slippage_percent": "0.5",
+      "client_order_id": "79f948fd-7556-4066-a128-083f3ea49322"
+    }
+  }
+}
+```
+
+<table><thead><tr><th width="194">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"id"</code></td><td>Full UUID string</td><td>required</td><td>Client-defined request ID</td><td><code>660065de-8f32-46ad-ba1e-83c93d3e3966</code></td></tr><tr><td><code>"params"</code></td><td>object</td><td>required</td><td>Contains action type and action parameters</td><td><code>"create_order"</code></td></tr><tr><td><code>"create_market_order"</code></td><td>object</td><td>required</td><td>Specifies action type and contains parameters</td><td>See examples.</td></tr><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>required</td><td>Whether the order is reduce-only</td><td><code>false</code></td></tr><tr><td><code>"amount"</code></td><td>string</td><td>required</td><td>Order amount</td><td><code>0.1</code></td></tr><tr><td><code>"side"</code></td><td>string</td><td>required</td><td>Order side (bid/ask)</td><td><code>bid</code></td></tr><tr><td><code>"slippage_percent"</code></td><td>string</td><td>required</td><td>Maximum allowed slippage in percentage, e.g. "0.5" means 0.5% max slippage</td><td><code>0.5</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID</td><td><code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"take_profit"</code></td><td>object</td><td>optional</td><td>Take profit stop order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required (if <code>"take_profit"</code> exists)</td><td>Stop trigger price</td><td><code>55000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>54950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>e36ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"stop_loss"</code></td><td>object</td><td>optional</td><td>Stop loss order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required (if <code>"stop_loss"</code> exists)</td><td>Stop trigger price</td><td><code>48000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>47950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID for the stop order</td><td><code>d25ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr></tbody></table>
+
+### Response
+
+```json
+{
+  "code": 200,
+  "data": {
+    "I": "79f948fd-7556-4066-a128-083f3ea49322",
+    "i": 645953,
+    "s": "BTC"
+  },
+  "id": "660065de-8f32-46ad-ba1e-83c93d3e3966",
+  "t": 1749223025962,
+  "type": "create_market_order"
+}
+```
+
+| Field    | Type    | Description                             |
+| -------- | ------- | --------------------------------------- |
+| `'code'` | integer | Status code                             |
+| `'data'` | object  | Contains information about placed order |
+| `'I'`    | string  | CLOID (if provided)                     |
+| `'i'`    | integer | Order ID                                |
+| `'s'`    | string  | Symbol                                  |
+| `'id'`   | string  | Client-defined request ID               |
+| `'t'`    | integer | Timestamp in milliseconds               |
+| `'type'` | string  | Specifies action type                   |
+# Create limit order
+
+The [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/ws/create_order.py) provides a comprehensive example on using this endpoint.
+
+### Request
+
+```json
+{
+  "id": "660065de-8f32-46ad-ba1e-83c93d3e3966",
+  "params": {
+    "create_order": {
+      "account": "AwX6321...",
+      "signature": "5vnYpt...",
+      "timestamp": 1749223025396,
+      "expiry_window": 5000,
+      "symbol": "BTC",
+      "price": "100000.00",
+      "reduce_only": false,
+      "amount": "0.001",
+      "side": "bid",
+      "tif": "GTC",
+      "client_order_id": "79f948fd-7556-4066-a128-083f3ea49322"
+    }
+  }
+}
+```
+
+<table><thead><tr><th width="188">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"id"</code></td><td>Full UUID string</td><td>required</td><td>Client-defined request ID</td><td><code>660065de-8f32-46ad-ba1e-83c93d3e3966</code></td></tr><tr><td><code>"params"</code></td><td>object</td><td>required</td><td>Contains action type and action parameters</td><td><code>"create_order"</code></td></tr><tr><td><code>"create_order"</code></td><td>object</td><td>required</td><td>Specifies action type and contains parameters</td><td>See examples.</td></tr><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"price"</code></td><td>string</td><td>required</td><td>Order price</td><td><code>50000</code></td></tr><tr><td><code>"reduce_only"</code></td><td>boolean</td><td>required</td><td>Whether the order is reduce-only</td><td><code>false</code></td></tr><tr><td><code>"amount"</code></td><td>string</td><td>required</td><td>Order amount</td><td><code>0.1</code></td></tr><tr><td><code>"side"</code></td><td>string</td><td>required</td><td>Order side (bid/ask)</td><td><code>bid</code></td></tr><tr><td><code>"tif"</code></td><td>string</td><td>required</td><td>Time in force (GTC, IOC, ALO)</td><td><code>GTC</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>optional</td><td>Client-defined order ID</td><td><code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"take_profit"</code></td><td>object</td><td>optional</td><td>Take profit stop order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required (if <code>"take_profit"</code> exists)</td><td>Stop trigger price</td><td><code>55000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>54950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>string</td><td>Full UUID string</td><td>Client-defined order ID for the stop order</td><td><code>e36ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr><tr><td><code>"stop_loss"</code></td><td>object</td><td>optional</td><td>Stop loss order configuration</td><td>See next three rows</td></tr><tr><td><code>"stop_price"</code></td><td>string</td><td>required (if <code>"stop_loss"</code> exists)</td><td>Stop trigger price</td><td><code>48000</code></td></tr><tr><td><code>"limit_price"</code></td><td>string</td><td>optional</td><td>Limit price for the triggered order</td><td><code>47950</code></td></tr><tr><td><code>"client_order_id"</code></td><td>string</td><td>Full UUID string</td><td>Client-defined order ID for the stop order</td><td><code>d25ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr></tbody></table>
+
+### Response
+
+```json
+{
+  "code": 200,
+  "data": {
+    "I": "79f948fd-7556-4066-a128-083f3ea49322",
+    "i": 645953,
+    "s": "BTC"
+  },
+  "id": "660065de-8f32-46ad-ba1e-83c93d3e3966",
+  "t": 1749223025962,
+  "type": "create_order"
+}
+```
+
+| Field    | Type    | Description                             |
+| -------- | ------- | --------------------------------------- |
+| `'code'` | integer | Status code                             |
+| `'data'` | object  | Contains information about placed order |
+| `'I'`    | string  | CLOID (if provided)                     |
+| `'i'`    | integer | Order ID                                |
+| `'s'`    | string  | Symbol                                  |
+| `'id'`   | string  | Client-defined request ID               |
+| `'t'`    | integer | Timestamp in milliseconds               |
+| `'type'` | string  | Specifies action type                   |
+# Cancel order
+
+The [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/ws/cancel_order.py) provides a comprehensive example on using this endpoint.
+
+### Request
+
+```json
+{
+  "id": "1bb2b72f-f545-4938-8a38-c5cda8823675",
+  "params": {
+    "cancel_order": {
+      "account": "AwX6321...",
+      "signature": "4RqbgB...",
+      "timestamp": 1749223343149,
+      "expiry_window": 5000,
+      "symbol": "BTC",
+      "client_order_id": "79f948fd-7556-4066-a128-083f3ea49322"
+    }
+  }
+}
+```
+
+<table><thead><tr><th width="188">Field</th><th width="98">Type</th><th width="95">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"id"</code></td><td>Full UUID string</td><td>required</td><td>Client-defined request ID</td><td><code>1bb2b72f-f545-4938-8a38-c5cda8823675</code></td></tr><tr><td><code>"params"</code></td><td>object</td><td>required</td><td>Contains action type and action parameters</td><td><code>"cancel_order"</code></td></tr><tr><td><code>"cancel_order"</code></td><td>object</td><td>required</td><td>Specifies action type and contains parameters</td><td>See examples.</td></tr><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr><tr><td><code>"order_id"</code></td><td>integer</td><td>required (if no CLOID)</td><td>Exchange-assigned order ID</td><td><code>123</code></td></tr><tr><td><code>"client_order_id"</code></td><td>Full UUID string</td><td>required (if no OID)</td><td>Client-defined order ID</td><td><code>f47ac10b-58cc-4372-a567-0e02b2c3d479</code></td></tr></tbody></table>
+
+### Response
+
+```json
+{
+  "code": 200,
+  "data": {
+    "I": "79f948fd-7556-4066-a128-083f3ea49322",
+    "i": null,
+    "s": "BTC"
+  },
+  "id": "1bb2b72f-f545-4938-8a38-c5cda8823675",
+  "t": 1749223343610,
+  "type": "cancel_order"
+}
+```
+
+| Field    | Type    | Description                             |
+| -------- | ------- | --------------------------------------- |
+| `'code'` | integer | Status code                             |
+| `'data'` | object  | Contains information about placed order |
+| `'I'`    | string  | CLOID (if provided)                     |
+| `'i'`    | integer | Order ID                                |
+| `'s'`    | string  | Symbol                                  |
+| `'id'`   | string  | Same as above request ID                |
+| `'t'`    | integer | Timestamp in milliseconds               |
+| `'type'` | string  | Specifies action type                   |
+# Cancel all orders
+
+The [Pacifica Python SDK](https://github.com/pacifica-fi/python-sdk/blob/f2385d42e9ae5276ba2ba85505d51db2eefd2715/ws/cancel_all_orders.py) provides a comprehensive example on using this endpoint.
+
+### Request
+
+```json
+{
+  "id": "4e9b4edb-b123-4759-9250-d19db61fabcb",
+  "params": {
+    "cancel_all_orders": {
+      "account": "AwX6f3...",
+      "signature": "2XP8fz...",
+      "timestamp": 1749221927343,
+      "expiry_window": 5000,
+      "all_symbols": true,
+      "exclude_reduce_only": false
+    }
+  }
+}
+```
+
+<table><thead><tr><th width="184">Field</th><th width="98">Type</th><th width="123">Need</th><th>Description</th><th>Example</th></tr></thead><tbody><tr><td><code>"id"</code></td><td>Full UUID string</td><td>required</td><td>Client-defined request ID</td><td><code>1bb2b72f-f545-4938-8a38-c5cda8823675</code></td></tr><tr><td><code>"params"</code></td><td>object</td><td>required</td><td>Contains action type and action parameters</td><td><code>"cancel_all_orders"</code></td></tr><tr><td><code>"cancel_order"</code></td><td>object</td><td>required</td><td>Specifies action type and contains parameters</td><td>See examples.</td></tr><tr><td><code>"account"</code></td><td>string</td><td>required</td><td><p></p><p>User's wallet address</p><p></p></td><td><code>42trU9A5...</code></td></tr><tr><td><code>"agent_wallet"</code></td><td>string</td><td>optional</td><td>Agent wallet address</td><td><code>69trU9A5...</code></td></tr><tr><td><code>"signature"</code></td><td>string</td><td>required</td><td><p></p><p>Cryptographic signature</p><p></p></td><td><code>5j1Vy9Uq...</code></td></tr><tr><td><code>"timestamp"</code></td><td>integer</td><td>required</td><td>Current timestamp in milliseconds</td><td><code>1716200000000</code></td></tr><tr><td><code>"expiry_window"</code></td><td>integer</td><td>optional</td><td>Signature expiry in milliseconds</td><td><code>30000</code></td></tr><tr><td><code>"all_symbols"</code></td><td>boolean</td><td>required</td><td>Whether to cancel orders for all symbols</td><td><code>true</code></td></tr><tr><td><code>"exclude_reduce_only"</code></td><td>boolean</td><td>required</td><td>Whether to exclude reduce-only orders</td><td><code>false</code></td></tr><tr><td><code>"symbol"</code></td><td>string</td><td>required<br>(if <code>"all_symbols"</code> is false)</td><td>Trading pair symbol</td><td><code>BTC</code></td></tr></tbody></table>
+
+```json
+{
+  "code": 200,
+  "data": {
+    "cancelled_count": 10
+  },
+  "id": "b86b4f45-49da-4191-84e2-93e141acdeab",
+  "t": 1749221787291,
+  "type": "cancel_all_orders"
+}
+```
+
+| Field               | Type    | Description                             |
+| ------------------- | ------- | --------------------------------------- |
+| `'code'`            | integer | Status code                             |
+| `'data'`            | object  | Contains information about placed order |
+| `'cancelled_count'` | string  | Number of orders successfully cancelled |
+| `'id'`              | string  | Same as above request ID                |
+| `'t'`               | integer | Timestamp in milliseconds               |
+| `'type'`            | string  | Specifies action type                   |

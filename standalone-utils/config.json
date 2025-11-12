@@ -1,0 +1,10 @@
+{
+  "exchanges": {
+    "hyperliquid": {
+      "testnet": false
+    },
+    "pacifica": {
+      "testnet": false
+    }
+  }
+}
