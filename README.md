@@ -472,3 +472,4 @@ The bot features colorized terminal output for easy monitoring:
 - **Graceful shutdown**: Ctrl+C cancels remaining orders before exit
 - **Credentials**: Never commit `.env` file to version control
 - **Testing**: Always test with small `order_notional_usd` first (e.g., 5.0)
+- **Deployment**: Run on AWS Tokyo to have the best latency
