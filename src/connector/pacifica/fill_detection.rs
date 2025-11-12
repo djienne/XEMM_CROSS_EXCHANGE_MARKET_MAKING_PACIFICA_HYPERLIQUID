@@ -25,6 +25,60 @@ pub struct FillDetectionConfig {
     pub enable_position_fill_detection: bool,
 }
 
+/// Handle for updating position baselines from external fill sources
+///
+/// This allows order-based fill detection to update the position baseline
+/// so that position-based detection doesn't trigger duplicate hedges.
+#[derive(Clone)]
+pub struct PositionBaselineUpdater {
+    position_snapshots: Arc<Mutex<HashMap<String, PositionSnapshot>>>,
+    position_initialized: Arc<Mutex<HashSet<String>>>,
+}
+
+impl PositionBaselineUpdater {
+    /// Update position baseline when a fill is detected
+    ///
+    /// # Arguments
+    /// * `symbol` - Trading symbol
+    /// * `side` - Fill side ("buy" or "sell")
+    /// * `filled_amount` - Amount that was filled
+    /// * `avg_price` - Average fill price
+    pub fn update_baseline(&self, symbol: &str, side: &str, filled_amount: f64, avg_price: f64) {
+        if let Ok(mut snapshots) = self.position_snapshots.lock() {
+            if let Ok(mut initialized) = self.position_initialized.lock() {
+                // Get current snapshot or default to 0.0
+                let current = snapshots.get(symbol);
+                let prev_qty = current.map(|s| s.quantity).unwrap_or(0.0);
+
+                // Calculate new position based on fill
+                let delta = if side == "buy" { filled_amount } else { -filled_amount };
+                let new_qty = prev_qty + delta;
+
+                // Update snapshot
+                snapshots.insert(
+                    symbol.to_string(),
+                    PositionSnapshot {
+                        quantity: new_qty,
+                        entry_price: avg_price,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    },
+                );
+
+                // Mark as initialized
+                initialized.insert(symbol.to_string());
+
+                debug!(
+                    "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({} {:.4} @ ${:.4})",
+                    symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
+                );
+            }
+        }
+    }
+}
+
 /// Position snapshot for tracking changes
 #[derive(Debug, Clone)]
 struct PositionSnapshot {
@@ -67,6 +121,17 @@ impl FillDetectionClient {
         })
     }
 
+    /// Get a handle for updating position baselines from external sources
+    ///
+    /// CRITICAL: Use this to update baselines when order-based fills are detected,
+    /// preventing position-based detection from triggering duplicate hedges.
+    pub fn get_baseline_updater(&self) -> PositionBaselineUpdater {
+        PositionBaselineUpdater {
+            position_snapshots: self.position_snapshots.clone(),
+            position_initialized: self.position_initialized.clone(),
+        }
+    }
+
     /// Initialize position snapshots from external source (e.g., REST API at startup)
     ///
     /// This method allows pre-populating position baselines before starting the WebSocket,
@@ -93,6 +158,51 @@ impl FillDetectionClient {
                         symbol, quantity, entry_price
                     );
                 }
+            }
+        }
+    }
+
+    /// Update position baseline when a fill is detected by other sources
+    ///
+    /// CRITICAL: This prevents position-based detection from triggering duplicate hedges
+    /// when order-based detection already processed the fill.
+    ///
+    /// # Arguments
+    /// * `symbol` - Trading symbol
+    /// * `side` - Fill side ("buy" or "sell")
+    /// * `filled_amount` - Amount that was filled
+    /// * `avg_price` - Average fill price
+    pub fn update_position_baseline(&self, symbol: &str, side: &str, filled_amount: f64, avg_price: f64) {
+        if let Ok(mut snapshots) = self.position_snapshots.lock() {
+            if let Ok(mut initialized) = self.position_initialized.lock() {
+                // Get current snapshot or default to 0.0
+                let current = snapshots.get(symbol);
+                let prev_qty = current.map(|s| s.quantity).unwrap_or(0.0);
+
+                // Calculate new position based on fill
+                let delta = if side == "buy" { filled_amount } else { -filled_amount };
+                let new_qty = prev_qty + delta;
+
+                // Update snapshot
+                snapshots.insert(
+                    symbol.to_string(),
+                    PositionSnapshot {
+                        quantity: new_qty,
+                        entry_price: avg_price,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    },
+                );
+
+                // Mark as initialized
+                initialized.insert(symbol.to_string());
+
+                debug!(
+                    "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({}  {:.4} @ ${:.4})",
+                    symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
+                );
             }
         }
     }

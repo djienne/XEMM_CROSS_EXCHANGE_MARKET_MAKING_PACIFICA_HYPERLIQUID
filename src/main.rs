@@ -26,8 +26,8 @@ use xemm_rust::connector::hyperliquid::{
     OrderbookConfig as HyperliquidOrderbookConfig,
 };
 use xemm_rust::connector::pacifica::{
-    FillDetectionClient, FillDetectionConfig, FillEvent, OrderbookClient as PacificaOrderbookClient,
-    OrderbookConfig as PacificaOrderbookConfig, OrderSide as PacificaOrderSide,
+    FillDetectionClient, FillDetectionConfig, FillEvent, PositionBaselineUpdater,
+    OrderbookClient as PacificaOrderbookClient, OrderbookConfig as PacificaOrderbookConfig, OrderSide as PacificaOrderSide,
     PacificaCredentials, PacificaTrading, PacificaWsTrading,
 };
 use xemm_rust::strategy::{Opportunity, OpportunityEvaluator, OrderSide};
@@ -326,6 +326,9 @@ async fn main() -> Result<()> {
     let mut fill_client = FillDetectionClient::new(fill_config, false)
         .context("Failed to create fill detection client")?;
 
+    // Get baseline updater BEFORE starting (to prevent duplicate hedge triggers)
+    let baseline_updater = fill_client.get_baseline_updater();
+
     tokio::spawn(async move {
         tprintln!("{} Starting fill detection client", "[FILL_DETECTION]".magenta().bold());
         fill_client
@@ -362,6 +365,7 @@ async fn main() -> Result<()> {
                         let pac_ws_trading_clone = pacifica_ws_trading_fill.clone();
                         let symbol_clone = symbol_fill.clone();
                         let processed_fills_clone = processed_fills_ws.clone();
+                        let baseline_updater_clone = baseline_updater.clone();
                         tokio::spawn(async move {
                             // Check if this is our order
                             let state = bot_state_clone.read().await;
@@ -468,10 +472,19 @@ async fn main() -> Result<()> {
                                     "✓✓".green().bold()
                                 );
 
+                                // *** CRITICAL: UPDATE POSITION BASELINE ***
+                                // This prevents position-based detection from triggering duplicate hedge
+                                let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
+                                baseline_updater_clone.update_baseline(
+                                    &symbol_clone,
+                                    &side_str,
+                                    filled_size,
+                                    avg_px
+                                );
+
                                 tprintln!("{} {}, triggering hedge", format!("[{}]", symbol).bright_white().bold(), "Order filled".green().bold());
 
                                 // Trigger hedge
-                                let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
                                 hedge_tx.send((order_side, filled_size, avg_px)).await.ok();
                             }
                         });
@@ -574,6 +587,7 @@ async fn main() -> Result<()> {
                             let pac_ws_trading_clone = pacifica_ws_trading_fill.clone();
                             let symbol_clone = symbol_fill.clone();
                             let processed_fills_clone = processed_fills_ws.clone();
+                            let baseline_updater_clone = baseline_updater.clone();
                             tokio::spawn(async move {
                                 // Check if this is our order
                                 let state = bot_state_clone.read().await;
@@ -674,13 +688,22 @@ async fn main() -> Result<()> {
                                         "✓✓".green().bold()
                                     );
 
+                                    // *** CRITICAL: UPDATE POSITION BASELINE ***
+                                    // This prevents position-based detection from triggering duplicate hedge
+                                    let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
+                                    baseline_updater_clone.update_baseline(
+                                        &symbol_clone,
+                                        &side_str,
+                                        filled_size,
+                                        avg_px
+                                    );
+
                                     tprintln!("{} {}, triggering hedge for partial fill",
                                         format!("[{}]", symbol).bright_white().bold(),
                                         "Partial fill hedging".green().bold()
                                     );
 
                                     // Trigger hedge with partial fill amount
-                                    let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
                                     hedge_tx.send((order_side, filled_size, avg_px)).await.ok();
                                 }
                             });
