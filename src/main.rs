@@ -2103,6 +2103,149 @@ async fn main() -> Result<()> {
                         );
                     }
 
+                    // *** POST-HEDGE POSITION VERIFICATION ***
+                    // Wait for positions to propagate and verify net position is neutral
+                    tprintln!("");
+                    tprintln!("{} {} Post-hedge verification: Waiting 8 seconds for positions to propagate...",
+                        format!("[{} HEDGE]", config_hedge.symbol).bright_magenta().bold(),
+                        "⏱".cyan().bold()
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+
+                    tprintln!("{} Verifying final positions on both exchanges...",
+                        format!("[{} VERIFY]", config_hedge.symbol).cyan().bold()
+                    );
+
+                    // Check Pacifica position
+                    let pacifica_position = match pacifica_trading_hedge.get_positions().await {
+                        Ok(positions) => {
+                            if let Some(pos) = positions.iter().find(|p| p.symbol == config_hedge.symbol) {
+                                let amount: f64 = pos.amount.parse().unwrap_or(0.0);
+                                let signed_amount = if pos.side == "bid" { amount } else { -amount };
+
+                                tprintln!("{} Pacifica: {} {} (signed: {:.4})",
+                                    format!("[{} VERIFY]", config_hedge.symbol).cyan().bold(),
+                                    amount,
+                                    pos.side,
+                                    signed_amount
+                                );
+                                Some(signed_amount)
+                            } else {
+                                tprintln!("{} Pacifica: No position (flat)",
+                                    format!("[{} VERIFY]", config_hedge.symbol).cyan().bold()
+                                );
+                                Some(0.0)
+                            }
+                        }
+                        Err(e) => {
+                            tprintln!("{} {} Failed to fetch Pacifica position: {}",
+                                format!("[{} VERIFY]", config_hedge.symbol).yellow().bold(),
+                                "⚠".yellow().bold(),
+                                e
+                            );
+                            None
+                        }
+                    };
+
+                    // Check Hyperliquid position
+                    let hl_wallet = std::env::var("HL_WALLET").unwrap_or_default();
+                    let mut hyperliquid_position: Option<f64> = None;
+
+                    // Try up to 3 times with delays if position not found
+                    for retry in 0..3 {
+                        if retry > 0 {
+                            tprintln!("{} Retry {} - waiting 3 more seconds for Hyperliquid position...",
+                                format!("[{} VERIFY]", config_hedge.symbol).cyan().bold(),
+                                retry
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        }
+
+                        match hl_trading_hedge.get_user_state(&hl_wallet).await {
+                            Ok(user_state) => {
+                                if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == config_hedge.symbol) {
+                                    let szi: f64 = asset_pos.position.szi.parse().unwrap_or(0.0);
+                                    tprintln!("{} Hyperliquid: {} (signed: {:.4})",
+                                        format!("[{} VERIFY]", config_hedge.symbol).cyan().bold(),
+                                        if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
+                                        szi
+                                    );
+                                    hyperliquid_position = Some(szi);
+                                    break;
+                                } else if retry == 2 {
+                                    tprintln!("{} Hyperliquid: No position found after 3 attempts (flat)",
+                                        format!("[{} VERIFY]", config_hedge.symbol).cyan().bold()
+                                    );
+                                    hyperliquid_position = Some(0.0);
+                                }
+                            }
+                            Err(e) => {
+                                if retry == 2 {
+                                    tprintln!("{} {} Failed to fetch Hyperliquid position after 3 attempts: {}",
+                                        format!("[{} VERIFY]", config_hedge.symbol).yellow().bold(),
+                                        "⚠".yellow().bold(),
+                                        e
+                                    );
+                                    hyperliquid_position = None;
+                                }
+                            }
+                        }
+                    }
+
+                    // Calculate net position across both exchanges
+                    if let (Some(pac_pos), Some(hl_pos)) = (pacifica_position, hyperliquid_position) {
+                        let net_position = pac_pos + hl_pos;
+
+                        tprintln!("");
+                        tprintln!("{} Net Position: {:.4} (Pacifica: {:.4} + Hyperliquid: {:.4})",
+                            format!("[{} VERIFY]", config_hedge.symbol).cyan().bold(),
+                            net_position,
+                            pac_pos,
+                            hl_pos
+                        );
+
+                        // Check if net position is close to neutral
+                        if net_position.abs() < 0.01 {
+                            tprintln!("{} {} Net position is NEUTRAL (properly hedged across both exchanges)",
+                                format!("[{} VERIFY]", config_hedge.symbol).cyan().bold(),
+                                "✓".green().bold()
+                            );
+                        } else {
+                            tprintln!("");
+                            tprintln!("{}", "⚠".repeat(80).yellow());
+                            tprintln!("{} {} WARNING: Net position NOT neutral!",
+                                format!("[{} VERIFY]", config_hedge.symbol).red().bold(),
+                                "⚠".yellow().bold()
+                            );
+                            tprintln!("{} Position delta: {:.4} {}",
+                                format!("[{} VERIFY]", config_hedge.symbol).red().bold(),
+                                net_position.abs(),
+                                config_hedge.symbol
+                            );
+                            tprintln!("{} This indicates a potential hedge failure or partial fill.",
+                                format!("[{} VERIFY]", config_hedge.symbol).red().bold()
+                            );
+                            tprintln!("{} Please check positions manually and rebalance if needed!",
+                                format!("[{} VERIFY]", config_hedge.symbol).red().bold()
+                            );
+                            tprintln!("{}", "⚠".repeat(80).yellow());
+                            tprintln!("");
+                        }
+                    } else {
+                        tprintln!("");
+                        tprintln!("{} {} WARNING: Could not verify net position!",
+                            format!("[{} VERIFY]", config_hedge.symbol).yellow().bold(),
+                            "⚠".yellow().bold()
+                        );
+                        tprintln!("{} Failed to fetch positions from one or both exchanges.",
+                            format!("[{} VERIFY]", config_hedge.symbol).yellow().bold()
+                        );
+                        tprintln!("{} Please check positions manually!",
+                            format!("[{} VERIFY]", config_hedge.symbol).yellow().bold()
+                        );
+                        tprintln!("");
+                    }
+
                     // Mark cycle as complete AFTER displaying profit AND final cancellation
                     let mut state = bot_state_hedge.write().await;
                     state.mark_complete();
