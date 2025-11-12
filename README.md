@@ -3,6 +3,12 @@
 A high-performance Rust trading bot that performs single-cycle arbitrage between Pacifica (maker) and Hyperliquid (taker). The bot continuously monitors orderbook feeds from both exchanges, places limit orders on Pacifica when profitable opportunities arise, and immediately hedges fills on Hyperliquid.
 The main rationale is to use Hyperliquid's better liquidity, namely lower spreads, to do arbitrage trades on Pacifica immediately hedged on Hyperliquid.
 
+## Architecture Overview
+
+The diagram below illustrates the bot's architecture and trading flow:
+
+<img src="schema.png" alt="XEMM Architecture Schema" width="700">
+
 Inspired by Hummingbot's XEMM Strategy.
 
 **💰 Support this project**:
