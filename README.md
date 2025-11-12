@@ -78,7 +78,7 @@ All methods deduplicate via shared HashSet to ensure only one hedge executes per
 - ✅ **Multi-source Orderbook** - WebSocket primary, REST API fallback
 - ✅ **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
 - ✅ **Auto-reconnect** - Exponential backoff on connection failures
-- ✅ **Concurrent Tasks** - 7 async tasks running in parallel
+- ✅ **Concurrent Tasks** - 10 async tasks running in parallel
 - ✅ **High-frequency Monitoring** - 25ms profit checks, 100ms opportunity evaluation
 - ✅ **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
 - ✅ **Graceful Shutdown** - Cancels orders on Ctrl+C
@@ -199,7 +199,7 @@ The bot uses a state machine to track lifecycle:
 - **Complete** - Cycle complete, bot exits
 - **Error** - Unrecoverable error occurred
 
-### 10 Concurrent Tasks
+### Concurrent Tasks
 
 The XEMM bot orchestrates 10 async tasks running in parallel:
 
@@ -207,12 +207,12 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 2. **Hyperliquid Orderbook (WebSocket)** - Real-time bid/ask feed
 3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations (primary + position delta)
 4. **Pacifica REST API Polling** - Fallback orderbook data (every 2s)
-4.5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
-5. **REST API Fill Detection** - Backup fill polling (every 500ms)
-5.5. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
-6. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
-7. **Hedge Execution** - Executes Hyperliquid hedge after fill
-8. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
+5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
+6. **REST API Fill Detection** - Backup fill polling (every 500ms)
+7. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
+8. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
+9. **Hedge Execution** - Executes Hyperliquid hedge after fill
+10. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
 
 ## Configuration Parameters
 
@@ -320,18 +320,6 @@ This test:
 - Verifies only one hedge executes (deduplication works)
 - Checks positions on both Pacifica and Hyperliquid after hedge
 - Shows comprehensive detection method summary with timestamps
-
-### Trading Examples
-
-Generic trading examples (educational):
-
-```bash
-# Simple trading example
-cargo run --example simple_trade --release
-
-# More complex trading example
-cargo run --example trading_example --release
-```
 
 ### Utility Examples
 
