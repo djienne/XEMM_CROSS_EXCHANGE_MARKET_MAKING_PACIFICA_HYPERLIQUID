@@ -12,7 +12,7 @@ Deployment method:
 
 What gets deployed:
 - All Rust source code (src/, examples/)
-- Configuration files (config.json, Cargo.toml, Cargo.lock)
+- Configuration files (Cargo.toml, Cargo.lock)
 - Docker assets (Dockerfile, docker-compose.yml, .dockerignore)
 - Documentation (docs/, *.md, CLAUDE.md, DEPLOYMENT.md)
 
@@ -21,6 +21,7 @@ What gets excluded:
 - Build artifacts (target/) - will be built on remote server via Docker
 - Log files (*.log, logs/)
 - SSH keys (lighter.pem, *.pem)
+- Configuration file (config.json) - CREATE MANUALLY ON REMOTE SERVER
 - Environment file (.env) - CREATE MANUALLY ON REMOTE SERVER
 - IDE settings (.vscode/, .idea/, .claude/)
 - Deployment scripts (deploy.sh, deploy.py)
@@ -28,9 +29,10 @@ What gets excluded:
 - Python dashboard (dashboard_python/) - not needed for bot
 
 CRITICAL: After deployment, you MUST:
-1. Create .env file with API credentials on remote server
-2. Build and run with Docker: docker compose build && docker compose up -d
-3. Use graceful shutdown (Ctrl+C or docker compose stop) - NEVER kill -9
+1. Create config.json with bot parameters on remote server
+2. Create .env file with API credentials on remote server
+3. Build and run with Docker: docker compose build && docker compose up -d
+4. Use graceful shutdown (Ctrl+C or docker compose stop) - NEVER kill -9
 
 Usage:
     python deploy.py
@@ -86,6 +88,7 @@ EXCLUDE_PATTERNS = [
     '.claude/',  # Claude Code settings
     '*.pem',  # SSH keys
     'lighter.pem',
+    'config.json',  # NEVER deploy config - create manually on remote server
     '.env',  # NEVER deploy credentials - create manually on remote server
     '.env.local',
     '.env.*.local',
@@ -391,28 +394,33 @@ def display_next_steps():
     print(f"2. Navigate to the bot directory:")
     print(f"   cd {REMOTE_PATH}\n")
 
-    print("3. Create .env file with your credentials:")
+    print("3. Create config.json with bot parameters:")
+    print("   nano config.json")
+    print("   (Copy contents from your local config.json file)\n")
+
+    print("4. Create .env file with your credentials:")
     print("   nano .env")
     print("   (Copy contents from your local .env file)")
     print("   Required variables:")
     print("     PACIFICA_API_KEY, PACIFICA_SECRET_KEY, PACIFICA_ACCOUNT")
     print("     HL_WALLET, HL_PRIVATE_KEY\n")
 
-    print("4. Verify configuration:")
+    print("5. Verify configuration:")
     print("   cat config.json")
     print("   cat .env\n")
 
-    print("5. Build and run with Docker (recommended):")
+    print("6. Build and run with Docker (recommended):")
     print("   docker compose build")
     print("   docker compose up -d")
     print("   docker compose logs -f\n")
 
-    print("6. To stop gracefully (CRITICAL - cancels all orders):")
+    print("7. To stop gracefully (CRITICAL - cancels all orders):")
     print("   docker compose stop\n")
 
     print("=" * 60)
     print("IMPORTANT SAFETY NOTES:")
     print("=" * 60)
+    print("• config.json is NOT deployed - create it manually on remote server")
     print("• .env file is NOT deployed for security - create it manually")
     print("• NEVER use 'kill -9' or 'docker kill' - orders won't be cancelled")
     print("• Always use graceful shutdown (Ctrl+C or docker compose stop)")
@@ -444,8 +452,16 @@ def main():
     print(f"  SSH key:     {SSH_KEY}")
     print()
 
-    # Check if .env exists locally and remind user
+    # Check if config.json and .env exist locally and remind user
+    config_file = Path("config.json")
     env_file = Path(".env")
+
+    if config_file.exists():
+        print_warning("config.json will NOT be deployed (prevents overwriting remote config)")
+        print_info("You must create config.json manually on the remote server")
+    else:
+        print_warning("config.json not found locally")
+
     if env_file.exists():
         print_warning(".env file will NOT be deployed (security best practice)")
         print_info("You must create .env manually on the remote server with your credentials")
