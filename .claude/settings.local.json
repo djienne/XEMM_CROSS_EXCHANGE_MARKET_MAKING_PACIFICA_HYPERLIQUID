@@ -8,7 +8,22 @@
       "Bash(ssh:*)",
       "Bash(chmod:*)",
       "Bash(git init:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "Bash(git commit:*)",
+      "Bash(git rm:*)",
+      "Bash(git rev-list:*)",
+      "Bash(xargs:*)",
+      "Bash(git count-objects:*)",
+      "Bash(git verify-pack:*)",
+      "Bash(while read obj)",
+      "Bash(do git cat-file -p $obj)",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(node verify_wallet.js:*)",
+      "Bash(git config:*)",
+      "Bash(test:*)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []
