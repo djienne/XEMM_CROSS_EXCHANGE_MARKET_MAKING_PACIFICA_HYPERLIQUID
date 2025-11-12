@@ -1,12 +1,26 @@
 #!/usr/bin/env node
 import React, { useState, useEffect, createElement as h } from 'react';
 import { render, Box, Text } from 'ink';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import dotenv from 'dotenv';
 import HyperliquidConnector from './connectors/hyperliquid.js';
 import PacificaConnector from './connectors/pacifica.js';
+
+// ============================================================================
+// DEBUG MODE
+// ============================================================================
+// Set DEBUG=true in .env to enable debug logging
+const DEBUG_MODE = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
+
+// Logger wrapper that respects debug mode
+const logger = {
+  log: (...args) => DEBUG_MODE && console.log('[Dashboard]', ...args),
+  error: (...args) => console.error('[Dashboard ERROR]', ...args),
+  warn: (...args) => DEBUG_MODE && console.warn('[Dashboard WARN]', ...args),
+  info: (...args) => DEBUG_MODE && console.log('[Dashboard INFO]', ...args)
+};
 
 // Simple table component (replacing ink-table)
 const Table = ({ data }) => {
@@ -81,11 +95,26 @@ class DashboardState {
     this.recentOrders = [];
     this.maxOrders = 8;
 
-    // Track seen fill IDs for deduplication
+    // Track seen fill IDs for deduplication (with max size limit)
     this.seenFillIds = new Set();
+    this.maxSeenIds = 1000; // Prevent unbounded growth
 
-    // Track seen order IDs for deduplication
+    // Track seen order IDs for deduplication (with max size limit)
     this.seenOrderIds = new Set();
+
+    // Connection health status
+    this.hlConnected = false;
+    this.hlReconnecting = false;
+    this.pacConnected = false;
+    this.pacReconnecting = false;
+
+    // Last successful data fetch timestamps
+    this.hlLastFetch = null;
+    this.pacLastFetch = null;
+
+    // Error tracking
+    this.lastError = null;
+    this.errorCount = 0;
 
     // Dirty flag
     this.dirty = true;
@@ -107,6 +136,16 @@ class DashboardState {
       pacOrders: new Map(this.pacOrders),
       recentFills: [...this.recentFills],
       recentOrders: [...this.recentOrders],
+      // Connection health
+      hlConnected: this.hlConnected,
+      hlReconnecting: this.hlReconnecting,
+      pacConnected: this.pacConnected,
+      pacReconnecting: this.pacReconnecting,
+      hlLastFetch: this.hlLastFetch,
+      pacLastFetch: this.pacLastFetch,
+      // Error tracking
+      lastError: this.lastError,
+      errorCount: this.errorCount,
       lastUpdate: this.lastUpdate
     };
   }
@@ -116,25 +155,41 @@ class DashboardState {
     this.lastUpdate = Date.now();
   }
 
-  // Update balances (only update if non-zero to avoid displaying temporary API issues)
+  // Update balances with improved logic
   updateHLBalance(balance, equity) {
-    // Only update if values are valid (non-zero)
-    if (balance > 0 || equity > 0) {
+    // Accept null/undefined as valid (not fetched yet)
+    // Accept 0 if we haven't fetched before (initial state)
+    // Reject 0 only if we had a positive value before (likely API glitch)
+    const isValidUpdate =
+      balance !== undefined && equity !== undefined &&
+      (balance > 0 || equity > 0 || this.hlBalance === null);
+
+    if (isValidUpdate) {
       this.hlBalance = balance;
       this.hlEquity = equity;
+      this.hlLastFetch = Date.now();
       this.markDirty();
+      logger.info(`HL balance updated: ${balance} / ${equity}`);
+    } else {
+      logger.warn(`HL balance update rejected (zero values): ${balance} / ${equity}`);
     }
-    // If both are zero, keep previous values (likely a temporary API issue)
   }
 
   updatePACBalance(balance, equity) {
-    // Only update if values are valid (non-zero)
-    if (balance > 0 || equity > 0) {
+    // Same logic as HL balance
+    const isValidUpdate =
+      balance !== undefined && equity !== undefined &&
+      (balance > 0 || equity > 0 || this.pacBalance === null);
+
+    if (isValidUpdate) {
       this.pacBalance = balance;
       this.pacEquity = equity;
+      this.pacLastFetch = Date.now();
       this.markDirty();
+      logger.info(`PAC balance updated: ${balance} / ${equity}`);
+    } else {
+      logger.warn(`PAC balance update rejected (zero values): ${balance} / ${equity}`);
     }
-    // If both are zero, keep previous values (likely a temporary API issue)
   }
 
   // Update positions
@@ -171,12 +226,20 @@ class DashboardState {
     this.markDirty();
   }
 
-  // Add fill with deduplication
+  // Add fill with deduplication and memory protection
   addFill(fill) {
     const fillId = fill.id || fill.tradeId || fill.hash || `${fill.timestamp}-${fill.coin || fill.symbol}`;
 
     if (this.seenFillIds.has(fillId)) {
       return; // Already seen
+    }
+
+    // Memory protection: limit Set size
+    if (this.seenFillIds.size >= this.maxSeenIds) {
+      logger.warn(`Fill ID cache exceeded ${this.maxSeenIds}, clearing oldest entries`);
+      // Clear oldest half when limit reached
+      const toRemove = Array.from(this.seenFillIds).slice(0, Math.floor(this.maxSeenIds / 2));
+      toRemove.forEach(id => this.seenFillIds.delete(id));
     }
 
     this.seenFillIds.add(fillId);
@@ -192,7 +255,7 @@ class DashboardState {
     this.markDirty();
   }
 
-  // Add order to recent orders with deduplication
+  // Add order to recent orders with deduplication and memory protection
   addRecentOrder(order) {
     // Create unique ID for this order (prioritize order_id, use created_at consistently for fallback)
     const orderId = order.orderId || order.order_id ||
@@ -201,6 +264,13 @@ class DashboardState {
     // Skip if already seen
     if (this.seenOrderIds.has(orderId)) {
       return;
+    }
+
+    // Memory protection: limit Set size
+    if (this.seenOrderIds.size >= this.maxSeenIds) {
+      logger.warn(`Order ID cache exceeded ${this.maxSeenIds}, clearing oldest entries`);
+      const toRemove = Array.from(this.seenOrderIds).slice(0, Math.floor(this.maxSeenIds / 2));
+      toRemove.forEach(id => this.seenOrderIds.delete(id));
     }
 
     this.seenOrderIds.add(orderId);
@@ -267,11 +337,29 @@ function formatNumber(num, decimals = 2) {
 // INK UI COMPONENTS
 // ============================================================================
 
-const Header = ({ lastUpdate }) =>
-  h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'cyan' }, 'XEMM Dashboard - Live'),
-    h(Text, { color: 'gray' }, `Updated: ${formatTimestamp(lastUpdate)}`)
+const Header = ({ lastUpdate, hlConnected, hlReconnecting, pacConnected, pacReconnecting, errorCount }) => {
+  // Connection status indicators
+  const hlStatus = hlReconnecting ? ' 🔄 Reconnecting' :
+                   hlConnected ? ' ✓ Connected' : ' ⏳ Connecting';
+  const pacStatus = pacReconnecting ? ' 🔄 Reconnecting' :
+                    pacConnected ? ' ✓ Connected' : ' ⏳ Connecting';
+
+  const hlColor = hlReconnecting ? 'yellow' :
+                  hlConnected ? 'green' : 'gray';
+  const pacColor = pacReconnecting ? 'yellow' :
+                   pacConnected ? 'green' : 'gray';
+
+  return h(Box, { flexDirection: 'column' },
+    h(Text, { bold: true, color: 'cyan' }, DEBUG_MODE ? 'XEMM Dashboard - Live (DEBUG MODE)' : 'XEMM Dashboard - Live'),
+    h(Box, { flexDirection: 'row' },
+      h(Text, { color: 'gray' }, `Updated: ${formatTimestamp(lastUpdate)}  |  `),
+      h(Text, { color: hlColor }, `HL${hlStatus}`),
+      h(Text, { color: 'gray' }, '  |  '),
+      h(Text, { color: pacColor }, `PAC${pacStatus}`),
+      errorCount > 0 && h(Text, { color: 'red' }, `  |  ⚠️  ${errorCount} errors`)
+    )
   );
+};
 
 const BalanceTable = ({ hlBalance, hlEquity, pacBalance, pacEquity }) => {
   const data = [
@@ -303,7 +391,8 @@ const PositionTable = ({ hlPositions, pacPositions, symbols }) => {
     const pacPos = pacPositions.get(symbol);
 
     const hlSize = hlPos ? (hlPos.side === 'long' ? hlPos.size : -hlPos.size) : 0;
-    // Fixed: Pacifica connector returns 'long'/'short', not 'bid'/'ask'
+    // Note: Pacifica connector correctly transforms API response ('bid'/'ask') to 'long'/'short'
+    // See pacifica.js:690 for transformation logic
     const pacSize = pacPos ? (pacPos.side === 'long' ? parseFloat(pacPos.amount) : -parseFloat(pacPos.amount)) : 0;
     const netPos = hlSize + pacSize;
 
@@ -440,7 +529,14 @@ const RecentFillsTable = ({ recentFills }) => {
 // Main Dashboard Component
 const DashboardUI = ({ snapshot, symbols }) => {
   return h(Box, { flexDirection: 'column' },
-    h(Header, { lastUpdate: snapshot.lastUpdate }),
+    h(Header, {
+      lastUpdate: snapshot.lastUpdate,
+      hlConnected: snapshot.hlConnected,
+      hlReconnecting: snapshot.hlReconnecting,
+      pacConnected: snapshot.pacConnected,
+      pacReconnecting: snapshot.pacReconnecting,
+      errorCount: snapshot.errorCount
+    }),
     h(BalanceTable, {
       hlBalance: snapshot.hlBalance,
       hlEquity: snapshot.hlEquity,
@@ -467,8 +563,25 @@ const DashboardUI = ({ snapshot, symbols }) => {
 
 class Dashboard {
   constructor(configPath) {
-    // Load configuration
-    this.config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    // Validate config file exists
+    if (!existsSync(configPath)) {
+      throw new Error(`Configuration file not found: ${configPath}`);
+    }
+
+    // Load and validate configuration
+    try {
+      this.config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    } catch (error) {
+      throw new Error(`Failed to parse configuration file: ${error.message}`);
+    }
+
+    // Validate required config fields
+    if (!this.config.symbols || !Array.isArray(this.config.symbols) || this.config.symbols.length === 0) {
+      throw new Error('Configuration must contain a non-empty "symbols" array');
+    }
+
+    logger.info(`Loaded config: ${this.config.symbols.length} symbols`);
+
     this.state = new DashboardState();
 
     // Connectors
@@ -483,21 +596,33 @@ class Dashboard {
   }
 
   async initialize() {
-    // Permanently suppress all console output to prevent dashboard movement
-    const originalLog = console.log;
-    const originalError = console.error;
-    const originalWarn = console.warn;
+    // Suppress console output to prevent dashboard movement (unless DEBUG mode)
+    if (!DEBUG_MODE) {
+      const originalLog = console.log;
+      const originalError = console.error;
+      const originalWarn = console.warn;
 
-    console.log = () => {};
-    console.error = () => {};
-    console.warn = () => {};
+      console.log = () => {};
+      console.error = () => {};
+      console.warn = () => {};
+    }
 
     try {
+      logger.info('Initializing connectors...');
+
+      // Validate environment variables
+      if (!process.env.HL_WALLET || !process.env.HL_PRIVATE_KEY) {
+        throw new Error('Missing Hyperliquid credentials (HL_WALLET, HL_PRIVATE_KEY)');
+      }
+      if (!process.env.SOL_WALLET || !process.env.API_PUBLIC || !process.env.API_PRIVATE) {
+        throw new Error('Missing Pacifica credentials (SOL_WALLET, API_PUBLIC, API_PRIVATE)');
+      }
+
       // Initialize Hyperliquid connector
       this.hlConnector = new HyperliquidConnector({
         wallet: process.env.HL_WALLET,
         privateKey: process.env.HL_PRIVATE_KEY,
-        silent: true
+        silent: !DEBUG_MODE
       });
 
       // Initialize Pacifica connector
@@ -505,17 +630,76 @@ class Dashboard {
         wallet: process.env.SOL_WALLET,
         apiPublic: process.env.API_PUBLIC,
         apiPrivate: process.env.API_PRIVATE,
-        silent: true
+        silent: !DEBUG_MODE
       });
+
+      // Set up connection event listeners
+      this.setupConnectionListeners();
 
       // Connect to exchanges (WebSocket)
       await this.hlConnector.connect();
-      await this.pacConnector.connect();
-    } finally {
-      // Keep console suppressed - don't restore
-      // This prevents connector reconnection messages from disrupting the UI
-    }
+      this.state.hlConnected = true;
+      this.state.markDirty();
 
+      await this.pacConnector.connect();
+      this.state.pacConnected = true;
+      this.state.markDirty();
+
+      logger.info('Connectors initialized successfully');
+    } catch (error) {
+      logger.error('Initialization error:', error.message);
+      this.state.lastError = error.message;
+      this.state.errorCount++;
+      this.state.markDirty();
+      throw error;
+    }
+  }
+
+  setupConnectionListeners() {
+    // Hyperliquid connection events
+    this.hlConnector.on('connected', () => {
+      logger.info('HL connected');
+      this.state.hlConnected = true;
+      this.state.hlReconnecting = false;
+      this.state.markDirty();
+    });
+
+    this.hlConnector.on('disconnected', () => {
+      logger.warn('HL disconnected');
+      this.state.hlConnected = false;
+      this.state.markDirty();
+    });
+
+    this.hlConnector.on('error', (error) => {
+      logger.error('HL error:', error.message);
+      this.state.lastError = `HL: ${error.message}`;
+      this.state.errorCount++;
+      this.state.markDirty();
+    });
+
+    // Pacifica connection events
+    this.pacConnector.on('connected', () => {
+      logger.info('PAC connected');
+      this.state.pacConnected = true;
+      this.state.pacReconnecting = false;
+      this.state.markDirty();
+    });
+
+    this.pacConnector.on('disconnected', () => {
+      logger.warn('PAC disconnected');
+      this.state.pacConnected = false;
+      this.state.markDirty();
+    });
+
+    this.pacConnector.on('error', (error) => {
+      logger.error('PAC error:', error.message);
+      this.state.lastError = `PAC: ${error.message}`;
+      this.state.errorCount++;
+      this.state.markDirty();
+    });
+  }
+
+  async setupAndStart() {
     // Set up WebSocket event handlers
     this.setupEventHandlers();
 
@@ -591,6 +775,8 @@ class Dashboard {
 
   async bootstrapData() {
     try {
+      logger.info('Bootstrapping initial data...');
+
       // Fetch initial HL data
       await this.pollHLData();
 
@@ -599,8 +785,13 @@ class Dashboard {
 
       // Subscribe to Pacifica WebSocket order updates (real-time)
       await this.pacConnector.subscribeOrderUpdates(process.env.SOL_WALLET);
+
+      logger.info('Bootstrap complete');
     } catch (error) {
-      console.error('[Dashboard] Bootstrap error:', error);
+      logger.error('Bootstrap error:', error.message);
+      this.state.lastError = `Bootstrap: ${error.message}`;
+      this.state.errorCount++;
+      this.state.markDirty();
     }
   }
 
@@ -634,8 +825,12 @@ class Dashboard {
         });
       });
 
+      logger.log('HL data polled successfully');
     } catch (error) {
-      console.error('[Dashboard] Error polling HL data:', error.message);
+      logger.error('Error polling HL data:', error.message);
+      this.state.lastError = `HL Poll: ${error.message}`;
+      this.state.errorCount++;
+      this.state.markDirty();
     }
   }
 
@@ -663,8 +858,8 @@ class Dashboard {
       }
 
       // Fetch recent fills from order history (returns data array directly)
-      // Fetch 200 orders to catch more history and reduce gaps
-      const orderHistory = await this.pacConnector.requestOrderHistoryRest(process.env.SOL_WALLET, 200);
+      // Optimized: Fetch 50 orders (reduced from 200 to improve performance)
+      const orderHistory = await this.pacConnector.requestOrderHistoryRest(process.env.SOL_WALLET, 50);
 
       if (Array.isArray(orderHistory)) {
         // First, separate filled orders and cancelled/rejected orders
@@ -714,8 +909,12 @@ class Dashboard {
         this.state.replaceRecentOrders(recentOrdersSnapshot);
       }
 
+      logger.log('PAC data polled successfully');
     } catch (error) {
-      console.error('[Dashboard] Error polling PAC data:', error.message);
+      logger.error('Error polling PAC data:', error.message);
+      this.state.lastError = `PAC Poll: ${error.message}`;
+      this.state.errorCount++;
+      this.state.markDirty();
     }
   }
 
@@ -764,11 +963,16 @@ class Dashboard {
 
 async function main() {
   const configPath = join(__dirname, 'dashboard', 'config.json');
-  const dashboard = new Dashboard(configPath);
 
   try {
-    // Initialize dashboard
+    // Create and initialize dashboard
+    logger.info('Starting XEMM Dashboard...');
+    const dashboard = new Dashboard(configPath);
+
     await dashboard.initialize();
+    await dashboard.setupAndStart();
+
+    logger.info('Dashboard initialized, starting UI...');
 
     // Create a React component that polls the state
     const App = () => {
@@ -791,10 +995,14 @@ async function main() {
     // Render the UI with patchConsole disabled to prevent output interference
     const { unmount } = render(h(App), { patchConsole: false });
 
+    logger.info('Dashboard running. Press Ctrl+C to exit.');
+
     // Handle graceful shutdown
     const handleShutdown = async () => {
+      logger.info('Shutting down dashboard...');
       unmount();
       await dashboard.cleanup();
+      logger.info('Dashboard stopped.');
       process.exit(0);
     };
 
@@ -802,8 +1010,10 @@ async function main() {
     process.on('SIGTERM', handleShutdown);
 
   } catch (error) {
-    console.error('[Dashboard] Fatal error:', error);
-    await dashboard.cleanup();
+    logger.error('Fatal error:', error.message);
+    if (DEBUG_MODE) {
+      console.error(error.stack);
+    }
     process.exit(1);
   }
 }
