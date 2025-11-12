@@ -6,6 +6,10 @@ The main rationale is to use Hyperliquid's better liquidity, namely lower spread
 ## Architecture Overview
 
 The diagram below illustrates the bot's trading idea. We arbitrage the fact that often bid-ask spread is tighter on Hyperliquid than in Pacifica because Hyperliquid has better liquidity.
+This is better than classical taker-to-taker arbitrage because:
+* there are more such opportunities
+* in taker-to-taker arbitrage, it is very hard or even impossible to compete on latency with professionals and exchanges
+* you are arbitraging your own limit order price, so you may have a latency advantage
 
 <img src="schema.png" alt="XEMM Architecture Schema" width="700">
 
