@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::time::{interval, Duration};
@@ -41,6 +41,8 @@ pub struct FillDetectionClient {
     position_snapshots: Arc<Mutex<HashMap<String, PositionSnapshot>>>,
     /// Track last order fill time for cross-validation (symbol -> timestamp)
     last_order_fill_time: Arc<Mutex<Instant>>,
+    /// Track which symbols have received their first position update (for baseline initialization)
+    position_initialized: Arc<Mutex<HashSet<String>>>,
 }
 
 impl FillDetectionClient {
@@ -61,7 +63,38 @@ impl FillDetectionClient {
             ws_url,
             position_snapshots: Arc::new(Mutex::new(HashMap::new())),
             last_order_fill_time: Arc::new(Mutex::new(Instant::now())),
+            position_initialized: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    /// Initialize position snapshots from external source (e.g., REST API at startup)
+    ///
+    /// This method allows pre-populating position baselines before starting the WebSocket,
+    /// preventing false fill detection from pre-existing positions.
+    ///
+    /// # Arguments
+    /// * `positions` - Vector of (symbol, quantity, entry_price, timestamp) tuples
+    ///   where quantity is signed (+ for long, - for short)
+    pub fn initialize_positions(&self, positions: Vec<(String, f64, f64, u64)>) {
+        if let Ok(mut snapshots) = self.position_snapshots.lock() {
+            if let Ok(mut initialized) = self.position_initialized.lock() {
+                for (symbol, quantity, entry_price, timestamp) in positions {
+                    snapshots.insert(
+                        symbol.clone(),
+                        PositionSnapshot {
+                            quantity,
+                            entry_price,
+                            timestamp,
+                        },
+                    );
+                    initialized.insert(symbol.clone());
+                    info!(
+                        "[POSITION INIT] Pre-initialized {} position: {:.4} @ ${:.4}",
+                        symbol, quantity, entry_price
+                    );
+                }
+            }
+        }
     }
 
     /// Start the fill detection client with a callback for fill events
@@ -257,9 +290,51 @@ impl FillDetectionClient {
 
     /// Detect fill from position change (redundancy layer)
     fn detect_fill_from_position(&self, position: &super::types::PositionData) -> Option<FillEvent> {
-        // Parse position data
-        let amount: f64 = position.amount.parse().ok()?;
-        let entry_price: f64 = position.entry_price.parse().ok()?;
+        // Parse position data with validation
+        let amount: f64 = match position.amount.parse::<f64>() {
+            Ok(val) if val >= 0.0 && val.is_finite() => val,
+            Ok(val) => {
+                warn!(
+                    "[POSITION VALIDATION] Invalid amount value: {} (must be non-negative and finite)",
+                    val
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    "[POSITION VALIDATION] Failed to parse amount '{}': {}",
+                    position.amount, e
+                );
+                return None;
+            }
+        };
+
+        let entry_price: f64 = match position.entry_price.parse::<f64>() {
+            Ok(val) if val > 0.0 && val.is_finite() => val,
+            Ok(val) => {
+                warn!(
+                    "[POSITION VALIDATION] Invalid entry_price value: {} (must be positive and finite)",
+                    val
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    "[POSITION VALIDATION] Failed to parse entry_price '{}': {}",
+                    position.entry_price, e
+                );
+                return None;
+            }
+        };
+
+        // Validate side field
+        if position.side != "ask" && position.side != "bid" {
+            warn!(
+                "[POSITION VALIDATION] Invalid side value: '{}' (must be 'ask' or 'bid')",
+                position.side
+            );
+            return None;
+        }
 
         // Convert to signed quantity (+ for long, - for short)
         let quantity = if position.side == "ask" {
@@ -268,12 +343,65 @@ impl FillDetectionClient {
             amount   // Long position
         };
 
+        debug!(
+            "[POSITION UPDATE] {} | amount: {}, side: {}, entry: ${}, quantity: {}",
+            position.symbol, amount, position.side, entry_price, quantity
+        );
+
+        // Check if this is the first position update for this symbol
+        let mut initialized = self.position_initialized.lock().ok()?;
+        let is_first_update = !initialized.contains(&position.symbol);
+
         // Get previous position snapshot
         let mut snapshots = self.position_snapshots.lock().ok()?;
         let prev_snapshot = snapshots.get(&position.symbol);
 
         let prev_qty = prev_snapshot.map(|s| s.quantity).unwrap_or(0.0);
         let delta = quantity - prev_qty;
+
+        // CRITICAL FIX: If this is the first position update for this symbol,
+        // treat it as baseline initialization ONLY (don't trigger fills)
+        // This prevents false positives from detecting pre-existing positions as new fills
+        if is_first_update {
+            info!(
+                "[POSITION BASELINE] Initializing position snapshot for {}: {:.4} (side: {}, entry: ${:.4})",
+                position.symbol,
+                quantity,
+                position.side,
+                entry_price
+            );
+
+            // Mark this symbol as initialized
+            initialized.insert(position.symbol.clone());
+            drop(initialized);  // Release lock early
+
+            // Save the baseline snapshot
+            snapshots.insert(
+                position.symbol.clone(),
+                PositionSnapshot {
+                    quantity,
+                    entry_price,
+                    timestamp: position.timestamp,
+                },
+            );
+
+            return None;  // Don't trigger fill detection on first update
+        }
+
+        drop(initialized);  // Release lock early
+
+        // Validate timestamp - reject stale updates (older than previous snapshot)
+        if let Some(prev_snapshot) = prev_snapshot {
+            if position.timestamp <= prev_snapshot.timestamp {
+                warn!(
+                    "[POSITION VALIDATION] Stale position update detected for {} (current: {}, previous: {}). Ignoring.",
+                    position.symbol,
+                    position.timestamp,
+                    prev_snapshot.timestamp
+                );
+                return None;  // Ignore stale updates
+            }
+        }
 
         // Only detect fills if there's a significant change (> 0.0001 for floating point tolerance)
         if delta.abs() < 0.0001 {
@@ -289,20 +417,41 @@ impl FillDetectionClient {
             return None;
         }
 
+        // Validate delta is reasonable (max 10 units for safety)
+        // This prevents triggering on obviously corrupted data
+        if delta.abs() > 10.0 {
+            warn!(
+                "[POSITION VALIDATION] Unreasonably large position delta detected: {:.4} (prev: {:.4}, new: {:.4}). Possible data corruption. NOT triggering hedge.",
+                delta, prev_qty, quantity
+            );
+
+            // Update snapshot but don't trigger fill
+            snapshots.insert(
+                position.symbol.clone(),
+                PositionSnapshot {
+                    quantity,
+                    entry_price,
+                    timestamp: position.timestamp,
+                },
+            );
+            return None;
+        }
+
         // Determine fill side from delta
         let side = if delta > 0.0 { "buy" } else { "sell" };
 
-        // Cross-validate: check if we received order fills recently (within 10 seconds)
-        let cross_validated = if let Ok(last_time) = self.last_order_fill_time.lock() {
-            last_time.elapsed().as_secs() < 10
+        // Cross-validate: check if we received order fills recently (for logging purposes only)
+        let (cross_validated, seconds_since_last_fill) = if let Ok(last_time) = self.last_order_fill_time.lock() {
+            let elapsed = last_time.elapsed().as_secs();
+            (elapsed < 60, elapsed)
         } else {
-            false
+            (false, u64::MAX)
         };
 
-        // Log based on cross-validation result
+        // Log fill detection with cross-validation status (informational only)
         if cross_validated {
             info!(
-                "[POSITION FILL ✓] {} {:.4} {} @ {:.4} (pos delta: {:.4} → {:.4}, cross-validated)",
+                "[POSITION FILL ✓] {} {:.4} {} @ {:.4} (pos: {:.4} → {:.4}, cross-validated with order updates)",
                 side.to_uppercase(),
                 delta.abs(),
                 position.symbol,
@@ -311,14 +460,15 @@ impl FillDetectionClient {
                 quantity
             );
         } else {
-            warn!(
-                "[POSITION FILL ⚠] {} {:.4} {} @ {:.4} (pos delta: {:.4} → {:.4}, MISSED BY PRIMARY!)",
+            info!(
+                "[POSITION FILL ⚠] {} {:.4} {} @ {:.4} (pos: {:.4} → {:.4}, {} sec since last order activity)",
                 side.to_uppercase(),
                 delta.abs(),
                 position.symbol,
                 entry_price,
                 prev_qty,
-                quantity
+                quantity,
+                seconds_since_last_fill
             );
         }
 
