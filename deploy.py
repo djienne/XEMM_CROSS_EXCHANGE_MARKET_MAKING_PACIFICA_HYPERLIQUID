@@ -229,7 +229,11 @@ def create_remote_directory():
 
 
 def check_rsync_available():
-    """Check if rsync is available."""
+    """Check if rsync is available (disabled on Windows)."""
+    # Disable rsync on Windows - even if available, it doesn't work reliably
+    if platform.system() == "Windows":
+        return False
+
     try:
         result = subprocess.run(
             ["rsync", "--version"],
