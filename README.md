@@ -235,7 +235,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 1. **Startup**: Cancel all existing Pacifica orders
 2. **Wait**: Gather initial orderbook data (3s warmup)
 3. **Evaluate**: Check both BUY and SELL opportunities every 100ms
-4. **Place**: If profitable (>target profit), place limit order on Pacifica
+4. **Calculate & Place**: Calculate Pacifica limit price from Hyperliquid hedge price with target profit margin (`profit_rate_bps`) embedded, place order if still profitable after rounding
 5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >60s
 6. **Fill Detection**: 5-layer system detects when order fills
    - WebSocket fill detection (primary, real-time via account_order_updates)

@@ -29,6 +29,34 @@ else
     BUILD_MODE="Debug"
 fi
 
+# Check if xemm_rust is already running
+if pgrep -f "xemm_rust" > /dev/null 2>&1; then
+    echo -e "${YELLOW}⚠️  WARNING: xemm_rust process is already running!${NC}"
+    echo "Please stop the existing process before starting a new loop."
+    echo ""
+    echo "To view running processes:"
+    echo "  ps aux | grep xemm_rust"
+    echo ""
+    echo "To stop all bot processes:"
+    echo "  bash kill_process.sh"
+    exit 1
+fi
+
+# Check if another instance of this loop script is already running
+SCRIPT_NAME=$(basename "$0")
+RUNNING_INSTANCES=$(pgrep -f "$SCRIPT_NAME" | grep -v $$ | wc -l)
+if [ "$RUNNING_INSTANCES" -gt 0 ]; then
+    echo -e "${YELLOW}⚠️  WARNING: Another instance of $SCRIPT_NAME is already running!${NC}"
+    echo "Please stop the existing loop before starting a new one."
+    echo ""
+    echo "To view running loop processes:"
+    echo "  ps aux | grep $SCRIPT_NAME"
+    echo ""
+    echo "To stop all bot processes:"
+    echo "  bash kill_process.sh"
+    exit 1
+fi
+
 echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
 echo -e "${CYAN}  XEMM Bot - Continuous Runner (cargo run)${NC}"
 echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
