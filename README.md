@@ -11,6 +11,8 @@ This is better than classical taker-to-taker arbitrage because:
 * in taker-to-taker arbitrage, it is very hard or even impossible to compete on latency with professionals and exchanges
 * you are arbitraging your own limit order price, so you may have a latency advantage
 
+Run on *AWS Tokyo* to have the best latency.
+
 <img src="schema.png" alt="XEMM Architecture Schema" width="700">
 
 Inspired by Hummingbot's XEMM Strategy.
