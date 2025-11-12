@@ -5,7 +5,7 @@ The main rationale is to use Hyperliquid's better liquidity, namely lower spread
 
 ## Architecture Overview
 
-The diagram below illustrates the bot's architecture and trading flow:
+The diagram below illustrates the bot's trading idea:
 
 <img src="schema.png" alt="XEMM Architecture Schema" width="700">
 
