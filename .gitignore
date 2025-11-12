@@ -23,6 +23,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Debug files
+*debug*.txt
+
 # CSV files
 *.csv
 

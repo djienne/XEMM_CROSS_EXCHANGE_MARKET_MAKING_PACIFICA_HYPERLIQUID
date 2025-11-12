@@ -399,6 +399,96 @@ cargo run --example test_pump_orders --release
 cargo run --example test_xpl_orders --release
 ```
 
+## Standalone Utilities
+
+The `standalone-utils/` folder contains self-contained JavaScript and Python utilities for monitoring and managing trading operations. These utilities can be copied and run independently anywhere.
+
+### Available Utilities
+
+**JavaScript Utilities:**
+- **`get-recent-fills.js`** - Fetch and display recent filled orders from both exchanges with PnL tracking
+- **`cleanup-all-positions.js`** - Emergency script to flatten all open positions on both exchanges
+- **`cancel-all-orders.js`** - Cancel all outstanding orders on Pacifica
+
+**Python Dashboard:**
+- **`dashboard/`** - Real-time terminal dashboard for monitoring:
+  - Live orderbook feeds from both exchanges
+  - Position tracking and PnL calculation
+  - Order status and fill detection
+  - Cross-exchange spread visualization
+
+### Quick Setup
+
+```bash
+# Navigate to utilities folder
+cd standalone-utils/
+
+# Install JavaScript dependencies
+npm install
+
+# Setup credentials
+cp .env.example .env
+# Edit .env with your API keys
+
+# Run utilities
+node get-recent-fills.js        # View recent fills
+node cleanup-all-positions.js   # Emergency position cleanup
+```
+
+**For Python Dashboard:**
+```bash
+cd standalone-utils/dashboard/
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with credentials
+python dashboard.py
+```
+
+See `standalone-utils/README.md` for detailed documentation, configuration options, and troubleshooting.
+
+## Running on Linux/AWS VPS
+
+The repository includes bash scripts for easy deployment on Linux systems (e.g., AWS VPS):
+
+### Single Cycle (Background)
+
+Run one complete arbitrage cycle in the background with nohup:
+
+```bash
+bash run_nohup.sh
+```
+
+This runs the bot in the background, logs output to `output.log`, and exits after one successful fill + hedge cycle.
+
+### Continuous Loop (Multiple Cycles)
+
+Run the bot continuously, restarting automatically after each cycle:
+
+```bash
+bash run_bot_loop_cargo.sh
+```
+
+This script:
+- Runs the bot in an infinite loop
+- Waits 20 seconds between cycles
+- Automatically restarts after each successful fill + hedge
+- Rebuilds on each run (picks up code changes)
+- Shows colorized output with cycle numbers and timestamps
+- Press `Ctrl+C` to stop
+
+### Stop All Bot Processes
+
+Kill all running bot processes (single or loop mode):
+
+```bash
+bash kill_process.sh
+```
+
+This stops:
+- The `xemm_rust` binary (if running)
+- The `run_bot_loop_cargo.sh` script (if running in loop mode)
+- Any `cargo` processes spawned by the loop
+
 ## Development Commands
 
 ```bash
