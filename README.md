@@ -129,13 +129,13 @@ Edit `config.json`:
 ### 3. Run the bot
 
 ```bash
-# Run the XEMM trading bot
+# Run the XEMM trading bot. Warning: This will perform only one cycle (one maker order filled on Pacifica and then hedged ASAP on Hyperliquid). Use `run_bot_loop_cargo.sh` to run cycles continuously.
 cargo run
 
 # With debug logging
 RUST_LOG=debug cargo run
 
-# In release mode (optimized)
+# In release mode (optimized, full performance)
 cargo run --release
 ```
 
