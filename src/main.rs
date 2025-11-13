@@ -9,6 +9,7 @@ use tokio::signal;
 use xemm_rust::app::PositionSnapshot;
 use xemm_rust::bot::{ActiveOrder, BotStatus};
 use xemm_rust::trade_fetcher;
+use xemm_rust::util::cancel::dual_cancel;
 use xemm_rust::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 // Macro for timestamped colored output
@@ -259,54 +260,28 @@ async fn main() -> Result<()> {
                                     "⚡".yellow().bold()
                                 );
 
-                                // First: REST API cancel (fast, reliable)
-                                let rest_result = pac_trading_clone
-                                    .cancel_all_orders(false, Some(&symbol_clone), false)
-                                    .await;
-
-                                match rest_result {
-                                    Ok(count) => {
-                                        tprintln!("{} {} REST API cancelled {} order(s)",
+                                // Dual cancel: REST + WebSocket for redundancy
+                                match dual_cancel(
+                                    &pac_trading_clone,
+                                    &pac_ws_trading_clone,
+                                    &symbol_clone
+                                ).await {
+                                    Ok((rest_count, ws_count)) => {
+                                        tprintln!("{} {} Dual cancellation complete (REST: {}, WS: {})",
                                             "[FILL_DETECTION]".magenta().bold(),
-                                            "✓".green().bold(),
-                                            count
+                                            "✓✓".green().bold(),
+                                            rest_count,
+                                            ws_count
                                         );
                                     }
                                     Err(e) => {
-                                        tprintln!("{} {} REST API cancel failed: {}",
+                                        tprintln!("{} {} Dual cancellation failed: {}",
                                             "[FILL_DETECTION]".magenta().bold(),
-                                            "⚠".yellow().bold(),
+                                            "✗".red().bold(),
                                             e
                                         );
                                     }
                                 }
-
-                                // Second: WebSocket cancel (ultra-fast, no rate limits)
-                                let ws_result = pac_ws_trading_clone
-                                    .cancel_all_orders_ws(false, Some(&symbol_clone), false)
-                                    .await;
-
-                                match ws_result {
-                                    Ok(count) => {
-                                        tprintln!("{} {} WebSocket cancelled {} order(s)",
-                                            "[FILL_DETECTION]".magenta().bold(),
-                                            "✓".green().bold(),
-                                            count
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tprintln!("{} {} WebSocket cancel failed: {}",
-                                            "[FILL_DETECTION]".magenta().bold(),
-                                            "⚠".yellow().bold(),
-                                            e
-                                        );
-                                    }
-                                }
-
-                                tprintln!("{} {} Dual cancellation complete",
-                                    "[FILL_DETECTION]".magenta().bold(),
-                                    "✓✓".green().bold()
-                                );
 
                                 // *** CRITICAL: UPDATE POSITION BASELINE ***
                                 // This prevents position-based detection from triggering duplicate hedge
@@ -475,54 +450,28 @@ async fn main() -> Result<()> {
                                         "⚡".yellow().bold()
                                     );
 
-                                    // First: REST API cancel
-                                    let rest_result = pac_trading_clone
-                                        .cancel_all_orders(false, Some(&symbol_clone), false)
-                                        .await;
-
-                                    match rest_result {
-                                        Ok(count) => {
-                                            tprintln!("{} {} REST API cancelled {} order(s)",
+                                    // Dual cancel: REST + WebSocket for redundancy
+                                    match dual_cancel(
+                                        &pac_trading_clone,
+                                        &pac_ws_trading_clone,
+                                        &symbol_clone
+                                    ).await {
+                                        Ok((rest_count, ws_count)) => {
+                                            tprintln!("{} {} Dual cancellation complete (REST: {}, WS: {})",
                                                 "[FILL_DETECTION]".magenta().bold(),
-                                                "✓".green().bold(),
-                                                count
+                                                "✓✓".green().bold(),
+                                                rest_count,
+                                                ws_count
                                             );
                                         }
                                         Err(e) => {
-                                            tprintln!("{} {} REST API cancel failed: {}",
+                                            tprintln!("{} {} Dual cancellation failed: {}",
                                                 "[FILL_DETECTION]".magenta().bold(),
-                                                "⚠".yellow().bold(),
+                                                "✗".red().bold(),
                                                 e
                                             );
                                         }
                                     }
-
-                                    // Second: WebSocket cancel
-                                    let ws_result = pac_ws_trading_clone
-                                        .cancel_all_orders_ws(false, Some(&symbol_clone), false)
-                                        .await;
-
-                                    match ws_result {
-                                        Ok(count) => {
-                                            tprintln!("{} {} WebSocket cancelled {} order(s)",
-                                                "[FILL_DETECTION]".magenta().bold(),
-                                                "✓".green().bold(),
-                                                count
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tprintln!("{} {} WebSocket cancel failed: {}",
-                                                "[FILL_DETECTION]".magenta().bold(),
-                                                "⚠".yellow().bold(),
-                                                e
-                                            );
-                                        }
-                                    }
-
-                                    tprintln!("{} {} Dual cancellation complete",
-                                        "[FILL_DETECTION]".magenta().bold(),
-                                        "✓✓".green().bold()
-                                    );
 
                                     // *** CRITICAL: UPDATE POSITION BASELINE ***
                                     // This prevents position-based detection from triggering duplicate hedge
