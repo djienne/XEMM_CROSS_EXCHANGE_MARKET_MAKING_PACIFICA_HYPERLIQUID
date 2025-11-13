@@ -6,6 +6,7 @@ pub mod config;
 pub mod strategy;
 pub mod bot;
 pub mod trade_fetcher;
+pub mod util;
 
 // Re-export commonly used items for convenience
 pub use app::XemmBot;

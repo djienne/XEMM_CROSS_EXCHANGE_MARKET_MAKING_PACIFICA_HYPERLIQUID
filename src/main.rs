@@ -9,6 +9,7 @@ use tokio::signal;
 use xemm_rust::app::PositionSnapshot;
 use xemm_rust::bot::{ActiveOrder, BotStatus};
 use xemm_rust::trade_fetcher;
+use xemm_rust::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 // Macro for timestamped colored output
 macro_rules! tprintln {
@@ -29,73 +30,6 @@ use xemm_rust::connector::pacifica::{
     PacificaTrading,
 };
 use xemm_rust::strategy::{Opportunity, OpportunityEvaluator, OrderSide};
-
-/// Rate limit tracker for exponential backoff
-#[derive(Debug)]
-struct RateLimitTracker {
-    last_error_time: Option<Instant>,
-    consecutive_errors: u32,
-}
-
-impl RateLimitTracker {
-    fn new() -> Self {
-        Self {
-            last_error_time: None,
-            consecutive_errors: 0,
-        }
-    }
-
-    /// Record a rate limit error
-    fn record_error(&mut self) {
-        self.last_error_time = Some(Instant::now());
-        self.consecutive_errors += 1;
-    }
-
-    /// Record a successful API call
-    fn record_success(&mut self) {
-        self.last_error_time = None;
-        self.consecutive_errors = 0;
-    }
-
-    /// Get current backoff duration in seconds (exponential: 1, 2, 4, 8, 16, 32 max)
-    fn get_backoff_secs(&self) -> u64 {
-        if self.consecutive_errors == 0 {
-            return 0;
-        }
-        std::cmp::min(2u64.pow(self.consecutive_errors - 1), 32)
-    }
-
-    /// Check if we should skip this operation due to active backoff
-    fn should_skip(&self) -> bool {
-        if let Some(last_error) = self.last_error_time {
-            let backoff_duration = Duration::from_secs(self.get_backoff_secs());
-            last_error.elapsed() < backoff_duration
-        } else {
-            false
-        }
-    }
-
-    /// Get remaining backoff time in seconds
-    fn remaining_backoff_secs(&self) -> f64 {
-        if let Some(last_error) = self.last_error_time {
-            let backoff_duration = Duration::from_secs(self.get_backoff_secs());
-            let elapsed = last_error.elapsed();
-            if elapsed < backoff_duration {
-                (backoff_duration - elapsed).as_secs_f64()
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
-    }
-}
-
-/// Check if an error is a rate limit error
-fn is_rate_limit_error(error: &anyhow::Error) -> bool {
-    let error_string = error.to_string().to_lowercase();
-    error_string.contains("rate limit") || error_string.contains("too many requests") || error_string.contains("429")
-}
 
 /// XEMM Bot - Cross-Exchange Market Making Bot
 ///
@@ -1435,7 +1369,7 @@ async fn main() -> Result<()> {
                                 "[MONITOR]".yellow().bold(),
                                 "⚠".yellow().bold(),
                                 backoff_secs,
-                                cancel_rate_limit.consecutive_errors
+                                cancel_rate_limit.consecutive_errors()
                             );
                         } else {
                             // Other error - log but don't backoff
@@ -1613,7 +1547,7 @@ async fn main() -> Result<()> {
                                 "[MONITOR]".yellow().bold(),
                                 "⚠".yellow().bold(),
                                 backoff_secs,
-                                cancel_rate_limit.consecutive_errors
+                                cancel_rate_limit.consecutive_errors()
                             );
                         } else {
                             // Other error - log but don't backoff
@@ -2434,7 +2368,7 @@ async fn main() -> Result<()> {
                                     format!("[{} ORDER]", config.symbol).bright_yellow().bold(),
                                     "⚠".yellow().bold(),
                                     backoff_secs,
-                                    order_placement_rate_limit.consecutive_errors
+                                    order_placement_rate_limit.consecutive_errors()
                                 );
                             } else {
                                 // Other error - log but don't backoff
