@@ -93,56 +93,35 @@ async fn main() -> Result<()> {
     // Task 1: Pacifica Orderbook
     // ═══════════════════════════════════════════════════
 
-    let pac_prices_clone = pacifica_prices.clone();
-    let pacifica_ob_config = PacificaOrderbookConfig {
+    let pacifica_ob_service = xemm_rust::services::orderbook::PacificaOrderbookService {
+        prices: pacifica_prices.clone(),
         symbol: config.symbol.clone(),
         agg_level: config.agg_level,
         reconnect_attempts: config.reconnect_attempts,
         ping_interval_secs: config.ping_interval_secs,
     };
 
-    let mut pacifica_ob_client = PacificaOrderbookClient::new(pacifica_ob_config)
-        .context("Failed to create Pacifica orderbook client")?;
-
     tokio::spawn(async move {
-        tprintln!("{} Starting orderbook client", "[PACIFICA_OB]".magenta().bold());
-        pacifica_ob_client
-            .start(move |bid, ask, _symbol, _ts| {
-                let bid_price: f64 = bid.parse().unwrap_or(0.0);
-                let ask_price: f64 = ask.parse().unwrap_or(0.0);
-                *pac_prices_clone.lock().unwrap() = (bid_price, ask_price);
-            })
-            .await
-            .ok();
+        pacifica_ob_service.run().await.ok();
     });
 
     // ═══════════════════════════════════════════════════
     // Task 2: Hyperliquid Orderbook
     // ═══════════════════════════════════════════════════
 
-    let hl_prices_clone = hyperliquid_prices.clone();
-    let hyperliquid_ob_config = HyperliquidOrderbookConfig {
-        coin: config.symbol.clone(),
+    let hyperliquid_ob_service = xemm_rust::services::orderbook::HyperliquidOrderbookService {
+        prices: hyperliquid_prices.clone(),
+        symbol: config.symbol.clone(),
         reconnect_attempts: config.reconnect_attempts,
         ping_interval_secs: config.ping_interval_secs,
         request_interval_ms: 99, // ~10 Hz updates (10 req/s)
     };
 
-    let mut hyperliquid_ob_client = HyperliquidOrderbookClient::new(hyperliquid_ob_config)
-        .context("Failed to create Hyperliquid orderbook client")?;
-
     tokio::spawn(async move {
-        tprintln!("{} Starting orderbook client", "[HYPERLIQUID_OB]".magenta().bold());
-        hyperliquid_ob_client
-            .start(move |bid, ask, _coin, _ts| {
-                let bid_price: f64 = bid.parse().unwrap_or(0.0);
-                let ask_price: f64 = ask.parse().unwrap_or(0.0);
-                *hl_prices_clone.lock().unwrap() = (bid_price, ask_price);
-            })
-            .await
-            .ok();
+        hyperliquid_ob_service.run().await.ok();
     });
 
+    // ═══════════════════════════════════════════════════
     // ═══════════════════════════════════════════════════
     // Task 3: Fill Detection
     // ═══════════════════════════════════════════════════
