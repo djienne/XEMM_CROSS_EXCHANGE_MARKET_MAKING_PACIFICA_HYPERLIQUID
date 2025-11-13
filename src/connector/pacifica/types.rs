@@ -31,7 +31,7 @@ pub struct PingMessage {
 /// Generic websocket response
 #[derive(Debug, Deserialize)]
 pub struct WebSocketResponse {
-    pub channel: String,
+    pub channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }

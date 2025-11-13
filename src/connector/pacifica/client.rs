@@ -179,7 +179,17 @@ impl OrderbookClient {
         // First try to parse as generic response to check channel
         let response: WebSocketResponse = serde_json::from_str(text)?;
 
-        match response.channel.as_str() {
+        // Handle messages without channel field
+        let channel = match response.channel {
+            Some(ch) => ch,
+            None => {
+                debug!("[PACIFICA] Received message without channel field, ignoring: {}",
+                    if text.len() > 100 { &text[..100] } else { text });
+                return Ok(());
+            }
+        };
+
+        match channel.as_str() {
             "pong" => {
                 debug!("[PACIFICA] Received pong response");
                 Ok(())

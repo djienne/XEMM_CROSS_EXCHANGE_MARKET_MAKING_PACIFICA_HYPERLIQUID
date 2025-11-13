@@ -111,21 +111,77 @@ impl HedgeService {
 
             match hedge_result {
                 Ok(response) => {
-                    tprintln!("{} {} Hedge executed successfully",
-                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                        "✓".green().bold()
-                    );
-
-                    // Extract hedge fill price from response
+                    // Validate and extract order status
                     let hedge_fill_price = if let Some(status) = response.response.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
+                                tprintln!("{} {} Hedge executed successfully: Filled {} @ ${}",
+                                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                    "✓".green().bold(),
+                                    filled.totalSz,
+                                    filled.avgPx
+                                );
                                 filled.avgPx.parse::<f64>().ok()
                             }
-                            _ => None,
+                            crate::connector::hyperliquid::OrderStatus::Error { error } => {
+                                tprintln!("{} {} Hedge order FAILED: {}",
+                                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                    "✗".red().bold(),
+                                    error
+                                );
+
+                                // Set error state
+                                {
+                                    let mut state = self.bot_state.write().await;
+                                    state.set_error(format!("Hedge order failed: {}", error));
+                                }
+
+                                // Signal shutdown with error
+                                self.shutdown_tx.send(()).await.ok();
+                                return;  // Exit hedge service immediately
+                            }
+                            crate::connector::hyperliquid::OrderStatus::Resting { resting } => {
+                                tprintln!("{} {} Hedge order is RESTING (oid: {}) - unexpected for IOC market order",
+                                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                    "⚠".yellow().bold(),
+                                    resting.oid
+                                );
+
+                                // Treat as error - IOC orders should never rest
+                                {
+                                    let mut state = self.bot_state.write().await;
+                                    state.set_error(format!("Hedge order resting (unexpected for IOC): oid {}", resting.oid));
+                                }
+
+                                self.shutdown_tx.send(()).await.ok();
+                                return;
+                            }
                         }
                     } else {
+                        tprintln!("{} {} Hedge response has no statuses - unexpected API response",
+                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                            "⚠".yellow().bold()
+                        );
                         None
+                    };
+
+                    // Validate we got a fill price before continuing
+                    let hedge_fill_price = match hedge_fill_price {
+                        Some(price) => price,
+                        None => {
+                            tprintln!("{} {} No hedge fill price available - hedge may have failed",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "✗".red().bold()
+                            );
+
+                            {
+                                let mut state = self.bot_state.write().await;
+                                state.set_error("Hedge execution failed - no fill price".to_string());
+                            }
+
+                            self.shutdown_tx.send(()).await.ok();
+                            return;
+                        }
                     };
 
                     // Get expected profit from active order before marking complete
@@ -222,37 +278,33 @@ impl HedgeService {
                                 );
 
                                 // Calculate profit using fill event prices and estimated fees
-                                if let Some(hl_price) = hedge_fill_price {
-                                    let pac_price = avg_price;
+                                let hl_price = hedge_fill_price;
+                                let pac_price = avg_price;
 
-                                    // Estimate fees using configured rates
-                                    let pac_fee = pac_price * size * (self.config.pacifica_maker_fee_bps / 10000.0);
-                                    let hl_fee = hl_price * size * (self.config.hyperliquid_taker_fee_bps / 10000.0);
+                                // Estimate fees using configured rates
+                                let pac_fee = pac_price * size * (self.config.pacifica_maker_fee_bps / 10000.0);
+                                let hl_fee = hl_price * size * (self.config.hyperliquid_taker_fee_bps / 10000.0);
 
-                                    // Calculate profit
-                                    let (profit_usd, cost, _revenue) = match side {
-                                        OrderSide::Buy => {
-                                            // Bought on Pacifica (maker), Sold on Hyperliquid (taker)
-                                            let cost = (pac_price * size) + pac_fee;
-                                            let revenue = (hl_price * size) - hl_fee;
-                                            (revenue - cost, cost, revenue)
-                                        }
-                                        OrderSide::Sell => {
-                                            // Sold on Pacifica (maker), Bought on Hyperliquid (taker)
-                                            let revenue = (pac_price * size) - pac_fee;
-                                            let cost = (hl_price * size) + hl_fee;
-                                            (revenue - cost, cost, revenue)
-                                        }
-                                    };
+                                // Calculate profit
+                                let (profit_usd, cost, _revenue) = match side {
+                                    OrderSide::Buy => {
+                                        // Bought on Pacifica (maker), Sold on Hyperliquid (taker)
+                                        let cost = (pac_price * size) + pac_fee;
+                                        let revenue = (hl_price * size) - hl_fee;
+                                        (revenue - cost, cost, revenue)
+                                    }
+                                    OrderSide::Sell => {
+                                        // Sold on Pacifica (maker), Bought on Hyperliquid (taker)
+                                        let revenue = (pac_price * size) - pac_fee;
+                                        let cost = (hl_price * size) + hl_fee;
+                                        (revenue - cost, cost, revenue)
+                                    }
+                                };
 
-                                    let profit_rate = if cost > 0.0 { profit_usd / cost } else { 0.0 };
-                                    let profit_bps = profit_rate * 10000.0;
+                                let profit_rate = if cost > 0.0 { profit_usd / cost } else { 0.0 };
+                                let profit_bps = profit_rate * 10000.0;
 
-                                    (profit_bps, profit_usd, Some(pac_price), Some(hl_price), pac_fee, hl_fee)
-                                } else {
-                                    // No hedge price available at all
-                                    (0.0, 0.0, Some(avg_price), None, 0.0, 0.0)
-                                }
+                                (profit_bps, profit_usd, Some(pac_price), Some(hl_price), pac_fee, hl_fee)
                             }
                         };
 
