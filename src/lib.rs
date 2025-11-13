@@ -7,6 +7,7 @@ pub mod strategy;
 pub mod bot;
 pub mod trade_fetcher;
 pub mod util;
+pub mod services;
 
 // Re-export commonly used items for convenience
 pub use app::XemmBot;
