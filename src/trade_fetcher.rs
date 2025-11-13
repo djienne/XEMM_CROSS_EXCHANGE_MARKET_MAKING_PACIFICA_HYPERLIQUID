@@ -4,9 +4,8 @@
 /// both exchanges after a hedge execution. This is used by the main bot
 /// for profit calculation and can be tested independently.
 
-use std::time::Duration;
-use tokio::sync::Mutex;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::connector::pacifica::trading::{PacificaTrading, TradeHistoryItem};
 use crate::connector::hyperliquid::trading::HyperliquidTrading;
