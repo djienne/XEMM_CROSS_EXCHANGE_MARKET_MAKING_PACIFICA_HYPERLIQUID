@@ -25,7 +25,7 @@ macro_rules! tprintln {
 /// WebSocket-based fill detection service (primary fill detection method)
 pub struct FillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64)>,
+    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64, std::time::Instant)>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub fill_config: FillDetectionConfig,
@@ -118,7 +118,9 @@ impl FillDetectionService {
 
                                 // *** CRITICAL: UPDATE STATE FIRST ***
                                 // Mark as filled IMMEDIATELY to prevent main loop from placing new orders
-                                // during the cancellation window
+                                // State machine provides race condition protection - cancellation can run async
+                                let fill_detect_start = std::time::Instant::now();
+
                                 let order_side = match side_str.as_str() {
                                     "buy" | "bid" => OrderSide::Buy,
                                     "sell" | "ask" => OrderSide::Sell,
@@ -140,39 +142,44 @@ impl FillDetectionService {
                                     "✓".green().bold()
                                 );
 
-                                // *** CRITICAL: DUAL CANCELLATION (REST + WebSocket) ***
-                                // This prevents race conditions where:
-                                // 1. Monitor task might place a new order
-                                // 2. Multiple orders might be active
-                                // 3. Stale orders might fill after hedge
-                                // Using BOTH methods provides maximum safety
-                                tprintln!("{} {} Dual cancellation (REST + WebSocket)...",
+                                // *** PARALLEL EXECUTION: Cancellation + Hedge Trigger ***
+                                // State machine (mark_filled) already prevents new orders
+                                // Dual cancel runs async while hedge triggers immediately
+                                // Pre-hedge cancellation in hedge.rs provides defensive redundancy
+                                tprintln!("{} {} Spawning async dual cancellation (REST + WebSocket)...",
                                     "[FILL_DETECTION]".magenta().bold(),
                                     "⚡".yellow().bold()
                                 );
 
-                                // Dual cancel: REST + WebSocket for redundancy
-                                match dual_cancel(
-                                    &pac_trading_clone,
-                                    &pac_ws_trading_clone,
-                                    &symbol_clone
-                                ).await {
-                                    Ok((rest_count, ws_count)) => {
-                                        tprintln!("{} {} Dual cancellation complete (REST: {}, WS: {})",
-                                            "[FILL_DETECTION]".magenta().bold(),
-                                            "✓✓".green().bold(),
-                                            rest_count,
-                                            ws_count
-                                        );
+                                // Clone for async cancellation task
+                                let pac_trading_bg = pac_trading_clone.clone();
+                                let pac_ws_trading_bg = pac_ws_trading_clone.clone();
+                                let symbol_bg = symbol_clone.clone();
+
+                                // Spawn dual cancel in background (don't await)
+                                tokio::spawn(async move {
+                                    match dual_cancel(
+                                        &pac_trading_bg,
+                                        &pac_ws_trading_bg,
+                                        &symbol_bg
+                                    ).await {
+                                        Ok((rest_count, ws_count)) => {
+                                            tprintln!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
+                                                "[FILL_DETECTION]".magenta().bold(),
+                                                "✓✓".green().bold(),
+                                                rest_count,
+                                                ws_count
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tprintln!("{} {} Background dual cancellation failed: {}",
+                                                "[FILL_DETECTION]".magenta().bold(),
+                                                "✗".red().bold(),
+                                                e
+                                            );
+                                        }
                                     }
-                                    Err(e) => {
-                                        tprintln!("{} {} Dual cancellation failed: {}",
-                                            "[FILL_DETECTION]".magenta().bold(),
-                                            "✗".red().bold(),
-                                            e
-                                        );
-                                    }
-                                }
+                                });
 
                                 // *** CRITICAL: UPDATE POSITION BASELINE ***
                                 // This prevents position-based detection from triggering duplicate hedge
@@ -184,10 +191,16 @@ impl FillDetectionService {
                                     avg_px
                                 );
 
-                                tprintln!("{} {}, triggering hedge", format!("[{}]", symbol_clone).bright_white().bold(), "Order filled".green().bold());
+                                // *** TRIGGER HEDGE IMMEDIATELY (PARALLEL WITH CANCELLATION) ***
+                                let hedge_trigger_latency = fill_detect_start.elapsed();
+                                tprintln!("{} {} ⚡ PARALLEL EXECUTION: Hedge triggered in {:.1}ms (cancellation running async)",
+                                    format!("[{}]", symbol_clone).bright_white().bold(),
+                                    "Order filled".green().bold(),
+                                    hedge_trigger_latency.as_secs_f64() * 1000.0
+                                );
 
-                                // Trigger hedge
-                                hedge_tx.send((order_side, filled_size, avg_px)).await.ok();
+                                // Trigger hedge immediately (runs in parallel with background cancellation)
+                                hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start)).await.ok();
                             }
                         });
                     }
@@ -313,6 +326,9 @@ impl FillDetectionService {
                                     }
 
                                     // *** CRITICAL: UPDATE STATE FIRST ***
+                                    // State machine provides race condition protection - cancellation can run async
+                                    let fill_detect_start = std::time::Instant::now();
+
                                     let order_side = match side_str.as_str() {
                                         "buy" | "bid" => OrderSide::Buy,
                                         "sell" | "ask" => OrderSide::Sell,
@@ -334,34 +350,44 @@ impl FillDetectionService {
                                         "✓".green().bold()
                                     );
 
-                                    // *** CRITICAL: DUAL CANCELLATION (REST + WebSocket) ***
-                                    tprintln!("{} {} Dual cancellation (REST + WebSocket)...",
+                                    // *** PARALLEL EXECUTION: Cancellation + Hedge Trigger ***
+                                    // State machine (mark_filled) already prevents new orders
+                                    // Dual cancel runs async while hedge triggers immediately
+                                    // Pre-hedge cancellation in hedge.rs provides defensive redundancy
+                                    tprintln!("{} {} Spawning async dual cancellation (REST + WebSocket)...",
                                         "[FILL_DETECTION]".magenta().bold(),
                                         "⚡".yellow().bold()
                                     );
 
-                                    // Dual cancel: REST + WebSocket for redundancy
-                                    match dual_cancel(
-                                        &pac_trading_clone,
-                                        &pac_ws_trading_clone,
-                                        &symbol_clone
-                                    ).await {
-                                        Ok((rest_count, ws_count)) => {
-                                            tprintln!("{} {} Dual cancellation complete (REST: {}, WS: {})",
-                                                "[FILL_DETECTION]".magenta().bold(),
-                                                "✓✓".green().bold(),
-                                                rest_count,
-                                                ws_count
-                                            );
+                                    // Clone for async cancellation task
+                                    let pac_trading_bg = pac_trading_clone.clone();
+                                    let pac_ws_trading_bg = pac_ws_trading_clone.clone();
+                                    let symbol_bg = symbol_clone.clone();
+
+                                    // Spawn dual cancel in background (don't await)
+                                    tokio::spawn(async move {
+                                        match dual_cancel(
+                                            &pac_trading_bg,
+                                            &pac_ws_trading_bg,
+                                            &symbol_bg
+                                        ).await {
+                                            Ok((rest_count, ws_count)) => {
+                                                tprintln!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
+                                                    "[FILL_DETECTION]".magenta().bold(),
+                                                    "✓✓".green().bold(),
+                                                    rest_count,
+                                                    ws_count
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tprintln!("{} {} Background dual cancellation failed: {}",
+                                                    "[FILL_DETECTION]".magenta().bold(),
+                                                    "✗".red().bold(),
+                                                    e
+                                                );
+                                            }
                                         }
-                                        Err(e) => {
-                                            tprintln!("{} {} Dual cancellation failed: {}",
-                                                "[FILL_DETECTION]".magenta().bold(),
-                                                "✗".red().bold(),
-                                                e
-                                            );
-                                        }
-                                    }
+                                    });
 
                                     // *** CRITICAL: UPDATE POSITION BASELINE ***
                                     let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
@@ -372,10 +398,16 @@ impl FillDetectionService {
                                         avg_px
                                     );
 
-                                    tprintln!("{} {}, triggering hedge", format!("[{}]", symbol_clone).bright_white().bold(), "Partial fill".green().bold());
+                                    // *** TRIGGER HEDGE IMMEDIATELY (PARALLEL WITH CANCELLATION) ***
+                                    let hedge_trigger_latency = fill_detect_start.elapsed();
+                                    tprintln!("{} {} ⚡ PARALLEL EXECUTION: Hedge triggered in {:.1}ms (cancellation running async)",
+                                        format!("[{}]", symbol_clone).bright_white().bold(),
+                                        "Partial fill".green().bold(),
+                                        hedge_trigger_latency.as_secs_f64() * 1000.0
+                                    );
 
-                                    // Trigger hedge
-                                    hedge_tx.send((order_side, filled_size, avg_px)).await.ok();
+                                    // Trigger hedge immediately (runs in parallel with background cancellation)
+                                    hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start)).await.ok();
                                 }
                             });
                         } else {

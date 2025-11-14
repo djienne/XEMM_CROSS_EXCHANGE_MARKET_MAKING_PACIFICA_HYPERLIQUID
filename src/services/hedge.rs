@@ -34,7 +34,7 @@ macro_rules! tprintln {
 /// 9. Mark cycle complete and signal shutdown
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_rx: mpsc::Receiver<(OrderSide, f64, f64)>,
+    pub hedge_rx: mpsc::Receiver<(OrderSide, f64, f64, std::time::Instant)>,
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
@@ -44,12 +44,14 @@ pub struct HedgeService {
 
 impl HedgeService {
     pub async fn run(mut self) {
-        while let Some((side, size, avg_price)) = self.hedge_rx.recv().await {
-            tprintln!("{} Received trigger: {} {} @ {}",
+        while let Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv().await {
+            let end_to_end_latency = fill_timestamp.elapsed();
+            tprintln!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | End-to-end latency: {:.1}ms",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                 side.as_str().bright_yellow(),
                 size,
-                format!("${:.4}", avg_price).cyan()
+                format!("${:.4}", avg_price).cyan(),
+                end_to_end_latency.as_secs_f64() * 1000.0
             );
 
             // *** CRITICAL: CANCEL ALL ORDERS BEFORE HEDGE ***

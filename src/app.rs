@@ -70,8 +70,8 @@ pub struct XemmBot {
     pub last_position_snapshot: Arc<tokio::sync::Mutex<Option<PositionSnapshot>>>,
 
     // Channels
-    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64)>,
-    pub hedge_rx: Option<mpsc::Receiver<(OrderSide, f64, f64)>>,
+    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64, std::time::Instant)>,
+    pub hedge_rx: Option<mpsc::Receiver<(OrderSide, f64, f64, std::time::Instant)>>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub shutdown_rx: Option<mpsc::Receiver<()>>,
 
@@ -382,7 +382,7 @@ impl XemmBot {
         let bot_state = Arc::new(RwLock::new(BotState::new()));
 
         // Channels for communication
-        let (hedge_tx, hedge_rx) = mpsc::channel::<(OrderSide, f64, f64)>(1); // (side, size, avg_price)
+        let (hedge_tx, hedge_rx) = mpsc::channel::<(OrderSide, f64, f64, std::time::Instant)>(1); // (side, size, avg_price, fill_timestamp)
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
         // Fill tracking state

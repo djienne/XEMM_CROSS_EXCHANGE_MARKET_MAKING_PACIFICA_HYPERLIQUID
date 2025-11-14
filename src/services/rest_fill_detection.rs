@@ -28,7 +28,7 @@ macro_rules! tprintln {
 /// missed by WebSocket. This provides redundancy and recovery capabilities.
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64)>,
+    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64, std::time::Instant)>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
@@ -226,8 +226,8 @@ impl RestFillDetectionService {
                                         "Order filled".green().bold()
                                     );
 
-                                    // Trigger hedge
-                                    hedge_tx_clone.send((order_side, filled_amount, price)).await.ok();
+                                    // Trigger hedge (with current timestamp since REST detection detects fills retroactively)
+                                    hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now())).await.ok();
                                 });
                             } else {
                                 debug!(
