@@ -113,7 +113,7 @@ pub async fn fetch_pacifica_trade(
                 let matching_trades: Vec<_> = trades
                     .iter()
                     .filter(|t| {
-                        &t.client_order_id == client_order_id &&
+                        t.client_order_id.as_deref() == Some(client_order_id) &&
                         t.event_type == "fulfill_maker"
                     })
                     .collect();

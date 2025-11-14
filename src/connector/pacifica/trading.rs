@@ -125,7 +125,7 @@ pub struct OrderbookSnapshot {
 pub struct TradeHistoryItem {
     pub history_id: u64,
     pub order_id: u64,
-    pub client_order_id: String,
+    pub client_order_id: Option<String>,  // Can be null for some orders (e.g., liquidations)
     pub symbol: String,
     pub amount: String,           // Size of trade in token denomination
     pub price: String,            // Current market price
@@ -145,6 +145,10 @@ pub struct TradeHistoryItem {
 pub struct TradeHistoryResponse {
     pub success: bool,
     pub data: Option<Vec<TradeHistoryItem>>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,  // Pagination cursor for next page
+    #[serde(default)]
+    pub has_more: Option<bool>,       // Whether more results exist
     pub error: Option<String>,
     pub code: Option<String>,
 }
