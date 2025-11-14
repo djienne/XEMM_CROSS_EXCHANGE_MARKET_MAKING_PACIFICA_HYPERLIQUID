@@ -8,6 +8,7 @@ pub mod bot;
 pub mod trade_fetcher;
 pub mod util;
 pub mod services;
+pub mod csv_logger;
 
 // Re-export commonly used items for convenience
 pub use app::XemmBot;

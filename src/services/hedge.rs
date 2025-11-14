@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
+use chrono::Utc;
 
 use crate::bot::BotState;
 use crate::config::Config;
@@ -9,6 +10,7 @@ use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
 use crate::strategy::OrderSide;
 use crate::trade_fetcher;
+use crate::csv_logger;
 
 // Macro for timestamped colored output
 macro_rules! tprintln {
@@ -400,6 +402,42 @@ impl HedgeService {
                                 (profit_bps, profit_usd, Some(pac_price), Some(hl_price), pac_fee, hl_fee)
                             }
                         };
+
+                    // Log trade to CSV file
+                    if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
+                        let trade_record = csv_logger::TradeRecord::new(
+                            Utc::now(),
+                            end_to_end_latency.as_secs_f64() * 1000.0,  // Convert to milliseconds
+                            self.config.symbol.clone(),
+                            side,
+                            pacifica_actual_price.unwrap(),
+                            size,
+                            pacifica_notional.unwrap_or(pacifica_actual_price.unwrap() * size),
+                            pac_fee_usd,
+                            hl_actual_price.unwrap(),
+                            size,
+                            hl_notional.unwrap_or(hl_actual_price.unwrap() * size),
+                            hl_fee_usd,
+                            expected_profit_bps.unwrap_or(0.0),
+                            actual_profit_bps,
+                            actual_profit_usd,
+                        );
+
+                        let csv_file = format!("{}_trades.csv", self.config.symbol.to_lowercase());
+                        if let Err(e) = csv_logger::log_trade(&csv_file, &trade_record) {
+                            tprintln!("{} {} Failed to log trade to CSV: {}",
+                                format!("[{} CSV]", self.config.symbol).bright_yellow().bold(),
+                                "⚠".yellow().bold(),
+                                e
+                            );
+                        } else {
+                            tprintln!("{} {} Trade logged to {}",
+                                format!("[{} CSV]", self.config.symbol).bright_green().bold(),
+                                "✓".green().bold(),
+                                csv_file
+                            );
+                        }
+                    }
 
                     // Display comprehensive summary
                     tprintln!("{}", "═══════════════════════════════════════════════════".green().bold());

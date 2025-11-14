@@ -17,6 +17,8 @@ use crate::strategy::OrderSide;
 pub struct TradeRecord {
     /// Timestamp of the trade (ISO 8601 format)
     pub timestamp: String,
+    /// End-to-end latency from fill detection to hedge execution (milliseconds)
+    pub latency_ms: f64,
     /// Trading symbol (e.g., "ENA", "BTC")
     pub symbol: String,
     /// Direction on Pacifica (Buy or Sell)
@@ -56,6 +58,7 @@ impl TradeRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         timestamp: DateTime<Utc>,
+        latency_ms: f64,
         symbol: String,
         pacifica_side: OrderSide,
         pacifica_price: f64,
@@ -84,6 +87,7 @@ impl TradeRecord {
 
         Self {
             timestamp: timestamp.to_rfc3339(),
+            latency_ms,
             symbol,
             pacifica_side: pacifica_side.as_str().to_uppercase(),
             hyperliquid_side: hyperliquid_side.to_string(),
@@ -154,6 +158,7 @@ mod tests {
     fn test_trade_record_creation() {
         let record = TradeRecord::new(
             Utc::now(),
+            125.5,  // latency_ms
             "ENA".to_string(),
             OrderSide::Buy,
             0.3900,
@@ -174,6 +179,7 @@ mod tests {
         assert_eq!(record.hyperliquid_side, "SELL");
         assert_eq!(record.pacifica_price, 0.3900);
         assert_eq!(record.total_fees, 0.0107);
+        assert_eq!(record.latency_ms, 125.5);
     }
 
     #[test]
@@ -185,6 +191,7 @@ mod tests {
 
         let record = TradeRecord::new(
             Utc::now(),
+            89.3,  // latency_ms
             "BTC".to_string(),
             OrderSide::Sell,
             50000.0,
