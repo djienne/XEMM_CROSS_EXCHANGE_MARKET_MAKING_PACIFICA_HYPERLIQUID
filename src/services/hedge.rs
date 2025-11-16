@@ -47,13 +47,13 @@ pub struct HedgeService {
 impl HedgeService {
     pub async fn run(mut self) {
         while let Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv().await {
-            let end_to_end_latency = fill_timestamp.elapsed();
-            tprintln!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | End-to-end latency: {:.1}ms",
+            let reception_latency = fill_timestamp.elapsed();
+            tprintln!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                 side.as_str().bright_yellow(),
                 size,
                 format!("${:.4}", avg_price).cyan(),
-                end_to_end_latency.as_secs_f64() * 1000.0
+                reception_latency.as_secs_f64() * 1000.0
             );
 
             // *** CRITICAL: CANCEL ALL ORDERS BEFORE HEDGE ***
@@ -206,15 +206,19 @@ impl HedgeService {
                         }
                     };
 
+                    // Calculate ACTUAL end-to-end latency from fill detection to hedge completion
+                    let end_to_end_latency = fill_timestamp.elapsed();
+
                     // Validate and extract order status
                     let hedge_fill_price = if let Some(status) = response_data.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
-                                tprintln!("{} {} Hedge executed successfully: Filled {} @ ${}",
+                                tprintln!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✓".green().bold(),
                                     filled.totalSz,
-                                    filled.avgPx
+                                    filled.avgPx,
+                                    end_to_end_latency.as_secs_f64() * 1000.0
                                 );
                                 filled.avgPx.parse::<f64>().ok()
                             }
