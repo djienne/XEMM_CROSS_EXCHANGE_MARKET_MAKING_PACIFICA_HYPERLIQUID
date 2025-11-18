@@ -9,6 +9,7 @@ use colored::Colorize;
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 
 // Macro for timestamped colored output
@@ -28,7 +29,7 @@ macro_rules! tprintln {
 /// a fill definitely occurred regardless of WebSocket/REST/order status detection.
 pub struct PositionMonitorService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64, std::time::Instant)>,
+    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
@@ -255,7 +256,7 @@ impl PositionMonitorService {
                             );
 
                             // Trigger hedge (with current timestamp since position monitor detects fills retroactively)
-                            self.hedge_tx.send((order_side, fill_size, estimated_price, std::time::Instant::now())).await.ok();
+                            let _ = self.hedge_tx.send((order_side, fill_size, estimated_price, std::time::Instant::now()));
                         } else {
                             debug!("[POSITION_MONITOR] Fill already processed by another detection method");
                         }

@@ -36,11 +36,11 @@ impl HyperliquidCredentials {
     }
 }
 
-/// Hyperliquid trading client
-pub struct HyperliquidTrading {
-    credentials: HyperliquidCredentials,
-    info_url: String,
-    exchange_url: String,
+    /// Hyperliquid trading client
+    pub struct HyperliquidTrading {
+        credentials: HyperliquidCredentials,
+        info_url: String,
+        exchange_url: String,
     client: Client,
     wallet: LocalWallet,
     meta_cache: Arc<RwLock<Option<MetaResponse>>>,
@@ -73,6 +73,11 @@ impl HyperliquidTrading {
             meta_cache: Arc::new(RwLock::new(None)),
             is_testnet,
         })
+    }
+
+    /// Returns true when this client is configured for testnet.
+    pub fn is_testnet(&self) -> bool {
+        self.is_testnet
     }
 
     /// Fetch asset metadata (for asset IDs and szDecimals)
@@ -344,20 +349,11 @@ impl HyperliquidTrading {
         })
     }
 
-    /// Place a market order (IOC limit order with slippage)
+    /// Build a signed market order request (IOC limit order with slippage).
     ///
-    /// # Arguments
-    /// * `coin` - Coin symbol (e.g., "SOL", "BTC")
-    /// * `is_buy` - True for buy, false for sell
-    /// * `size` - Order size
-    /// * `slippage` - Slippage tolerance (default 0.05 = 5%)
-    /// * `reduce_only` - Whether this is a reduce-only order
-    /// * `bid` - Current bid price (if None, will fetch from orderbook client)
-    /// * `ask` - Current ask price (if None, will fetch from orderbook client)
-    ///
-    /// # Returns
-    /// Order response with status and order ID
-    pub async fn place_market_order(
+    /// This constructs and signs the order payload that can be sent either via
+    /// REST (`/exchange`) or via WebSocket `post` (type: "action").
+    pub async fn build_market_order_request(
         &self,
         coin: &str,
         is_buy: bool,
@@ -366,7 +362,7 @@ impl HyperliquidTrading {
         reduce_only: bool,
         bid: Option<f64>,
         ask: Option<f64>,
-    ) -> Result<OrderResponse> {
+    ) -> Result<OrderRequest> {
         // Get asset ID and metadata
         let asset_id = self.get_asset_id(coin).await?;
         let asset_info = self.get_asset_info(coin).await?;
@@ -436,12 +432,41 @@ impl HyperliquidTrading {
         let signature = self.sign_action(&action, nonce, None).await?;
 
         // Construct request payload
-        let payload = OrderRequest {
+        Ok(OrderRequest {
             action,
             nonce,
             signature,
             vaultAddress: None,
-        };
+        })
+    }
+
+    /// Place a market order (IOC limit order with slippage)
+    ///
+    /// # Arguments
+    /// * `coin` - Coin symbol (e.g., "SOL", "BTC")
+    /// * `is_buy` - True for buy, false for sell
+    /// * `size` - Order size
+    /// * `slippage` - Slippage tolerance (default 0.05 = 5%)
+    /// * `reduce_only` - Whether this is a reduce-only order
+    /// * `bid` - Current bid price (if None, will fetch from orderbook client)
+    /// * `ask` - Current ask price (if None, will fetch from orderbook client)
+    ///
+    /// # Returns
+    /// Order response with status and order ID
+    pub async fn place_market_order(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        size: f64,
+        slippage: f64,
+        reduce_only: bool,
+        bid: Option<f64>,
+        ask: Option<f64>,
+    ) -> Result<OrderResponse> {
+        // Build signed order payload (shared with WebSocket execution path)
+        let payload = self
+            .build_market_order_request(coin, is_buy, size, slippage, reduce_only, bid, ask)
+            .await?;
 
         // Send order via REST API
         debug!("[HYPERLIQUID] Sending order to exchange");

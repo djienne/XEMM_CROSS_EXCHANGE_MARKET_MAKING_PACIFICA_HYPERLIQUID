@@ -3,14 +3,23 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
 use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::bot::BotState;
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
+use crate::connector::hyperliquid::types::{WsPostRequest, WsPostRequestInner, WsPostResponse};
 use crate::connector::pacifica::PacificaTrading;
+use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::trade_fetcher;
 use crate::csv_logger;
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
+type WsRead = futures_util::stream::SplitStream<WsStream>;
 
 // Macro for timestamped colored output
 macro_rules! tprintln {
@@ -36,7 +45,7 @@ macro_rules! tprintln {
 /// 9. Mark cycle complete and signal shutdown
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_rx: mpsc::Receiver<(OrderSide, f64, f64, std::time::Instant)>,
+    pub hedge_rx: mpsc::UnboundedReceiver<HedgeEvent>,
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
@@ -46,6 +55,34 @@ pub struct HedgeService {
 
 impl HedgeService {
     pub async fn run(mut self) {
+        let use_ws_for_hedge = self.config.hyperliquid_use_ws_for_hedge;
+        let mut ws_write: Option<WsWrite> = None;
+        let mut ws_read: Option<WsRead> = None;
+        let mut ws_request_id: u64 = 0;
+
+        // Optionally establish trading WebSocket up front so it is hot
+        if use_ws_for_hedge {
+            match self.connect_hyperliquid_ws().await {
+                Ok((write, read)) => {
+                    tprintln!(
+                        "{} {} Hyperliquid trading WebSocket connected (hedge execution via WS)",
+                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                        "✓".green().bold(),
+                    );
+                    ws_write = Some(write);
+                    ws_read = Some(read);
+                }
+                Err(e) => {
+                    tprintln!(
+                        "{} {} Failed to pre-connect Hyperliquid trading WebSocket (using REST until reconnect succeeds): {}",
+                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                        "⚠".yellow().bold(),
+                        e
+                    );
+                }
+            }
+        }
+
         while let Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv().await {
             let reception_latency = fill_timestamp.elapsed();
             tprintln!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
@@ -171,17 +208,88 @@ impl HedgeService {
                 size
             );
 
-            let hedge_result = self.hyperliquid_trading
-                .place_market_order(
-                    &self.config.symbol,
-                    is_buy,
-                    size,
-                    self.config.hyperliquid_slippage,
-                    false, // reduce_only
-                    Some(hl_bid),
-                    Some(hl_ask),
-                )
-                .await;
+            let hedge_result = if use_ws_for_hedge {
+                // Ensure we have an active trading WebSocket
+                if ws_write.is_none() || ws_read.is_none() {
+                    match self.connect_hyperliquid_ws().await {
+                        Ok((write, read)) => {
+                            tprintln!(
+                                "{} {} Reconnected Hyperliquid trading WebSocket for hedge execution",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "✓".green().bold()
+                            );
+                            ws_write = Some(write);
+                            ws_read = Some(read);
+                        }
+                        Err(e) => {
+                            tprintln!(
+                                "{} {} Failed to connect Hyperliquid trading WebSocket, falling back to REST for this hedge: {}",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "⚠".yellow().bold(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                if let (Some(write), Some(read)) = (ws_write.as_mut(), ws_read.as_mut()) {
+                    match self
+                        .place_market_order_ws(write, read, &mut ws_request_id, is_buy, size, hl_bid, hl_ask)
+                        .await
+                    {
+                        Ok(response) => Ok(response),
+                        Err(e) => {
+                            tprintln!(
+                                "{} {} WebSocket hedge execution failed, falling back to REST: {}",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "⚠".yellow().bold(),
+                                e
+                            );
+                            // Drop WS so next hedge attempts a clean reconnect
+                            ws_write = None;
+                            ws_read = None;
+
+                            self.hyperliquid_trading
+                                .place_market_order(
+                                    &self.config.symbol,
+                                    is_buy,
+                                    size,
+                                    self.config.hyperliquid_slippage,
+                                    false, // reduce_only
+                                    Some(hl_bid),
+                                    Some(hl_ask),
+                                )
+                                .await
+                        }
+                    }
+                } else {
+                    // No WS connection available – use REST for this hedge
+                    self.hyperliquid_trading
+                        .place_market_order(
+                            &self.config.symbol,
+                            is_buy,
+                            size,
+                            self.config.hyperliquid_slippage,
+                            false, // reduce_only
+                            Some(hl_bid),
+                            Some(hl_ask),
+                        )
+                        .await
+                }
+            } else {
+                // WS disabled via config – use REST only
+                self.hyperliquid_trading
+                    .place_market_order(
+                        &self.config.symbol,
+                        is_buy,
+                        size,
+                        self.config.hyperliquid_slippage,
+                        false, // reduce_only
+                        Some(hl_bid),
+                        Some(hl_ask),
+                    )
+                    .await
+            };
 
             match hedge_result {
                 Ok(response) => {
@@ -720,6 +828,125 @@ impl HedgeService {
                     // Signal shutdown with error
                     self.shutdown_tx.send(()).await.ok();
                 }
+            }
+        }
+    }
+
+    /// Establish a Hyperliquid trading WebSocket connection for hedging.
+    async fn connect_hyperliquid_ws(&self) -> anyhow::Result<(WsWrite, WsRead)> {
+        let ws_url = if self.hyperliquid_trading.is_testnet() {
+            "wss://api.hyperliquid-testnet.xyz/ws"
+        } else {
+            "wss://api.hyperliquid.xyz/ws"
+        };
+
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (write, read) = ws_stream.split();
+        Ok((write, read))
+    }
+
+    /// Place a market IOC order over Hyperliquid WebSocket using the shared
+    /// REST signing and request-building logic.
+    async fn place_market_order_ws(
+        &self,
+        write: &mut WsWrite,
+        read: &mut WsRead,
+        request_id_counter: &mut u64,
+        is_buy: bool,
+        size: f64,
+        bid: f64,
+        ask: f64,
+    ) -> anyhow::Result<crate::connector::hyperliquid::OrderResponse> {
+        // Build signed order payload (same as REST)
+        let payload = self
+            .hyperliquid_trading
+            .build_market_order_request(
+                &self.config.symbol,
+                is_buy,
+                size,
+                self.config.hyperliquid_slippage,
+                false,
+                Some(bid),
+                Some(ask),
+            )
+            .await?;
+
+        *request_id_counter += 1;
+        let request_id = *request_id_counter;
+
+        let ws_request = WsPostRequest {
+            method: "post".to_string(),
+            id: request_id,
+            request: WsPostRequestInner {
+                type_: "action".to_string(),
+                payload,
+            },
+        };
+
+        let request_json = serde_json::to_string(&ws_request)?;
+        tprintln!(
+            "{} Sending Hyperliquid hedge order via WebSocket (id={})",
+            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+            request_id
+        );
+        write.send(Message::Text(request_json)).await?;
+
+        // Wait for the matching post response
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    // Try to parse as a generic post response
+                    let ws_resp: WsPostResponse = match serde_json::from_str(&text) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // Ignore unrelated/non-standard messages
+                            continue;
+                        }
+                    };
+
+                    if ws_resp.channel != "post" || ws_resp.data.id != request_id {
+                        // Response for another request or channel – ignore
+                        continue;
+                    }
+
+                    let resp_type = ws_resp.data.response.type_;
+                    let payload = ws_resp.data.response.payload;
+
+                    return match resp_type.as_str() {
+                        "action" => {
+                            let order_response: crate::connector::hyperliquid::OrderResponse =
+                                serde_json::from_value(payload)?;
+                            Ok(order_response)
+                        }
+                        "error" => {
+                            let msg = payload
+                                .as_str()
+                                .unwrap_or("Unknown Hyperliquid WebSocket error")
+                                .to_string();
+                            anyhow::bail!("Hyperliquid WebSocket order error: {}", msg);
+                        }
+                        other => {
+                            anyhow::bail!("Unexpected Hyperliquid WebSocket response type: {}", other);
+                        }
+                    };
+                }
+                Some(Ok(Message::Ping(data))) => {
+                    // Respond to low-level WebSocket ping frames
+                    write.send(Message::Pong(data)).await?;
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    // Ignore
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    anyhow::bail!("Hyperliquid WebSocket closed: {:?}", frame);
+                }
+                Some(Err(e)) => {
+                    anyhow::bail!("Hyperliquid WebSocket error: {}", e);
+                }
+                None => {
+                    anyhow::bail!("Hyperliquid WebSocket stream ended unexpectedly");
+                }
+                _ => {}
             }
         }
     }

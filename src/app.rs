@@ -20,7 +20,7 @@ use crate::services::{
     fill_detection::FillDetectionService, hedge::HedgeService, order_monitor::OrderMonitorService,
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
-    rest_poll::{HyperliquidRestPollService, PacificaRestPollService},
+    rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
 };
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
@@ -70,8 +70,8 @@ pub struct XemmBot {
     pub last_position_snapshot: Arc<tokio::sync::Mutex<Option<PositionSnapshot>>>,
 
     // Channels
-    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64, std::time::Instant)>,
-    pub hedge_rx: Option<mpsc::Receiver<(OrderSide, f64, f64, std::time::Instant)>>,
+    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_rx: Option<mpsc::UnboundedReceiver<HedgeEvent>>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub shutdown_rx: Option<mpsc::Receiver<()>>,
 
@@ -382,7 +382,9 @@ impl XemmBot {
         let bot_state = Arc::new(RwLock::new(BotState::new()));
 
         // Channels for communication
-        let (hedge_tx, hedge_rx) = mpsc::channel::<(OrderSide, f64, f64, std::time::Instant)>(1); // (side, size, avg_price, fill_timestamp)
+        // Unbounded hedge event queue: producers never block when enqueueing,
+        // hedge executor processes events sequentially.
+        let (hedge_tx, hedge_rx) = mpsc::unbounded_channel::<HedgeEvent>(); // (side, size, avg_price, fill_timestamp)
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
         // Fill tracking state

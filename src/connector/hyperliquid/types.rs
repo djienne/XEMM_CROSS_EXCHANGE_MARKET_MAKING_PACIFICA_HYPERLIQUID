@@ -47,6 +47,41 @@ pub struct WebSocketResponse {
     pub data: Option<serde_json::Value>,
 }
 
+/// Generic WebSocket POST request wrapper (info or action)
+#[derive(Debug, Serialize)]
+pub struct WsPostRequest<T> {
+    pub method: String,
+    pub id: u64,
+    pub request: WsPostRequestInner<T>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WsPostRequestInner<T> {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub payload: T,
+}
+
+/// Generic WebSocket POST response (for info/action/error)
+#[derive(Debug, Deserialize)]
+pub struct WsPostResponse {
+    pub channel: String,
+    pub data: WsPostResponseData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WsPostResponseData {
+    pub id: u64,
+    pub response: WsPostResponseInner,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WsPostResponseInner {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub payload: serde_json::Value,
+}
+
 /// L2 Book response
 #[derive(Debug, Deserialize)]
 pub struct L2BookResponse {

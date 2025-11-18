@@ -8,6 +8,7 @@ use colored::Colorize;
 
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
 use crate::util::rate_limit::is_rate_limit_error;
@@ -28,7 +29,7 @@ macro_rules! tprintln {
 /// missed by WebSocket. This provides redundancy and recovery capabilities.
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64, std::time::Instant)>,
+    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
@@ -227,7 +228,7 @@ impl RestFillDetectionService {
                                     );
 
                                     // Trigger hedge (with current timestamp since REST detection detects fills retroactively)
-                                    hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now())).await.ok();
+                                    let _ = hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now()));
                                 });
                             } else {
                                 debug!(
