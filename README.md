@@ -74,6 +74,30 @@ All methods deduplicate via shared HashSet to ensure only one hedge executes per
 - REST API positions (clearinghouse state for position verification)
 - EIP-712 authenticated trading (market orders)
 - Automatic slippage protection
+- **WebSocket trading for hedges (default)** – Hedge market orders are sent as signed `post` actions over the Hyperliquid WebSocket for minimal latency, with REST fallback on error.
+
+### Hedge Execution Architecture (This Branch)
+
+This development branch introduces a low-latency, queue-based hedge pipeline and WebSocket-based Hyperliquid execution:
+
+- **Hedge event queue (non-blocking)**  
+  - All fill-detection layers (`FillDetectionService`, `RestFillDetectionService`, `PositionMonitorService`) act as **producers** and push `HedgeEvent`s into an unbounded Tokio `mpsc` channel.  
+  - Producers never block when enqueuing, so fill detection is not slowed down by hedge execution.
+
+- **Dedicated hedge executor task**  
+  - `HedgeService` runs in its own async task and acts as a **single consumer** of the hedge event queue.  
+  - It awaits `hedge_rx.recv().await`, so as soon as an event arrives, the hedge flow starts; there is no polling interval.
+
+- **WebSocket-first Hyperliquid hedging**  
+  - On startup, `HedgeService` establishes a dedicated Hyperliquid trading WebSocket connection and keeps it alive for hedging.  
+  - Hedge orders are built and signed once (shared logic), then wrapped in a WS `post` request (`type: "action"`) and sent over the hot WebSocket.
+  - WS responses are parsed into the same `OrderResponse` type as REST, so the downstream profit and verification logic is unchanged.
+  - If WS execution fails for a given hedge (connection error or WS-level error), the bot **falls back to REST** for that hedge and logs the reason.
+
+- **Config toggle: WS vs REST**  
+  - `Config.hyperliquid_use_ws_for_hedge` (default: `true`) controls the execution path:  
+    - `true` → use WebSocket for hedging, with REST fallback on error.  
+    - `false` → use REST-only hedging (original behavior).
 
 ### Performance & Reliability
 - ✅ **Multi-source Orderbook** - WebSocket primary, REST API fallback
