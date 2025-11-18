@@ -45,7 +45,7 @@ macro_rules! tprintln {
 /// 9. Mark cycle complete and signal shutdown
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_rx: mpsc::UnboundedReceiver<HedgeEvent>,
+    pub hedge_rx: mpsc::Receiver<HedgeEvent>,
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
@@ -95,27 +95,33 @@ impl HedgeService {
 
             // *** CRITICAL: CANCEL ALL ORDERS BEFORE HEDGE ***
             // Extra safety: cancel again in case fill detection missed anything
-            // or there was a race condition
-            tprintln!("{} {} Pre-hedge safety: Cancelling all Pacifica orders...",
+            // or there was a race condition.
+            // OPTIMIZATION: Run in background task to avoid blocking hedge execution!
+            tprintln!("{} {} Pre-hedge safety: Spawning background cancellation of all Pacifica orders...",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                 "⚡".yellow().bold()
             );
 
-            if let Err(e) = self.pacifica_trading
-                .cancel_all_orders(false, Some(&self.config.symbol), false)
-                .await
-            {
-                tprintln!("{} {} Failed to cancel orders before hedge: {}",
-                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                    "⚠".yellow().bold(),
-                    e
-                );
-            } else {
-                tprintln!("{} {} Pre-hedge cancellation complete",
-                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                    "✓".green().bold()
-                );
-            }
+            let pacifica_trading_bg = self.pacifica_trading.clone();
+            let symbol_bg = self.config.symbol.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = pacifica_trading_bg
+                    .cancel_all_orders(false, Some(&symbol_bg), false)
+                    .await
+                {
+                    tprintln!("{} {} Background pre-hedge cancellation failed: {}",
+                        format!("[{} HEDGE]", symbol_bg).bright_magenta().bold(),
+                        "⚠".yellow().bold(),
+                        e
+                    );
+                } else {
+                    tprintln!("{} {} Background pre-hedge cancellation complete",
+                        format!("[{} HEDGE]", symbol_bg).bright_magenta().bold(),
+                        "✓".green().bold()
+                    );
+                }
+            });
 
             // Update status
             {
@@ -324,11 +330,11 @@ impl HedgeService {
                                 tprintln!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✓".green().bold(),
-                                    filled.totalSz,
-                                    filled.avgPx,
+                                    filled.total_sz,
+                                    filled.avg_px,
                                     end_to_end_latency.as_secs_f64() * 1000.0
                                 );
-                                filled.avgPx.parse::<f64>().ok()
+                                filled.avg_px.parse::<f64>().ok()
                             }
                             crate::connector::hyperliquid::OrderStatus::Error { error } => {
                                 tprintln!("{} {} Hedge order FAILED: {}",

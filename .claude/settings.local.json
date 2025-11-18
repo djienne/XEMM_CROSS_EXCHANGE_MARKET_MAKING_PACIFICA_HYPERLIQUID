@@ -23,7 +23,8 @@
       "Bash(node verify_wallet.js:*)",
       "Bash(git config:*)",
       "Bash(test:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(git stash:*)"
     ],
     "deny": [],
     "ask": []

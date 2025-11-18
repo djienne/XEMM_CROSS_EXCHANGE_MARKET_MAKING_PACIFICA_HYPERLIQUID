@@ -83,6 +83,7 @@ impl PositionBaselineUpdater {
 #[derive(Debug, Clone)]
 struct PositionSnapshot {
     quantity: f64,      // Signed quantity (+ for long, - for short)
+    #[allow(dead_code)]
     entry_price: f64,
     timestamp: u64,
 }

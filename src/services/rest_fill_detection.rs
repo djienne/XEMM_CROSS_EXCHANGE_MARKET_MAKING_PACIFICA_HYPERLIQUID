@@ -29,7 +29,7 @@ macro_rules! tprintln {
 /// missed by WebSocket. This provides redundancy and recovery capabilities.
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
@@ -228,7 +228,14 @@ impl RestFillDetectionService {
                                     );
 
                                     // Trigger hedge (with current timestamp since REST detection detects fills retroactively)
-                                    let _ = hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now()));
+                                    // FIX: Use async send for bounded channel
+                                    if let Err(e) = hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now())).await {
+                                        tprintln!("{} {} Failed to send hedge event: {}",
+                                            "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                            "✗".red().bold(),
+                                            e
+                                        );
+                                    }
                                 });
                             } else {
                                 debug!(

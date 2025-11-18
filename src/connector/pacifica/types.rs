@@ -17,6 +17,7 @@ pub struct SubscribeParams {
 
 /// Unsubscription message
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct UnsubscribeMessage {
     pub method: String,
     pub params: SubscribeParams,
@@ -33,12 +34,14 @@ pub struct PingMessage {
 pub struct WebSocketResponse {
     pub channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
     pub data: Option<serde_json::Value>,
 }
 
 /// Orderbook stream response
 #[derive(Debug, Deserialize)]
 pub struct OrderbookResponse {
+    #[allow(dead_code)]
     pub channel: String,
     pub data: OrderbookData,
 }
@@ -58,8 +61,10 @@ pub struct OrderbookData {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookLevel {
     #[serde(rename = "a")]
+    #[allow(dead_code)]
     pub amount: String, // Total amount in aggregation level
     #[serde(rename = "n")]
+    #[allow(dead_code)]
     pub num_orders: u32, // Number of orders in aggregation level
     #[serde(rename = "p")]
     pub price: String, // Price (highest for bids, lowest for asks)
@@ -108,6 +113,7 @@ impl SubscribeMessage {
 }
 
 impl UnsubscribeMessage {
+    #[allow(dead_code)]
     pub fn new(symbol: String, agg_level: u32) -> Self {
         Self {
             method: "unsubscribe".to_string(),
@@ -198,6 +204,7 @@ pub struct OrderUpdate {
     #[serde(rename = "I")]
     pub client_order_id: Option<String>,
     #[serde(rename = "u")]
+    #[allow(dead_code)]
     pub account: String,
     #[serde(rename = "s")]
     pub symbol: String,
@@ -206,6 +213,7 @@ pub struct OrderUpdate {
     #[serde(rename = "p")]
     pub avg_filled_price: String,
     #[serde(rename = "ip")]
+    #[allow(dead_code)]
     pub initial_price: String,
     #[serde(rename = "a")]
     pub original_amount: String,
@@ -216,22 +224,28 @@ pub struct OrderUpdate {
     #[serde(rename = "os")]
     pub order_status: OrderStatus,
     #[serde(rename = "ot")]
+    #[allow(dead_code)]
     pub order_type: String, // "limit" or "market"
     #[serde(rename = "sp")]
+    #[allow(dead_code)]
     pub stop_price: Option<String>,
     #[serde(rename = "si")]
+    #[allow(dead_code)]
     pub stop_parent_order_id: Option<String>,
     #[serde(rename = "r")]
+    #[allow(dead_code)]
     pub reduce_only: bool,
     #[serde(rename = "ut")]
     pub updated_at: u64, // milliseconds
     #[serde(rename = "ct")]
+    #[allow(dead_code)]
     pub created_at: u64, // milliseconds
 }
 
 /// Account order updates response
 #[derive(Debug, Deserialize)]
 pub struct AccountOrderUpdatesResponse {
+    #[allow(dead_code)]
     pub channel: String,
     pub data: Vec<OrderUpdate>,
 }
@@ -382,9 +396,11 @@ pub struct WsCancelAllOrdersResponse {
     /// Request ID (matches request)
     pub id: String,
     /// Response timestamp
+    #[allow(dead_code)]
     pub t: i64,
     /// Response type
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     pub response_type: String,
 }
 
@@ -401,8 +417,10 @@ pub struct WsErrorResponse {
     pub code: u16,
     pub error: Option<String>,
     pub id: String,
+    #[allow(dead_code)]
     pub t: i64,
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     pub response_type: String,
 }
 
@@ -450,16 +468,20 @@ pub struct PositionData {
     #[serde(rename = "d")]
     pub side: String,           // "bid" (long) or "ask" (short)
     #[serde(rename = "m")]
+    #[allow(dead_code)]
     pub margin: String,         // Position margin
     #[serde(rename = "f")]
+    #[allow(dead_code)]
     pub funding: String,        // Funding fee
     #[serde(rename = "i")]
+    #[allow(dead_code)]
     pub isolated: bool,         // Is isolated position
 }
 
 /// Account positions response
 #[derive(Debug, Deserialize)]
 pub struct AccountPositionsResponse {
+    #[allow(dead_code)]
     pub channel: String,
     pub data: Vec<PositionData>,
 }

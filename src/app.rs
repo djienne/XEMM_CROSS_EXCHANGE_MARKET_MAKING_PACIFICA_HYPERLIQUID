@@ -70,8 +70,8 @@ pub struct XemmBot {
     pub last_position_snapshot: Arc<tokio::sync::Mutex<Option<PositionSnapshot>>>,
 
     // Channels
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
-    pub hedge_rx: Option<mpsc::UnboundedReceiver<HedgeEvent>>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
+    pub hedge_rx: Option<mpsc::Receiver<HedgeEvent>>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub shutdown_rx: Option<mpsc::Receiver<()>>,
 
@@ -381,11 +381,10 @@ impl XemmBot {
         // Shared bot state
         let bot_state = Arc::new(RwLock::new(BotState::new()));
 
-        // Channels for communication
-        // Unbounded hedge event queue: producers never block when enqueueing,
-        // hedge executor processes events sequentially.
-        let (hedge_tx, hedge_rx) = mpsc::unbounded_channel::<HedgeEvent>(); // (side, size, avg_price, fill_timestamp)
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        // Channels
+        // FIX: Use bounded channel to prevent memory exhaustion (backpressure)
+        let (hedge_tx, hedge_rx) = mpsc::channel::<HedgeEvent>(1024);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Fill tracking state
         let processed_fills = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));

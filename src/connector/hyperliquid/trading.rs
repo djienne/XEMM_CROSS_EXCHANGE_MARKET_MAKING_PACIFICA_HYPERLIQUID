@@ -38,6 +38,7 @@ impl HyperliquidCredentials {
 
     /// Hyperliquid trading client
     pub struct HyperliquidTrading {
+        #[allow(dead_code)]
         credentials: HyperliquidCredentials,
         info_url: String,
         exchange_url: String,
@@ -436,7 +437,7 @@ impl HyperliquidTrading {
             action,
             nonce,
             signature,
-            vaultAddress: None,
+            vault_address: None,
         })
     }
 

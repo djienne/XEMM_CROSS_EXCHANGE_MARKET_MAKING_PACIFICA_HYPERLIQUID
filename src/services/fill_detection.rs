@@ -26,7 +26,7 @@ macro_rules! tprintln {
 /// WebSocket-based fill detection service (primary fill detection method)
 pub struct FillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub fill_config: FillDetectionConfig,
@@ -201,7 +201,14 @@ impl FillDetectionService {
                                 );
 
                                 // Trigger hedge immediately (runs in parallel with background cancellation)
-                                let _ = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start));
+                        // FIX: Use async send for bounded channel
+                        if let Err(e) = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start)).await {
+                            tprintln!("{} {} Failed to send hedge event: {}",
+                                format!("[{}]", symbol_clone).bright_white().bold(),
+                                "✗".red().bold(),
+                                e
+                            );
+                        }
                             }
                         });
                     }
