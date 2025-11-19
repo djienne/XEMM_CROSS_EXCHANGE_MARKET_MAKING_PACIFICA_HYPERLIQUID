@@ -155,9 +155,8 @@ impl OrderbookClient {
                 // Send ping periodically
                 _ = ping_interval.tick() => {
                     debug!("[HYPERLIQUID] Sending ping");
-                    let ping_msg = PingMessage::new();
-                    let ping_json = serde_json::to_string(&ping_msg)?;
-                    write.send(Message::Text(ping_json)).await?;
+                    debug!("[HYPERLIQUID] Sending ping");
+                    write.send(Message::Ping(vec![])).await?;
                 }
             }
         }

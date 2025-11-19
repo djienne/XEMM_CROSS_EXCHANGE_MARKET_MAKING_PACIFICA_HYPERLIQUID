@@ -168,19 +168,7 @@ impl L2BookData {
     }
 }
 
-/// Ping message
-#[derive(Debug, Serialize)]
-pub struct PingMessage {
-    pub method: String,
-}
 
-impl PingMessage {
-    pub fn new() -> Self {
-        Self {
-            method: "ping".to_string(),
-        }
-    }
-}
 
 /// Time in force for orders
 #[derive(Debug, Clone, Serialize, Deserialize)]
