@@ -581,6 +581,98 @@ impl PacificaTrading {
         })
     }
 
+    /// Place a market order
+    pub async fn place_market_order(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        size: f64,
+        slippage_percent: f64,
+        reduce_only: bool,
+    ) -> Result<OrderData> {
+        // Get market info for lot size rounding
+        let market_info = self.get_market_info().await?;
+        let symbol_info = market_info
+            .get(symbol)
+            .context(format!("Market info not found for {}", symbol))?;
+
+        let lot_size = symbol_info.lot_size.clone();
+        let rounded_size = self.round_to_lot_size(size, lot_size.clone())?;
+
+        info!(
+            "[PACIFICA] Placing MARKET {} order: {} {} (lot: {}, slippage: {}%, reduce_only: {})",
+            match side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" },
+            rounded_size,
+            symbol,
+            lot_size,
+            slippage_percent,
+            reduce_only
+        );
+
+        let client_order_id = Uuid::new_v4().to_string();
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let expiry_window = 5000;
+
+        let header = json!({
+            "type": "create_market_order",
+            "timestamp": timestamp,
+            "expiry_window": expiry_window
+        });
+
+        let payload = json!({
+            "symbol": symbol,
+            "amount": rounded_size.to_string(),
+            "side": side.as_str(),
+            "slippage_percent": slippage_percent.to_string(),
+            "reduce_only": reduce_only,
+            "client_order_id": client_order_id
+        });
+
+        let signature = self.sign_message(header, payload.clone())?;
+
+        let request_body = serde_json::json!({
+            "account": self.credentials.account,
+            "signature": signature,
+            "timestamp": timestamp,
+            "expiry_window": expiry_window,
+            "symbol": symbol,
+            "amount": rounded_size.to_string(),
+            "side": side.as_str(),
+            "slippage_percent": slippage_percent.to_string(),
+            "reduce_only": reduce_only,
+            "client_order_id": client_order_id,
+            "agent_wallet": self.credentials.agent_wallet
+        });
+
+        debug!("[PACIFICA] Market Order request: {}", serde_json::to_string_pretty(&request_body)?);
+
+        let url = format!("{}/api/v1/orders/create_market", self.rest_url);
+        let response = self.client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Market order placement failed: {}", error_text);
+        }
+
+        let order_response: OrderResponse = response.json().await?;
+        
+        let order_data = order_response.data.context("No order data in response")?;
+        let order_id = order_data.order_id.or(order_data.i).context("No order ID in response")?;
+
+        info!("[PACIFICA] Market Order placed: ID={}", order_id);
+
+        Ok(OrderData {
+            order_id: Some(order_id),
+            i: Some(order_id),
+            client_order_id: Some(client_order_id),
+            symbol: Some(symbol.to_string()),
+        })
+    }
+
     /// Cancel an order by client order ID
     pub async fn cancel_order(
         &self,
