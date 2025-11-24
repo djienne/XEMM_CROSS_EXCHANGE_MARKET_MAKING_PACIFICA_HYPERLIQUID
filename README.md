@@ -456,6 +456,30 @@ python dashboard.py
 
 See `standalone-utils/README.md` for detailed documentation, configuration options, and troubleshooting.
 
+## Web Dashboard
+
+The `dashboard_js/` directory contains a Node.js web dashboard for remote monitoring and control of the bot.
+
+### Features
+- **Real-time Status** - Monitor bot status (Running/Stopped) with accurate process detection
+- **Remote Control** - Start, stop, and deploy bot from your browser
+- **Live Logs** - Auto-refreshing log viewer with ANSI color support
+- **Trade History** - View recent trades with PnL statistics
+- **Configuration** - Display current bot configuration
+
+### Quick Setup
+
+```bash
+cd dashboard_js
+npm install
+node server.js
+# Open http://localhost:3000 in your browser
+```
+
+The dashboard connects to your remote server via SSH to execute commands and fetch data. Configure the remote server details in `server.js`.
+
+See `dashboard_js/README.md` for detailed documentation, API endpoints, and troubleshooting.
+
 ## Running on Linux/AWS VPS
 
 The repository includes bash scripts for easy deployment on Linux systems (e.g., AWS VPS):
