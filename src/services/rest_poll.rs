@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::debug;
@@ -30,7 +31,7 @@ impl PacificaRestPollService {
             match self.pacifica_trading.get_best_bid_ask_rest(&self.symbol, self.agg_level).await {
                 Ok(Some((bid, ask))) => {
                     // Update shared orderbook prices
-                    *self.prices.lock().unwrap() = (bid, ask);
+                    *self.prices.lock() = (bid, ask);
                     debug!(
                         "[PACIFICA_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
                         bid, ask
@@ -70,7 +71,7 @@ impl HyperliquidRestPollService {
             match self.hyperliquid_trading.get_l2_snapshot(&self.symbol).await {
                 Ok(Some((bid, ask))) => {
                     // Update shared orderbook prices
-                    *self.prices.lock().unwrap() = (bid, ask);
+                    *self.prices.lock() = (bid, ask);
                     debug!(
                         "[HYPERLIQUID_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
                         bid, ask
