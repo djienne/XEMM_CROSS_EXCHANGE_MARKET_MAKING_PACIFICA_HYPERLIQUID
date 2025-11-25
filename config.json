@@ -3,7 +3,7 @@
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
   "pacifica_maker_fee_bps": 1.5,
-  "hyperliquid_taker_fee_bps": 4.0,
+  "hyperliquid_taker_fee_bps": 4.5,
   "profit_rate_bps": 15.0,
   "order_notional_usd": 20.0,
   "profit_cancel_threshold_bps": 3.0,

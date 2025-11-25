@@ -382,6 +382,37 @@ def deploy_with_scp():
             pass
 
 
+def fix_line_endings():
+    """Fix line endings on shell scripts to ensure Linux compatibility."""
+    print_info("Fixing line endings on shell scripts for Linux compatibility...")
+
+    cmd = [
+        "ssh",
+        "-i", SSH_KEY,
+        "-o", "ConnectTimeout=30",
+        "-o", "StrictHostKeyChecking=no",
+        f"{REMOTE_USER}@{REMOTE_HOST}",
+        f"cd {REMOTE_PATH} && find . -name '*.sh' -type f -exec sed -i 's/\\r$//' {{}} +"
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            print_success("Line endings fixed on all .sh files")
+            return True
+        else:
+            print_warning(f"Could not fix line endings: {result.stderr}")
+            return False
+    except Exception as e:
+        print_warning(f"Error fixing line endings: {e}")
+        return False
+
+
 def display_next_steps():
     """Display next steps after successful deployment."""
     print("\n" + "=" * 60)
@@ -482,7 +513,11 @@ def main():
     else:
         success = deploy_with_scp()
 
-    # Step 6: Display results
+    # Step 6: Fix line endings (Windows/Linux compatibility)
+    if success:
+        fix_line_endings()
+
+    # Step 7: Display results
     if success:
         display_next_steps()
     else:

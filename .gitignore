@@ -70,3 +70,7 @@ yarn-error.log*
 dist/
 build/
 coverage/
+
+# Claude settings
+.claude/settings.local.json
+dashboard_js/.claude/settings.local.json

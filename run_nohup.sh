@@ -15,6 +15,10 @@ if pgrep -f "xemm_rust" > /dev/null 2>&1; then
 fi
 
 echo "✓ No existing xemm_rust process found. Starting bot..."
+
+# Source cargo environment (Rust installation)
+source $HOME/.cargo/env
+
 nohup cargo run --release > output.log 2>&1 &
 echo "✓ Bot started in background (PID: $!)"
 echo "✓ Output logged to: output.log"
