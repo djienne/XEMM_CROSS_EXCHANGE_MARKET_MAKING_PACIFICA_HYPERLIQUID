@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use parking_lot::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
@@ -75,7 +74,7 @@ impl OrderMonitorService {
                     continue;
                 }
 
-                let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+                let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
                 let age_ms = active_order.placed_at.elapsed().as_millis();
 
                 // *** CRITICAL FIX: Check if order has fills BEFORE cancelling ***
@@ -178,7 +177,7 @@ impl OrderMonitorService {
                 {
                     match self.pacifica_trading.get_best_bid_ask_rest(&self.config.symbol, self.config.agg_level).await {
                         Ok(Some((bid, ask))) => {
-                            *self.pacifica_prices.lock() = (bid, ask);
+                            *self.pacifica_prices.lock().unwrap() = (bid, ask);
                             tprintln!(
                                 "{} Refreshed Pacifica via REST: bid={}, ask={}",
                                 "[MONITOR]".yellow().bold(),
@@ -199,7 +198,7 @@ impl OrderMonitorService {
                 {
                     match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
                         Ok(Some((bid, ask))) => {
-                            *self.hyperliquid_prices.lock() = (bid, ask);
+                            *self.hyperliquid_prices.lock().unwrap() = (bid, ask);
                             tprintln!(
                                 "{} Refreshed Hyperliquid via REST: bid={}, ask={}",
                                 "[MONITOR]".yellow().bold(),
@@ -220,7 +219,7 @@ impl OrderMonitorService {
             }
 
             // Check 2: Profit monitoring (cancel if drops > profit_cancel_threshold_bps)
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
 
             if hl_bid == 0.0 || hl_ask == 0.0 {
                 continue;
@@ -356,7 +355,7 @@ impl OrderMonitorService {
                 {
                     match self.pacifica_trading.get_best_bid_ask_rest(&self.config.symbol, self.config.agg_level).await {
                         Ok(Some((bid, ask))) => {
-                            *self.pacifica_prices.lock() = (bid, ask);
+                            *self.pacifica_prices.lock().unwrap() = (bid, ask);
                             tprintln!(
                                 "{} Refreshed Pacifica via REST: bid={}, ask={}",
                                 "[MONITOR]".yellow().bold(),
@@ -377,7 +376,7 @@ impl OrderMonitorService {
                 {
                     match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
                         Ok(Some((bid, ask))) => {
-                            *self.hyperliquid_prices.lock() = (bid, ask);
+                            *self.hyperliquid_prices.lock().unwrap() = (bid, ask);
                             tprintln!(
                                 "{} Refreshed Hyperliquid via REST: bid={}, ask={}",
                                 "[MONITOR]".yellow().bold(),
@@ -411,7 +410,7 @@ impl OrderMonitorService {
                     };
                     drop(state);
 
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
                     if hl_bid == 0.0 || hl_ask == 0.0 {
                         continue;
                     }

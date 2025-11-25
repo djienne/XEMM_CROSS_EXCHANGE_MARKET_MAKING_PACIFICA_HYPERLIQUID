@@ -316,50 +316,16 @@ impl FillDetectionService {
                                 drop(state);
 
                                 if is_our_order {
-                                    // Track cumulative filled amount to handle multiple partial fills
-                                    // Each partial fill should hedge the INCREMENTAL amount, not be skipped
-                                    let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
-
-                                    // Use a unique key that includes the cumulative filled amount
-                                    // This allows multiple partial fills to each trigger a hedge for their increment
-                                    let cumulative_key = cloid.as_ref()
-                                        .map(|id| format!("partial_{}_cumulative", id))
-                                        .unwrap_or_default();
-
-                                    let hedge_amount = {
+                                    // Check if this fill was already processed (prevent duplicate hedges)
+                                    let fill_id = cloid.as_ref().map(|id| format!("partial_{}", id)).unwrap_or_default();
+                                    {
                                         let mut processed = processed_fills_clone.lock();
-
-                                        // Get previously hedged cumulative amount for this order
-                                        let prev_cumulative: f64 = processed
-                                            .iter()
-                                            .find(|k| k.starts_with(&cumulative_key))
-                                            .and_then(|k| k.split('_').last())
-                                            .and_then(|v| parse(v).ok())
-                                            .unwrap_or(0.0);
-
-                                        // Calculate incremental amount to hedge
-                                        let increment = filled_size - prev_cumulative;
-
-                                        if increment < 0.0001 {
-                                            // No new fill amount to hedge (duplicate event or rounding)
-                                            debug!("[FILL_DETECTION] Partial fill increment {:.6} too small, skipping", increment);
+                                        if processed.contains(&fill_id) {
+                                            debug!("[FILL_DETECTION] Partial fill already processed (duplicate), skipping");
                                             return;
                                         }
-
-                                        // Remove old cumulative marker and insert new one
-                                        processed.retain(|k| !k.starts_with(&cumulative_key));
-                                        processed.insert(format!("{}_{:.6}", cumulative_key, filled_size));
-
-                                        // Also mark this specific fill event as processed
-                                        let fill_event_id = format!("partial_{}_{:.6}",
-                                            cloid.as_ref().unwrap_or(&String::new()), filled_size);
-                                        processed.insert(fill_event_id);
-
-                                        increment
-                                    };
-
-                                    // Use hedge_amount (the incremental amount) instead of filled_size for the hedge
-                                    let filled_size = hedge_amount;
+                                        processed.insert(fill_id);
+                                    }
 
                                     // *** CRITICAL: UPDATE STATE FIRST ***
                                     // State machine provides race condition protection - cancellation can run async
@@ -373,6 +339,8 @@ impl FillDetectionService {
                                             return;
                                         }
                                     };
+
+                                    let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
 
                                     {
                                         let mut state = bot_state_clone.write().await;

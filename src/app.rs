@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
-use parking_lot::Mutex;
 use tokio::time::interval;
 use tracing::debug;
 
@@ -642,8 +642,8 @@ impl XemmBot {
                     }
 
                     // Get current prices
-                    let (pac_bid, pac_ask) = *self.pacifica_prices.lock();
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+                    let (pac_bid, pac_ask) = *self.pacifica_prices.lock().unwrap();
+                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
 
                     // Validate prices
                     if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {

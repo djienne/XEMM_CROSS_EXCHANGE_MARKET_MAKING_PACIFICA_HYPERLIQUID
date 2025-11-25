@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
@@ -7,8 +7,6 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 use fast_float::parse;
-use parking_lot::Mutex;
-use tracing::debug;
 
 use crate::bot::BotState;
 use crate::config::Config;
@@ -118,27 +116,29 @@ impl HedgeService {
                 reception_latency.as_secs_f64() * 1000.0
             );
 
-            // *** HYBRID PRE-HEDGE CANCEL: Fire-and-Forget + Fallback ***
-            // Phase 1: Launch parallel async cancels (0ms wait for speed)
-            // Phase 2: Proceed immediately with hedge (state machine blocks new orders)
-            // Phase 3: Monitor async results and retry if needed (safety net)
-            tprintln!("{} {} Pre-hedge: Async dual cancel initiated (0ms wait)...",
+            // *** CRITICAL: CANCEL ALL ORDERS BEFORE HEDGE ***
+            // Extra safety: cancel again in case fill detection missed anything
+            // or there was a race condition
+            tprintln!("{} {} Pre-hedge safety: Cancelling all Pacifica orders...",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                 "⚡".yellow().bold()
             );
 
-            let pac_clone = self.pacifica_trading.clone();
-            let symbol_clone = self.config.symbol.clone();
-
-            let cancel_handle = tokio::spawn(async move {
-                pac_clone.cancel_all_orders(false, Some(&symbol_clone), false).await
-            });
-
-            // Small yield to start sending cancel requests
-            tokio::task::yield_now().await;
-
-            // Proceed immediately to hedge execution (state machine already prevents new orders)
-            // Async monitoring and fallback retry happens in background
+            if let Err(e) = self.pacifica_trading
+                .cancel_all_orders(false, Some(&self.config.symbol), false)
+                .await
+            {
+                tprintln!("{} {} Failed to cancel orders before hedge: {}",
+                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                    "⚠".yellow().bold(),
+                    e
+                );
+            } else {
+                tprintln!("{} {} Pre-hedge cancellation complete",
+                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                    "✓".green().bold()
+                );
+            }
 
             // Update status
             {
@@ -152,7 +152,7 @@ impl HedgeService {
                 OrderSide::Sell => true, // Filled sell on Pacifica → buy on Hyperliquid
             };
 
-            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock();
+            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock().unwrap();
 
             if hl_bid <= 0.0 || hl_ask <= 0.0 {
                 tprintln!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
@@ -160,14 +160,13 @@ impl HedgeService {
                     "⚠".yellow().bold()
                 );
 
-                const MAX_ATTEMPTS: usize = 3;  // Reduced from 5 for faster retry
-                const RETRY_DELAY_MS: u64 = 100;  // Reduced from 500ms for faster retry
+                const MAX_ATTEMPTS: usize = 5;
                 for attempt in 1..=MAX_ATTEMPTS {
                     match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
                         Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
                             hl_bid = bid;
                             hl_ask = ask;
-                            let mut cache = self.hyperliquid_prices.lock();
+                            let mut cache = self.hyperliquid_prices.lock().unwrap();
                             *cache = (bid, ask);
                             tprintln!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -197,8 +196,8 @@ impl HedgeService {
                     }
 
                     if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
-                        let cached = *self.hyperliquid_prices.lock();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let cached = *self.hyperliquid_prices.lock().unwrap();
                         hl_bid = cached.0;
                         hl_ask = cached.1;
                         if hl_bid > 0.0 && hl_ask > 0.0 {
@@ -345,94 +344,7 @@ impl HedgeService {
                     let hedge_fill_price = if let Some(status) = response_data.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
-                                let filled_size: f64 = parse(&filled.totalSz).unwrap_or(0.0);
-                                let requested_size = size;
-                                let fill_ratio = if requested_size > 0.0 { filled_size / requested_size } else { 0.0 };
-
-                                // Check for partial fill (more than 0.5% difference)
-                                if fill_ratio < 0.995 {
-                                    let unfilled_amount = requested_size - filled_size;
-                                    let unfilled_notional = unfilled_amount * parse(&filled.avgPx).unwrap_or(0.0);
-
-                                    tprintln!("{} {} ⚠️ PARTIAL HEDGE FILL DETECTED!",
-                                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                        "⚠".yellow().bold()
-                                    );
-                                    tprintln!("{} Requested: {:.6} | Filled: {} ({:.1}%) | Unfilled: {:.6} (~${:.2})",
-                                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                        requested_size,
-                                        filled.totalSz,
-                                        fill_ratio * 100.0,
-                                        unfilled_amount,
-                                        unfilled_notional
-                                    );
-
-                                    // If unfilled notional > $5, attempt to hedge the remainder
-                                    if unfilled_notional > 5.0 {
-                                        tprintln!("{} {} Attempting to hedge unfilled remainder: {:.6}",
-                                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                            "⚡".yellow().bold(),
-                                            unfilled_amount
-                                        );
-
-                                        // Re-fetch current prices for remainder hedge
-                                        let (remainder_bid, remainder_ask) = *self.hyperliquid_prices.lock();
-
-                                        if remainder_bid > 0.0 && remainder_ask > 0.0 {
-                                            // Attempt remainder hedge with 1.5x slippage (conservative per user preference)
-                                            let remainder_slippage = self.config.hyperliquid_slippage * 1.5;
-                                            match self.hyperliquid_trading
-                                                .place_market_order(
-                                                    &self.config.symbol,
-                                                    is_buy,
-                                                    unfilled_amount,
-                                                    remainder_slippage,
-                                                    false,
-                                                    Some(remainder_bid),
-                                                    Some(remainder_ask),
-                                                )
-                                                .await
-                                            {
-                                                Ok(remainder_response) => {
-                                                    if let crate::connector::hyperliquid::OrderResponseContent::Success(data) = &remainder_response.response {
-                                                        if let Some(crate::connector::hyperliquid::OrderStatus::Filled { filled: rem_filled }) = data.data.statuses.first() {
-                                                            tprintln!("{} {} Remainder hedge successful: {} @ ${}",
-                                                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                                                "✓".green().bold(),
-                                                                rem_filled.totalSz,
-                                                                rem_filled.avgPx
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tprintln!("{} {} CRITICAL: Remainder hedge FAILED: {} - POSITION MAY BE UNHEDGED!",
-                                                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                                        "✗✗✗".red().bold(),
-                                                        e
-                                                    );
-                                                    tprintln!("{} {} Manual intervention required - check positions immediately!",
-                                                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                                        "⚠".yellow().bold()
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            tprintln!("{} {} Cannot hedge remainder - prices unavailable",
-                                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                                "✗".red().bold()
-                                            );
-                                        }
-                                    } else {
-                                        tprintln!("{} {} Unfilled notional ${:.2} below $5 threshold, accepting partial hedge",
-                                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                                            "ℹ".blue().bold(),
-                                            unfilled_notional
-                                        );
-                                    }
-                                }
-
-                                tprintln!("{} {} Hedge executed: Filled {} @ ${} | Total latency: {:.1}ms",
+                                tprintln!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✓".green().bold(),
                                     filled.totalSz,
@@ -729,50 +641,6 @@ impl HedgeService {
 
                     // *** CRITICAL: FINAL SAFETY CANCELLATION ***
                     // Cancel all orders one last time before marking complete
-                    // *** PHASE 4: Monitor async pre-hedge cancel results and retry if needed ***
-                    // Spawn background task to check pre-hedge cancel results and fallback retry
-                    let pac_fallback = self.pacifica_trading.clone();
-                    let symbol_fallback = self.config.symbol.clone();
-                    tokio::spawn(async move {
-                        // Check cancel result
-                        let cancel_ok = match cancel_handle.await {
-                            Ok(Ok(_)) => {
-                                debug!("[HEDGE] Pre-hedge cancel succeeded");
-                                true
-                            }
-                            _ => {
-                                debug!("[HEDGE] Pre-hedge cancel failed or incomplete");
-                                false
-                            }
-                        };
-
-                        // If failed, attempt synchronous fallback retry
-                        if !cancel_ok {
-                            tprintln!("{} {} Async pre-hedge cancel incomplete, attempting sync fallback retry...",
-                                format!("[{} HEDGE]", symbol_fallback).bright_magenta().bold(),
-                                "⚠".yellow().bold()
-                            );
-
-                            // Retry
-                            match pac_fallback.cancel_all_orders(false, Some(&symbol_fallback), false).await {
-                                Ok(count) => {
-                                    tprintln!("{} {} Fallback cancel succeeded (cancelled {} orders)",
-                                        format!("[{} HEDGE]", symbol_fallback).bright_magenta().bold(),
-                                        "✓".green().bold(),
-                                        count
-                                    );
-                                }
-                                Err(e) => {
-                                    tprintln!("{} {} Fallback cancel also failed: {}",
-                                        format!("[{} HEDGE]", symbol_fallback).bright_magenta().bold(),
-                                        "⚠".yellow().bold(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    });
-
                     // This ensures no stray orders remain active
                     tprintln!("");
                     tprintln!("{} {} Post-hedge safety: Final cancellation of all Pacifica orders...",
@@ -897,56 +765,22 @@ impl HedgeService {
                             hl_pos
                         );
 
-                        // Calculate dynamic threshold based on order size and current price
-                        // Use 0.5% of the hedge size as tolerance, with minimum of 0.0001 for dust
-                        let (current_bid, current_ask) = *self.hyperliquid_prices.lock();
-                        let current_price = if current_bid > 0.0 && current_ask > 0.0 {
-                            (current_bid + current_ask) / 2.0
-                        } else {
-                            // Fallback to using the fill price from hedge
-                            hedge_fill_price
-                        };
-
-                        // Dynamic threshold: max(0.5% of hedge size, $0.10 worth, 0.0001 units)
-                        let size_based_threshold = size * 0.005;  // 0.5% of order size
-                        let notional_threshold = if current_price > 0.0 { 0.10 / current_price } else { 0.0001 };  // $0.10 worth
-                        let position_tolerance = size_based_threshold
-                            .max(notional_threshold)
-                            .max(0.0001);  // Absolute minimum for dust
-
-                        tprintln!("{} Position tolerance: {:.6} {} (based on size {:.4} @ ${:.2})",
-                            format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                            position_tolerance,
-                            self.config.symbol,
-                            size,
-                            current_price
-                        );
-
                         // Check if net position is close to neutral
-                        if net_position.abs() < position_tolerance {
-                            tprintln!("{} {} Net position {:.6} is within tolerance {:.6} (properly hedged)",
+                        if net_position.abs() < 0.01 {
+                            tprintln!("{} {} Net position is NEUTRAL (properly hedged across both exchanges)",
                                 format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                                "✓".green().bold(),
-                                net_position.abs(),
-                                position_tolerance
+                                "✓".green().bold()
                             );
                         } else {
-                            let unhedged_notional = net_position.abs() * current_price;
                             tprintln!("");
                             tprintln!("{}", "⚠".repeat(80).yellow());
                             tprintln!("{} {} WARNING: Net position NOT neutral!",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold(),
                                 "⚠".yellow().bold()
                             );
-                            tprintln!("{} Position delta: {:.6} {} (~${:.2} unhedged exposure)",
+                            tprintln!("{} Position delta: {:.4} {}",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold(),
                                 net_position.abs(),
-                                self.config.symbol,
-                                unhedged_notional
-                            );
-                            tprintln!("{} Tolerance was: {:.6} {}",
-                                format!("[{} VERIFY]", self.config.symbol).red().bold(),
-                                position_tolerance,
                                 self.config.symbol
                             );
                             tprintln!("{} This indicates a potential hedge failure or partial fill.",

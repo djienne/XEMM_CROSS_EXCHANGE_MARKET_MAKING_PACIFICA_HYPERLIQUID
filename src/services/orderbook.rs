@@ -1,8 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use fast_float::parse;
-use parking_lot::Mutex;
 
 use crate::connector::pacifica::{OrderbookClient as PacificaOrderbookClient, OrderbookConfig as PacificaOrderbookConfig};
 use crate::connector::hyperliquid::{OrderbookClient as HyperliquidOrderbookClient, OrderbookConfig as HyperliquidOrderbookConfig};
@@ -47,7 +46,7 @@ impl PacificaOrderbookService {
             .start(move |bid, ask, _symbol, _ts| {
                 let bid_price: f64 = parse(&bid).unwrap_or(0.0);
                 let ask_price: f64 = parse(&ask).unwrap_or(0.0);
-                *pac_prices_clone.lock() = (bid_price, ask_price);
+                *pac_prices_clone.lock().unwrap() = (bid_price, ask_price);
             })
             .await
             .ok();
@@ -84,7 +83,7 @@ impl HyperliquidOrderbookService {
             .start(move |bid, ask, _coin, _ts| {
                 let bid_price: f64 = parse(&bid).unwrap_or(0.0);
                 let ask_price: f64 = parse(&ask).unwrap_or(0.0);
-                *hl_prices_clone.lock() = (bid_price, ask_price);
+                *hl_prices_clone.lock().unwrap() = (bid_price, ask_price);
             })
             .await
             .ok();
