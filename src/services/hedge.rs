@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
@@ -152,7 +153,7 @@ impl HedgeService {
                 OrderSide::Sell => true, // Filled sell on Pacifica → buy on Hyperliquid
             };
 
-            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock().unwrap();
+            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock();
 
             if hl_bid <= 0.0 || hl_ask <= 0.0 {
                 tprintln!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
@@ -166,7 +167,7 @@ impl HedgeService {
                         Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
                             hl_bid = bid;
                             hl_ask = ask;
-                            let mut cache = self.hyperliquid_prices.lock().unwrap();
+                            let mut cache = self.hyperliquid_prices.lock();
                             *cache = (bid, ask);
                             tprintln!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -197,7 +198,7 @@ impl HedgeService {
 
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let cached = *self.hyperliquid_prices.lock().unwrap();
+                        let cached = *self.hyperliquid_prices.lock();
                         hl_bid = cached.0;
                         hl_ask = cached.1;
                         if hl_bid > 0.0 && hl_ask > 0.0 {

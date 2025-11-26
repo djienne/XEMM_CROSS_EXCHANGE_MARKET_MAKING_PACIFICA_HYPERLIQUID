@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::interval;
 use tracing::debug;
 use colored::Colorize;
 use fast_float::parse;
@@ -50,7 +49,7 @@ impl RestFillDetectionService {
                 state.has_active_order_fast() || matches!(state.status, crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging)
             };
 
-            let poll_ms = if has_active_order { 200 } else { 1000 };
+            let poll_ms = if has_active_order { 100 } else { 1000 };
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
             // Get active order info, with recovery logic for recent cancellations
