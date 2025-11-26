@@ -154,6 +154,25 @@ impl PositionMonitorService {
                             format!("{:.4}", delta.abs()).green().bold()
                         );
 
+                        // CRITICAL FIX: Skip if this is first position change from None baseline (startup)
+                        // This prevents hedging the bot's first order fill which establishes initial position
+                        if last_snapshot.is_none() && last_signed.abs() < 0.0001 {
+                            tprintln!(
+                                "{} {} Skipping hedge for first position change from baseline (startup initialization)",
+                                "[POSITION_MONITOR]".bright_cyan().bold(),
+                                "ℹ".blue().bold()
+                            );
+
+                            // Update snapshot to prevent continuous detection
+                            let mut snapshot = self.last_position_snapshot.lock();
+                            *snapshot = Some(PositionSnapshot {
+                                amount: current_amount,
+                                side: current_side,
+                                last_check: std::time::Instant::now(),
+                            });
+                            continue;
+                        }
+
                         // Check bot state - don't trigger duplicate hedges
                         let current_state = {
                             let state = self.bot_state.read().await;
