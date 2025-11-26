@@ -1,6 +1,6 @@
 ================================================================================
 RUST SOURCE CODE COLLECTION
-Generated: 2025-11-24 22:04:49
+Generated: 2025-11-26 23:37:02
 Total files: 69
 ================================================================================
 
@@ -6013,7 +6013,8 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
@@ -6028,7 +6029,8 @@ use crate::connector::pacifica::{
     PacificaWsTrading, OrderSide as PacificaOrderSide,
 };
 use crate::services::{
-    fill_detection::FillDetectionService, hedge::HedgeService, order_monitor::OrderMonitorService,
+    fill_detection::FillDetectionService, hedge::HedgeService,
+    order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks, sync_atomic_status, update_order_snapshot},
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
     rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
@@ -6077,8 +6079,12 @@ pub struct XemmBot {
     pub evaluator: OpportunityEvaluator,
 
     // Fill tracking state
-    pub processed_fills: Arc<tokio::sync::Mutex<HashSet<String>>>,
-    pub last_position_snapshot: Arc<tokio::sync::Mutex<Option<PositionSnapshot>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub last_position_snapshot: Arc<parking_lot::Mutex<Option<PositionSnapshot>>>,
+
+    // Order monitor state (lock-free)
+    pub atomic_status: Arc<AtomicU8>,
+    pub order_snapshot: Arc<SharedOrderSnapshot>,
 
     // Channels
     pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
@@ -6212,6 +6218,15 @@ impl XemmBot {
                 .bright_black(),
             "[CONFIG]".blue().bold(),
             format!("{} secs", config.pacifica_rest_poll_interval_secs).bright_white()
+        );
+        println!(
+            "{} {} Active Order REST Poll Interval: {}",
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string()
+                .bright_black(),
+            "[CONFIG]".blue().bold(),
+            format!("{} ms", config.pacifica_active_order_rest_poll_interval_ms).bright_white()
         );
         println!(
             "{} {} Hyperliquid Market Order maximum allowed Slippage: {}",
@@ -6399,8 +6414,8 @@ impl XemmBot {
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
         // Fill tracking state
-        let processed_fills = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));
-        let last_position_snapshot = Arc::new(tokio::sync::Mutex::new(Option::<PositionSnapshot>::None));
+        let processed_fills = Arc::new(parking_lot::Mutex::new(HashSet::<String>::new()));
+        let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
 
         println!(
             "{} {} {}",
@@ -6412,6 +6427,10 @@ impl XemmBot {
             "State and channels initialized".green()
         );
         println!();
+
+        // Initialize order monitor state
+        let atomic_status = Arc::new(AtomicU8::new(AtomicBotStatus::Idle as u8));
+        let order_snapshot = Arc::new(SharedOrderSnapshot::new());
 
         Ok(XemmBot {
             config,
@@ -6429,6 +6448,8 @@ impl XemmBot {
             evaluator,
             processed_fills,
             last_position_snapshot,
+            atomic_status,
+            order_snapshot,
             hedge_tx,
             hedge_rx: Some(hedge_rx),
             shutdown_tx,
@@ -6484,6 +6505,8 @@ impl XemmBot {
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             baseline_updater,
+            atomic_status: self.atomic_status.clone(),
+            order_snapshot: self.order_snapshot.clone(),
         };
         tokio::spawn(async move {
             fill_service.run().await;
@@ -6525,6 +6548,7 @@ impl XemmBot {
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             min_hedge_notional: 10.0,
+            poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
         };
         tokio::spawn(async move {
             rest_fill_service.run().await;
@@ -6551,18 +6575,19 @@ impl XemmBot {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Service 6: Order Monitor (age/profit monitoring)
-        let order_monitor_service = OrderMonitorService {
-            bot_state: self.bot_state.clone(),
-            pacifica_prices: self.pacifica_prices.clone(),
-            hyperliquid_prices: self.hyperliquid_prices.clone(),
-            config: self.config.clone(),
-            evaluator: self.evaluator.clone(),
-            pacifica_trading: self.pacifica_trading_monitor.clone(),
-            hyperliquid_trading: self.hyperliquid_trading.clone(),
-        };
-        tokio::spawn(async move {
-            order_monitor_service.run().await;
-        });
+        let (order_monitor_service, cancel_rx) = OrderMonitorService::new(
+            self.bot_state.clone(),
+            self.atomic_status.clone(),
+            self.order_snapshot.clone(),
+            self.pacifica_prices.clone(),
+            self.hyperliquid_prices.clone(),
+            self.config.clone(),
+            self.evaluator.clone(),
+            self.pacifica_trading_monitor.clone(),
+            self.hyperliquid_trading.clone(),
+        );
+        let order_monitor_service = Arc::new(order_monitor_service);
+        spawn_monitor_tasks(order_monitor_service, cancel_rx);
 
         // Service 7: Hedge Execution
         let hedge_service = HedgeService {
@@ -6653,17 +6678,23 @@ impl XemmBot {
                     }
 
                     // Get current prices
-                    let (pac_bid, pac_ask) = *self.pacifica_prices.lock().unwrap();
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
+                    let (pac_bid, pac_ask) = *self.pacifica_prices.lock();
+                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
 
                     // Validate prices
                     if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {
                         continue;
                     }
 
+                    // Get timestamp once for this evaluation cycle
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+
                     // Evaluate opportunities
-                    let buy_opp = self.evaluator.evaluate_buy_opportunity(hl_bid, self.config.order_notional_usd);
-                    let sell_opp = self.evaluator.evaluate_sell_opportunity(hl_ask, self.config.order_notional_usd);
+                    let buy_opp = self.evaluator.evaluate_buy_opportunity(hl_bid, self.config.order_notional_usd, now_ms);
+                    let sell_opp = self.evaluator.evaluate_sell_opportunity(hl_ask, self.config.order_notional_usd, now_ms);
 
                     let pac_mid = (pac_bid + pac_ask) / 2.0;
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
@@ -6739,6 +6770,16 @@ impl XemmBot {
                                     };
 
                                     state.set_active_order(active_order);
+
+                                    // Sync atomic status and order snapshot for order monitor
+                                    sync_atomic_status(&self.atomic_status, &state.status);
+                                    update_order_snapshot(
+                                        &self.order_snapshot,
+                                        opp.direction,
+                                        opp.pacifica_price,
+                                        opp.size,
+                                        opp.initial_profit_bps,
+                                    );
                                 } else {
                                     tprintln!("{} {} Order placed but no client_order_id returned",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
@@ -7356,6 +7397,8 @@ PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PA
 ================================================================================
 
 use crate::strategy::OrderSide;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Bot status enumeration
@@ -7403,6 +7446,8 @@ pub struct BotState {
     pub position: f64,
     /// Current bot status
     pub status: BotStatus,
+    /// Atomic status for fast lock-free checks (0=Idle, 1=OrderPlaced, 2=Filled, 3=Hedging, 4=Complete, 5=Error)
+    pub status_atomic: Arc<AtomicU8>,
     /// Last time an order was cancelled (for grace period enforcement)
     pub last_cancellation_time: Option<Instant>,
 }
@@ -7414,6 +7459,7 @@ impl BotState {
             active_order: None,
             position: 0.0,
             status: BotStatus::Idle,
+            status_atomic: Arc::new(AtomicU8::new(0)), // 0 = Idle
             last_cancellation_time: None,
         }
     }
@@ -7422,18 +7468,21 @@ impl BotState {
     pub fn set_active_order(&mut self, order: ActiveOrder) {
         self.active_order = Some(order);
         self.status = BotStatus::OrderPlaced;
+        self.status_atomic.store(1, Ordering::Release); // 1 = OrderPlaced
     }
 
     /// Clear active order and return to Idle
     pub fn clear_active_order(&mut self) {
         self.active_order = None;
         self.status = BotStatus::Idle;
+        self.status_atomic.store(0, Ordering::Release); // 0 = Idle
         self.last_cancellation_time = Some(Instant::now());
     }
 
     /// Mark order as filled
     pub fn mark_filled(&mut self, filled_size: f64, side: OrderSide) {
         self.status = BotStatus::Filled;
+        self.status_atomic.store(2, Ordering::Release); // 2 = Filled
 
         // Update position
         match side {
@@ -7445,17 +7494,20 @@ impl BotState {
     /// Mark as hedging
     pub fn mark_hedging(&mut self) {
         self.status = BotStatus::Hedging;
+        self.status_atomic.store(3, Ordering::Release); // 3 = Hedging
     }
 
     /// Mark as complete
     pub fn mark_complete(&mut self) {
         self.status = BotStatus::Complete;
+        self.status_atomic.store(4, Ordering::Release); // 4 = Complete
         self.active_order = None;
     }
 
     /// Set error status
     pub fn set_error(&mut self, error: String) {
         self.status = BotStatus::Error(error);
+        self.status_atomic.store(5, Ordering::Release); // 5 = Error
     }
 
     /// Check if bot is in a terminal state
@@ -7466,6 +7518,21 @@ impl BotState {
     /// Check if bot is idle
     pub fn is_idle(&self) -> bool {
         self.status == BotStatus::Idle
+    }
+
+    /// Fast lock-free check if bot is idle (using atomic status)
+    pub fn is_idle_fast(&self) -> bool {
+        self.status_atomic.load(Ordering::Acquire) == 0
+    }
+
+    /// Fast lock-free check if bot has an active order (OrderPlaced status)
+    pub fn has_active_order_fast(&self) -> bool {
+        self.status_atomic.load(Ordering::Acquire) == 1
+    }
+
+    /// Fast lock-free get current status as u8
+    pub fn get_status_atomic(&self) -> u8 {
+        self.status_atomic.load(Ordering::Acquire)
     }
 
     /// Check if the grace period has passed since last cancellation
@@ -7553,6 +7620,11 @@ pub struct Config {
     /// Pacifica REST API polling interval in seconds (complement to WebSocket)
     #[serde(default = "default_pacifica_rest_poll_interval")]
     pub pacifica_rest_poll_interval_secs: u64,
+
+    /// Pacifica REST poll interval for active orders (ms).
+    /// Used by REST fill detection to poll more frequently when an order is active.
+    #[serde(default = "default_pacifica_active_order_rest_poll_interval")]
+    pub pacifica_active_order_rest_poll_interval_ms: u64,
 }
 
 // Default values
@@ -7608,6 +7680,10 @@ fn default_pacifica_rest_poll_interval() -> u64 {
     2 // 2 seconds
 }
 
+fn default_pacifica_active_order_rest_poll_interval() -> u64 {
+    500 // 500 ms (safer than 100ms to avoid rate limits)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -7625,6 +7701,7 @@ impl Default for Config {
             hyperliquid_slippage: default_hyperliquid_slippage(),
             hyperliquid_use_ws_for_hedge: default_hyperliquid_use_ws_for_hedge(),
             pacifica_rest_poll_interval_secs: default_pacifica_rest_poll_interval(),
+            pacifica_active_order_rest_poll_interval_ms: default_pacifica_active_order_rest_poll_interval(),
         }
     }
 }
@@ -9241,8 +9318,9 @@ PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PA
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
+use parking_lot::Mutex;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -9284,38 +9362,37 @@ impl PositionBaselineUpdater {
     /// * `filled_amount` - Amount that was filled
     /// * `avg_price` - Average fill price
     pub fn update_baseline(&self, symbol: &str, side: &str, filled_amount: f64, avg_price: f64) {
-        if let Ok(mut snapshots) = self.position_snapshots.lock() {
-            if let Ok(mut initialized) = self.position_initialized.lock() {
-                // Get current snapshot or default to 0.0
-                let current = snapshots.get(symbol);
-                let prev_qty = current.map(|s| s.quantity).unwrap_or(0.0);
+        // Batch lock acquisition for lower latency
+        let mut snapshots = self.position_snapshots.lock();
+        let mut initialized = self.position_initialized.lock();
 
-                // Calculate new position based on fill
-                let delta = if side == "buy" { filled_amount } else { -filled_amount };
-                let new_qty = prev_qty + delta;
+        // Get current snapshot or default to 0.0
+        let prev_qty = snapshots.get(symbol).map(|s| s.quantity).unwrap_or(0.0);
 
-                // Update snapshot
-                snapshots.insert(
-                    symbol.to_string(),
-                    PositionSnapshot {
-                        quantity: new_qty,
-                        entry_price: avg_price,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                    },
-                );
+        // Calculate new position based on fill
+        let delta = if side == "buy" { filled_amount } else { -filled_amount };
+        let new_qty = prev_qty + delta;
 
-                // Mark as initialized
-                initialized.insert(symbol.to_string());
+        // Update snapshot
+        snapshots.insert(
+            symbol.to_string(),
+            PositionSnapshot {
+                quantity: new_qty,
+                entry_price: avg_price,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            },
+        );
 
-                debug!(
-                    "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({} {:.4} @ ${:.4})",
-                    symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
-                );
-            }
-        }
+        // Mark as initialized
+        initialized.insert(symbol.to_string());
+
+        debug!(
+            "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({} {:.4} @ ${:.4})",
+            symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
+        );
     }
 }
 
@@ -9381,24 +9458,24 @@ impl FillDetectionClient {
     /// * `positions` - Vector of (symbol, quantity, entry_price, timestamp) tuples
     ///   where quantity is signed (+ for long, - for short)
     pub fn initialize_positions(&self, positions: Vec<(String, f64, f64, u64)>) {
-        if let Ok(mut snapshots) = self.position_snapshots.lock() {
-            if let Ok(mut initialized) = self.position_initialized.lock() {
-                for (symbol, quantity, entry_price, timestamp) in positions {
-                    snapshots.insert(
-                        symbol.clone(),
-                        PositionSnapshot {
-                            quantity,
-                            entry_price,
-                            timestamp,
-                        },
-                    );
-                    initialized.insert(symbol.clone());
-                    info!(
-                        "[POSITION INIT] Pre-initialized {} position: {:.4} @ ${:.4}",
-                        symbol, quantity, entry_price
-                    );
-                }
-            }
+        // Batch lock acquisition for lower latency
+        let mut snapshots = self.position_snapshots.lock();
+        let mut initialized = self.position_initialized.lock();
+
+        for (symbol, quantity, entry_price, timestamp) in positions {
+            snapshots.insert(
+                symbol.clone(),
+                PositionSnapshot {
+                    quantity,
+                    entry_price,
+                    timestamp,
+                },
+            );
+            initialized.insert(symbol.clone());
+            info!(
+                "[POSITION INIT] Pre-initialized {} position: {:.4} @ ${:.4}",
+                symbol, quantity, entry_price
+            );
         }
     }
 
@@ -9413,38 +9490,37 @@ impl FillDetectionClient {
     /// * `filled_amount` - Amount that was filled
     /// * `avg_price` - Average fill price
     pub fn update_position_baseline(&self, symbol: &str, side: &str, filled_amount: f64, avg_price: f64) {
-        if let Ok(mut snapshots) = self.position_snapshots.lock() {
-            if let Ok(mut initialized) = self.position_initialized.lock() {
-                // Get current snapshot or default to 0.0
-                let current = snapshots.get(symbol);
-                let prev_qty = current.map(|s| s.quantity).unwrap_or(0.0);
+        // Batch lock acquisition for lower latency
+        let mut snapshots = self.position_snapshots.lock();
+        let mut initialized = self.position_initialized.lock();
 
-                // Calculate new position based on fill
-                let delta = if side == "buy" { filled_amount } else { -filled_amount };
-                let new_qty = prev_qty + delta;
+        // Get current snapshot or default to 0.0
+        let prev_qty = snapshots.get(symbol).map(|s| s.quantity).unwrap_or(0.0);
 
-                // Update snapshot
-                snapshots.insert(
-                    symbol.to_string(),
-                    PositionSnapshot {
-                        quantity: new_qty,
-                        entry_price: avg_price,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                    },
-                );
+        // Calculate new position based on fill
+        let delta = if side == "buy" { filled_amount } else { -filled_amount };
+        let new_qty = prev_qty + delta;
 
-                // Mark as initialized
-                initialized.insert(symbol.to_string());
+        // Update snapshot
+        snapshots.insert(
+            symbol.to_string(),
+            PositionSnapshot {
+                quantity: new_qty,
+                entry_price: avg_price,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            },
+        );
 
-                debug!(
-                    "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({}  {:.4} @ ${:.4})",
-                    symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
-                );
-            }
-        }
+        // Mark as initialized
+        initialized.insert(symbol.to_string());
+
+        debug!(
+            "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({}  {:.4} @ ${:.4})",
+            symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
+        );
     }
 
     /// Start the fill detection client with a callback for fill events
@@ -9591,9 +9667,7 @@ impl FillDetectionClient {
                     );
 
                     // Update last order fill time for cross-validation
-                    if let Ok(mut last_time) = self.last_order_fill_time.lock() {
-                        *last_time = Instant::now();
-                    }
+                    *self.last_order_fill_time.lock() = Instant::now();
 
                     // Process each order update
                     for update in updates.data {
@@ -9639,8 +9713,10 @@ impl FillDetectionClient {
     }
 
     /// Detect fill from position change (redundancy layer)
+    ///
+    /// Optimized for low latency with batched lock acquisition.
     fn detect_fill_from_position(&self, position: &super::types::PositionData) -> Option<FillEvent> {
-        // Parse position data with validation
+        // Parse position data with validation (no locks needed)
         let amount: f64 = match position.amount.parse::<f64>() {
             Ok(val) if val >= 0.0 && val.is_finite() => val,
             Ok(val) => {
@@ -9698,15 +9774,14 @@ impl FillDetectionClient {
             position.symbol, amount, position.side, entry_price, quantity
         );
 
-        // Check if this is the first position update for this symbol
-        let mut initialized = self.position_initialized.lock().ok()?;
+        // BATCH LOCK ACQUISITION: Acquire all locks at once for lower latency
+        // This eliminates multiple lock/unlock cycles in the hot path
+        let mut initialized = self.position_initialized.lock();
+        let mut snapshots = self.position_snapshots.lock();
+
         let is_first_update = !initialized.contains(&position.symbol);
-
-        // Get previous position snapshot
-        let mut snapshots = self.position_snapshots.lock().ok()?;
-        let prev_snapshot = snapshots.get(&position.symbol);
-
-        let prev_qty = prev_snapshot.map(|s| s.quantity).unwrap_or(0.0);
+        let prev_snapshot = snapshots.get(&position.symbol).cloned();
+        let prev_qty = prev_snapshot.as_ref().map(|s| s.quantity).unwrap_or(0.0);
         let delta = quantity - prev_qty;
 
         // CRITICAL FIX: If this is the first position update for this symbol,
@@ -9721,11 +9796,8 @@ impl FillDetectionClient {
                 entry_price
             );
 
-            // Mark this symbol as initialized
+            // Mark this symbol as initialized and save baseline snapshot
             initialized.insert(position.symbol.clone());
-            drop(initialized);  // Release lock early
-
-            // Save the baseline snapshot
             snapshots.insert(
                 position.symbol.clone(),
                 PositionSnapshot {
@@ -9738,16 +9810,14 @@ impl FillDetectionClient {
             return None;  // Don't trigger fill detection on first update
         }
 
-        drop(initialized);  // Release lock early
-
         // Validate timestamp - reject stale updates (older than previous snapshot)
-        if let Some(prev_snapshot) = prev_snapshot {
-            if position.timestamp <= prev_snapshot.timestamp {
+        if let Some(ref prev) = prev_snapshot {
+            if position.timestamp <= prev.timestamp {
                 warn!(
                     "[POSITION VALIDATION] Stale position update detected for {} (current: {}, previous: {}). Ignoring.",
                     position.symbol,
                     position.timestamp,
-                    prev_snapshot.timestamp
+                    prev.timestamp
                 );
                 return None;  // Ignore stale updates
             }
@@ -9790,12 +9860,26 @@ impl FillDetectionClient {
         // Determine fill side from delta
         let side = if delta > 0.0 { "buy" } else { "sell" };
 
+        // Update snapshot before releasing locks
+        snapshots.insert(
+            position.symbol.clone(),
+            PositionSnapshot {
+                quantity,
+                entry_price,
+                timestamp: position.timestamp,
+            },
+        );
+
+        // Release position locks before acquiring last_order_fill_time lock
+        // to avoid potential deadlock and reduce lock hold time
+        drop(snapshots);
+        drop(initialized);
+
         // Cross-validate: check if we received order fills recently (for logging purposes only)
-        let (cross_validated, seconds_since_last_fill) = if let Ok(last_time) = self.last_order_fill_time.lock() {
+        let (cross_validated, seconds_since_last_fill) = {
+            let last_time = self.last_order_fill_time.lock();
             let elapsed = last_time.elapsed().as_secs();
             (elapsed < 60, elapsed)
-        } else {
-            (false, u64::MAX)
         };
 
         // Log fill detection with cross-validation status (informational only)
@@ -9821,16 +9905,6 @@ impl FillDetectionClient {
                 seconds_since_last_fill
             );
         }
-
-        // Update snapshot before returning
-        snapshots.insert(
-            position.symbol.clone(),
-            PositionSnapshot {
-                quantity,
-                entry_price,
-                timestamp: position.timestamp,
-            },
-        );
 
         // Create position-based fill event
         Some(FillEvent::PositionFill {
@@ -11911,6 +11985,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::debug;
 use colored::Colorize;
+use fast_float::parse;
 
 use crate::bot::{BotState, BotStatus};
 use crate::connector::pacifica::{
@@ -11939,8 +12014,10 @@ pub struct FillDetectionService {
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub fill_config: FillDetectionConfig,
     pub symbol: String,
-    pub processed_fills: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub baseline_updater: PositionBaselineUpdater,
+    pub atomic_status: Arc<std::sync::atomic::AtomicU8>,
+    pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
 }
 
 impl FillDetectionService {
@@ -11967,6 +12044,8 @@ impl FillDetectionService {
         let symbol = self.symbol.clone();
         let processed_fills = self.processed_fills.clone();
         let baseline_updater = self.baseline_updater.clone();
+        let atomic_status = self.atomic_status.clone();
+        let order_snapshot = self.order_snapshot.clone();
 
         fill_client
             .start(move |fill_event| {
@@ -12017,7 +12096,7 @@ impl FillDetectionService {
                                 // Check if this fill was already processed (prevent duplicate hedges)
                                 let fill_id = cloid.as_ref().map(|id| format!("full_{}", id)).unwrap_or_default();
                                 {
-                                    let mut processed = processed_fills_clone.lock().await;
+                                    let mut processed = processed_fills_clone.lock();
                                     if processed.contains(&fill_id) {
                                         debug!("[FILL_DETECTION] Full fill already processed (duplicate), skipping");
                                         return;
@@ -12039,7 +12118,7 @@ impl FillDetectionService {
                                     }
                                 };
 
-                                let filled_size: f64 = filled_amount_str.parse().unwrap_or(0.0);
+                                let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
 
                                 {
                                     let mut state = bot_state_clone.write().await;
@@ -12092,7 +12171,7 @@ impl FillDetectionService {
 
                                 // *** CRITICAL: UPDATE POSITION BASELINE ***
                                 // This prevents position-based detection from triggering duplicate hedge
-                                let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
+                                let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
                                 baseline_updater_clone.update_baseline(
                                     &symbol_clone,
                                     &side_str,
@@ -12124,6 +12203,8 @@ impl FillDetectionService {
                         // Spawn async task to handle the cancellation
                         let bot_state_clone = bot_state.clone();
                         let cloid = client_order_id.clone();
+                        let atomic_status_clone = atomic_status.clone();
+                        let order_snapshot_clone = order_snapshot.clone();
 
                         tokio::spawn(async move {
                             let mut state = bot_state_clone.write().await;
@@ -12141,6 +12222,9 @@ impl FillDetectionService {
                                     BotStatus::OrderPlaced => {
                                         // Normal cancellation (monitor refresh, profit deviation, etc.)
                                         state.clear_active_order();
+                                        // Sync atomic status and clear order snapshot
+                                        crate::services::order_monitor::sync_atomic_status(&atomic_status_clone, &state.status);
+                                        order_snapshot_clone.set(None);
                                         debug!("[BOT] Active order cancelled, returning to Idle");
                                     }
                                     BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
@@ -12173,8 +12257,8 @@ impl FillDetectionService {
                         ..
                     } => {
                         // Calculate notional value of partial fill
-                        let filled_size: f64 = filled_amount.parse().unwrap_or(0.0);
-                        let fill_price: f64 = avg_price.parse().unwrap_or(0.0);
+                        let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
+                        let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
                         let notional_value = filled_size * fill_price;
 
                         tprintln!(
@@ -12226,7 +12310,7 @@ impl FillDetectionService {
                                     // Check if this fill was already processed (prevent duplicate hedges)
                                     let fill_id = cloid.as_ref().map(|id| format!("partial_{}", id)).unwrap_or_default();
                                     {
-                                        let mut processed = processed_fills_clone.lock().await;
+                                        let mut processed = processed_fills_clone.lock();
                                         if processed.contains(&fill_id) {
                                             debug!("[FILL_DETECTION] Partial fill already processed (duplicate), skipping");
                                             return;
@@ -12247,7 +12331,7 @@ impl FillDetectionService {
                                         }
                                     };
 
-                                    let filled_size: f64 = filled_amount_str.parse().unwrap_or(0.0);
+                                    let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
 
                                     {
                                         let mut state = bot_state_clone.write().await;
@@ -12299,7 +12383,7 @@ impl FillDetectionService {
                                     });
 
                                     // *** CRITICAL: UPDATE POSITION BASELINE ***
-                                    let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
+                                    let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
                                     baseline_updater_clone.update_baseline(
                                         &symbol_clone,
                                         &side_str,
@@ -12346,7 +12430,8 @@ FILE: src\services\hedge.rs
 PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PACIFICA_HYPERLIQUID\src\services\hedge.rs
 ================================================================================
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
@@ -12354,6 +12439,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
+use fast_float::parse;
 
 use crate::bot::BotState;
 use crate::config::Config;
@@ -12431,7 +12517,29 @@ impl HedgeService {
             }
         }
 
-        while let Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv().await {
+        // Keep-alive interval for WebSocket pings (5s to keep connection warm)
+        let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                // Send periodic pings to keep WebSocket connection warm
+                _ = keepalive_interval.tick() => {
+                    if let Some(write) = ws_write.as_mut() {
+                        if let Err(e) = write.send(Message::Ping(vec![])).await {
+                            tprintln!("{} {} Failed to send keepalive ping: {}",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "⚠".yellow().bold(),
+                                e
+                            );
+                            // Connection likely dead, clear write handle
+                            ws_write = None;
+                        }
+                    }
+                }
+
+                // Main hedge event processing
+                Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv() => {
             let reception_latency = fill_timestamp.elapsed();
             tprintln!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -12477,7 +12585,7 @@ impl HedgeService {
                 OrderSide::Sell => true, // Filled sell on Pacifica → buy on Hyperliquid
             };
 
-            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock().unwrap();
+            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock();
 
             if hl_bid <= 0.0 || hl_ask <= 0.0 {
                 tprintln!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
@@ -12491,7 +12599,7 @@ impl HedgeService {
                         Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
                             hl_bid = bid;
                             hl_ask = ask;
-                            let mut cache = self.hyperliquid_prices.lock().unwrap();
+                            let mut cache = self.hyperliquid_prices.lock();
                             *cache = (bid, ask);
                             tprintln!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -12522,7 +12630,7 @@ impl HedgeService {
 
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let cached = *self.hyperliquid_prices.lock().unwrap();
+                        let cached = *self.hyperliquid_prices.lock();
                         hl_bid = cached.0;
                         hl_ask = cached.1;
                         if hl_bid > 0.0 && hl_ask > 0.0 {
@@ -13006,7 +13114,7 @@ impl HedgeService {
                     let pacifica_position = match self.pacifica_trading.get_positions().await {
                         Ok(positions) => {
                             if let Some(pos) = positions.iter().find(|p| p.symbol == self.config.symbol) {
-                                let amount: f64 = pos.amount.parse().unwrap_or(0.0);
+                                let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
                                 let signed_amount = if pos.side == "bid" { amount } else { -amount };
 
                                 tprintln!("{} Pacifica: {} {} (signed: {:.4})",
@@ -13050,7 +13158,7 @@ impl HedgeService {
                         match self.hyperliquid_trading.get_user_state(&hl_wallet).await {
                             Ok(user_state) => {
                                 if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == self.config.symbol) {
-                                    let szi: f64 = asset_pos.position.szi.parse().unwrap_or(0.0);
+                                    let szi: f64 = parse(&asset_pos.position.szi).unwrap_or(0.0);
                                     tprintln!("{} Hyperliquid: {} (signed: {:.4})",
                                         format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                                         if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
@@ -13177,7 +13285,9 @@ impl HedgeService {
                     self.shutdown_tx.send(()).await.ok();
                 }
             }
-        }
+                } // Close Some((side, size, avg_price, fill_timestamp)) arm
+            } // Close tokio::select!
+        } // Close loop
     }
 
     /// Establish a Hyperliquid trading WebSocket connection for hedging.
@@ -13332,29 +13442,103 @@ FILE: src\services\order_monitor.rs
 PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PACIFICA_HYPERLIQUID\src\services\order_monitor.rs
 ================================================================================
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use parking_lot::Mutex;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::debug;
-use colored::Colorize;
+use tracing::{debug, info, warn};
 
 use crate::bot::{BotState, BotStatus};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
-use crate::strategy::{Opportunity, OpportunityEvaluator, OrderSide};
+use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
+// ============================================================================
+// ATOMIC STATUS FOR LOCK-FREE HOT PATH CHECKS
+// ============================================================================
+
+/// Atomic bot status for lock-free checks in hot path
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicBotStatus {
+    Idle = 0,
+    OrderPlaced = 1,
+    Filled = 2,
+    Hedging = 3,
+    Complete = 4,
 }
+
+impl From<&BotStatus> for AtomicBotStatus {
+    fn from(status: &BotStatus) -> Self {
+        match status {
+            BotStatus::Idle => AtomicBotStatus::Idle,
+            BotStatus::OrderPlaced => AtomicBotStatus::OrderPlaced,
+            BotStatus::Filled => AtomicBotStatus::Filled,
+            BotStatus::Hedging => AtomicBotStatus::Hedging,
+            BotStatus::Complete => AtomicBotStatus::Complete,
+            BotStatus::Error(_) => AtomicBotStatus::Idle, // Treat errors as idle for monitoring purposes
+        }
+    }
+}
+
+// ============================================================================
+// LIGHTWEIGHT ORDER SNAPSHOT (AVOID CLONING FULL ORDER)
+// ============================================================================
+
+/// Minimal order data needed for monitoring (avoids full clone)
+#[derive(Debug, Clone, Copy)]
+pub struct OrderSnapshot {
+    pub side: OrderSide,
+    pub price: f64,
+    pub size: f64,
+    pub initial_profit_bps: f64,
+    pub placed_at: Instant,
+}
+
+/// Shared order snapshot updated atomically by order placer
+/// Uses Option wrapped in Mutex for atomic swap semantics
+pub struct SharedOrderSnapshot {
+    inner: Mutex<Option<OrderSnapshot>>,
+}
+
+impl SharedOrderSnapshot {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<OrderSnapshot> {
+        *self.inner.lock()
+    }
+
+    #[inline]
+    pub fn set(&self, snapshot: Option<OrderSnapshot>) {
+        *self.inner.lock() = snapshot;
+    }
+}
+
+// ============================================================================
+// CANCELLATION REQUEST CHANNEL (DECOUPLE FROM HOT PATH)
+// ============================================================================
+
+/// Cancellation request sent from monitor to cancellation handler
+#[derive(Debug)]
+pub enum CancelRequest {
+    /// Cancel due to age expiry
+    AgeExpiry { symbol: String, reason: String },
+    /// Cancel due to profit deviation
+    ProfitDeviation { symbol: String, current_profit_bps: f64, deviation_bps: f64 },
+}
+
+// ============================================================================
+// ORDER MONITOR SERVICE (OPTIMIZED)
+// ============================================================================
 
 /// Order monitoring service
 ///
@@ -13363,423 +13547,396 @@ macro_rules! tprintln {
 /// 2. Profit deviation - cancels if profit drops > profit_cancel_threshold_bps
 /// 3. Periodic profit logging every 2 seconds
 ///
-/// Checks every 25ms (40 Hz) for fast response to market changes.
+/// Key optimizations:
+/// - Lock-free status check via atomic
+/// - No REST calls in hot loop (delegated to separate task)
+/// - No cloning (uses lightweight snapshot)
+/// - No allocations in hot path
 pub struct OrderMonitorService {
+    // Shared state (write lock only needed for mutations)
     pub bot_state: Arc<RwLock<BotState>>,
+    
+    // Lock-free status for hot path (updated by state manager)
+    pub atomic_status: Arc<AtomicU8>,
+    
+    // Lightweight order snapshot (updated when order placed)
+    pub order_snapshot: Arc<SharedOrderSnapshot>,
+    
+    // Price feeds (lock-free reads via parking_lot)
     pub pacifica_prices: Arc<Mutex<(f64, f64)>>,
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+    
+    // Configuration
     pub config: Config,
     pub evaluator: OpportunityEvaluator,
+    
+    // Trading connectors (only used by cancellation task)
     pub pacifica_trading: Arc<PacificaTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
+    
+    // Channel for cancel requests (decouples hot path from I/O)
+    pub cancel_tx: mpsc::Sender<CancelRequest>,
 }
 
 impl OrderMonitorService {
-    pub async fn run(self) {
-        let mut monitor_interval = interval(Duration::from_millis(1)); // Check every 1ms (1000 Hz)
-        let mut log_interval = interval(Duration::from_secs(2)); // Log profit every 2 seconds
+    /// Create a new order monitor service with cancellation channel
+    pub fn new(
+        bot_state: Arc<RwLock<BotState>>,
+        atomic_status: Arc<AtomicU8>,
+        order_snapshot: Arc<SharedOrderSnapshot>,
+        pacifica_prices: Arc<Mutex<(f64, f64)>>,
+        hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+        config: Config,
+        evaluator: OpportunityEvaluator,
+        pacifica_trading: Arc<PacificaTrading>,
+        hyperliquid_trading: Arc<HyperliquidTrading>,
+    ) -> (Self, mpsc::Receiver<CancelRequest>) {
+        // Bounded channel to prevent unbounded growth, but large enough to not block
+        let (cancel_tx, cancel_rx) = mpsc::channel(64);
+        
+        let service = Self {
+            bot_state,
+            atomic_status,
+            order_snapshot,
+            pacifica_prices,
+            hyperliquid_prices,
+            config,
+            evaluator,
+            pacifica_trading,
+            hyperliquid_trading,
+            cancel_tx,
+        };
+        
+        (service, cancel_rx)
+    }
 
-        // Rate limit tracking for cancellations
-        let mut cancel_rate_limit = RateLimitTracker::new();
+    /// Main monitoring loop - LATENCY CRITICAL
+    /// 
+    /// This loop runs at 1kHz and must complete each iteration in <1ms.
+    /// All I/O operations are delegated to separate tasks via channels.
+    pub async fn run_monitor_loop(&self) {
+        let mut monitor_interval = interval(Duration::from_millis(1));
+        
+        // Timing thresholds
+        let age_threshold = Duration::from_secs(self.config.order_refresh_interval_secs);
+        let profit_threshold = self.config.profit_cancel_threshold_bps;
 
         loop {
-            tokio::select! {
-                _ = monitor_interval.tick() => {
-                    let state = self.bot_state.read().await;
+            monitor_interval.tick().await;
 
-                    // Only monitor orders that are actively placed (not filled/hedging/complete)
-                    if !matches!(state.status, BotStatus::OrderPlaced) {
-                        continue;
-                    }
-
-                    let active_order = match &state.active_order {
-                        Some(order) => order.clone(),
-                        None => continue,
-                    };
-                    drop(state);
-
-            // Check 1: Order age (refresh if > order_refresh_interval_secs)
-            if active_order.placed_at.elapsed() > Duration::from_secs(self.config.order_refresh_interval_secs) {
-                // Check if we're in rate limit backoff period
-                if cancel_rate_limit.should_skip() {
-                    let remaining = cancel_rate_limit.remaining_backoff_secs();
-                    debug!("[MONITOR] Skipping age cancellation (rate limit backoff, {:.1}s remaining)", remaining);
-                    continue;
-                }
-
-                let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
-                let age_ms = active_order.placed_at.elapsed().as_millis();
-
-                // *** CRITICAL FIX: Check if order has fills BEFORE cancelling ***
-                // If order is filled but WebSocket missed it, don't cancel - let REST fill detection handle it
-                let filled_check_result = self.pacifica_trading.get_open_orders().await;
-
-                match filled_check_result {
-                    Ok(orders) => {
-                        if let Some(order) = orders.iter().find(|o| o.client_order_id == active_order.client_order_id) {
-                            let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
-
-                            if filled_amount > 0.0 {
-                                // Order has fills - DON'T cancel, let fill detection handle it
-                                tprintln!(
-                                    "{} Order age {}s but has FILLS ({}) - skipping cancellation, waiting for fill detection",
-                                    "[MONITOR]".yellow().bold(),
-                                    format!("{:.3}", age_ms as f64 / 1000.0).bright_white(),
-                                    filled_amount
-                                );
-                                continue;
-                            }
-                        } else {
-                            // Order not in open orders anymore (filled or already cancelled)
-                            debug!("[MONITOR] Order not in open orders, might be filled/cancelled already");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[MONITOR] Failed to check order fills before age cancellation: {}", e);
-                        // Continue with cancellation attempt (safer than leaving hanging orders)
-                    }
-                }
-
-                tprintln!(
-                    "{} Order age {}s (max {}s) | PAC: {} | HL: {}/{} → {}",
-                    "[MONITOR]".yellow().bold(),
-                    format!("{:.3}", age_ms as f64 / 1000.0).bright_white(),
-                    self.config.order_refresh_interval_secs,
-                    format!("${:.4}", active_order.price).cyan(),
-                    format!("${:.4}", hl_bid).cyan(),
-                    format!("${:.4}", hl_ask).cyan(),
-                    "Refreshing".yellow()
-                );
-
-                // Cancel all orders for this symbol (only if no fills detected above)
-                let cancel_result = self.pacifica_trading
-                    .cancel_all_orders(false, Some(&active_order.symbol), false)
-                    .await;
-
-                match cancel_result {
-                    Ok(_) => {
-                        // Success - reset rate limit tracking
-                        cancel_rate_limit.record_success();
-                    }
-                    Err(e) => {
-                        // Check if it's a rate limit error
-                        if is_rate_limit_error(&e) {
-                            cancel_rate_limit.record_error();
-                            let backoff_secs = cancel_rate_limit.get_backoff_secs();
-                            tprintln!(
-                                "{} {} Failed to cancel: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                "[MONITOR]".yellow().bold(),
-                                "⚠".yellow().bold(),
-                                backoff_secs,
-                                cancel_rate_limit.consecutive_errors()
-                            );
-                        } else {
-                            // Other error - log but don't backoff
-                            tprintln!("{} {} Failed to cancel order: {}", "[MONITOR]".yellow().bold(), "✗".red().bold(), e);
-                        }
-
-                        // Check if order is still active (might have been filled/cancelled)
-                        let state = self.bot_state.read().await;
-                        if state.active_order.is_none() {
-                            // Order already cleared by fill detection or another task
-                            continue;
-                        }
-                        drop(state);
-                        continue;
-                    }
-                }
-
-                // Clear active order ONLY if not filled/hedging
-                let mut state = self.bot_state.write().await;
-                match &state.status {
-                    BotStatus::OrderPlaced => {
-                        // Normal cancellation - safe to clear
-                        state.clear_active_order();
-                    }
-                    BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
-                        // Order was filled during cancellation - DO NOT reset to Idle
-                        debug!("[MONITOR] Order age check: state is {:?}, not clearing", state.status);
-                    }
-                    _ => {}
-                }
-                drop(state);
-
-                // Force fresh price fetch from REST API after cancellation (both exchanges)
-                // Pacifica REST API
-                {
-                    match self.pacifica_trading.get_best_bid_ask_rest(&self.config.symbol, self.config.agg_level).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.pacifica_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Pacifica via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Pacifica bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Pacifica prices: {}", e);
-                        }
-                    }
-                }
-
-                // Hyperliquid REST API
-                {
-                    match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.hyperliquid_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Hyperliquid via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Hyperliquid bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Hyperliquid prices: {}", e);
-                        }
-                    }
-                }
-
+            // FAST PATH: Lock-free status check
+            let status = self.atomic_status.load(Ordering::Acquire);
+            if status != AtomicBotStatus::OrderPlaced as u8 {
                 continue;
             }
 
-            // Check 2: Profit monitoring (cancel if drops > profit_cancel_threshold_bps)
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
+            // Get order snapshot (single lock, no clone of complex types)
+            let snapshot = match self.order_snapshot.get() {
+                Some(s) => s,
+                None => continue,
+            };
 
+            // Get prices (parking_lot mutex is very fast for uncontended case)
+            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
             if hl_bid == 0.0 || hl_ask == 0.0 {
                 continue;
             }
 
-            // Create a temporary opportunity to recalculate profit
-            let temp_opp = Opportunity {
-                direction: active_order.side,
-                pacifica_price: active_order.price,
-                hyperliquid_price: 0.0, // Not used in recalculation
-                size: active_order.size,
-                initial_profit_bps: active_order.initial_profit_bps,
-                timestamp: 0,
-            };
+            let age = snapshot.placed_at.elapsed();
 
-            let current_profit = self.evaluator.recalculate_profit(&temp_opp, hl_bid, hl_ask);
-            let profit_change = active_order.initial_profit_bps - current_profit;
+            // Check 1: Age threshold
+            if age > age_threshold {
+                // Send cancel request (non-blocking)
+                let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
+                    symbol: self.config.symbol.clone(),
+                    reason: format!("age {}ms > {}s threshold", age.as_millis(), self.config.order_refresh_interval_secs),
+                });
+                continue;
+            }
+
+            // Check 2: Profit deviation (using raw method - no allocation)
+            let current_profit = self.evaluator.recalculate_profit_raw(
+                snapshot.side,
+                snapshot.price,
+                hl_bid,
+                hl_ask,
+            );
+            
+            // Consistent calculation: positive = profit dropped (bad)
+            let profit_change = snapshot.initial_profit_bps - current_profit;
             let profit_deviation = profit_change.abs();
 
-            if profit_deviation > self.config.profit_cancel_threshold_bps {
-                // Check if we're in rate limit backoff period
-                if cancel_rate_limit.should_skip() {
-                    let remaining = cancel_rate_limit.remaining_backoff_secs();
-                    debug!("[MONITOR] Skipping profit cancellation (rate limit backoff, {:.1}s remaining)", remaining);
+            if profit_deviation > profit_threshold {
+                // Send cancel request (non-blocking)
+                let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
+                    symbol: self.config.symbol.clone(),
+                    current_profit_bps: current_profit,
+                    deviation_bps: profit_deviation,
+                });
+            }
+        }
+    }
+
+    /// Cancellation handler task - runs separately from hot path
+    /// 
+    /// Handles all I/O operations: REST API calls, state updates, logging
+    pub async fn run_cancellation_handler(
+        &self,
+        mut cancel_rx: mpsc::Receiver<CancelRequest>,
+    ) {
+        let mut rate_limit = RateLimitTracker::new();
+
+        while let Some(request) = cancel_rx.recv().await {
+            // Check rate limit backoff
+            if rate_limit.should_skip() {
+                debug!(
+                    "[CANCEL] Skipping cancellation (rate limit backoff, {:.1}s remaining)",
+                    rate_limit.remaining_backoff_secs()
+                );
+                continue;
+            }
+
+            // Double-check state hasn't changed (order might have filled)
+            let status = self.atomic_status.load(Ordering::Acquire);
+            if status != AtomicBotStatus::OrderPlaced as u8 {
+                debug!("[CANCEL] Skipping - status changed to {}", status);
+                continue;
+            }
+
+            // Get current snapshot for logging
+            let _snapshot = self.order_snapshot.get();
+
+            // Check for partial fills before cancelling
+            match self.check_for_fills().await {
+                FillCheckResult::HasFills(amount) => {
+                    info!(
+                        "[CANCEL] Order has fills ({}) - skipping cancellation, waiting for fill detection",
+                        amount
+                    );
                     continue;
                 }
-
-                let hedge_price = match active_order.side {
-                    OrderSide::Buy => hl_bid,
-                    OrderSide::Sell => hl_ask,
-                };
-
-                let age_ms = active_order.placed_at.elapsed().as_millis();
-                let change_direction = if profit_change > 0.0 { "dropped" } else { "increased" };
-                // *** CRITICAL FIX: Check if order has fills BEFORE cancelling ***
-                // If order is filled but WebSocket missed it, don't cancel - let REST fill detection handle it
-                let filled_check_result = self.pacifica_trading.get_open_orders().await;
-
-                match filled_check_result {
-                    Ok(orders) => {
-                        if let Some(order) = orders.iter().find(|o| o.client_order_id == active_order.client_order_id) {
-                            let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
-
-                            if filled_amount > 0.0 {
-                                // Order has fills - DON'T cancel, let fill detection handle it
-                                tprintln!(
-                                    "{} Profit deviation {:.2} bps but order has FILLS ({}) - skipping cancellation",
-                                    "[MONITOR]".yellow().bold(),
-                                    profit_deviation,
-                                    filled_amount
-                                );
-                                continue;
-                            }
-                        } else {
-                            // Order not in open orders anymore (filled or already cancelled)
-                            debug!("[MONITOR] Order not in open orders during profit check, might be filled/cancelled");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[MONITOR] Failed to check order fills before profit cancellation: {}", e);
-                        // Continue with cancellation attempt (safer than leaving hanging orders)
-                    }
+                FillCheckResult::NotFound => {
+                    debug!("[CANCEL] Order not in open orders - might be filled/cancelled");
+                    continue;
                 }
-
-                tprintln!(
-                    "{} Profit: {} bps ({} {}) | PAC: {} | HL: {} | Age: {}s → {}",
-                    "[MONITOR]".yellow().bold(),
-                    if profit_change > 0.0 { format!("{:.2}", current_profit).red() } else { format!("{:.2}", current_profit).green() },
-                    change_direction,
-                    format!("{:.2}", profit_deviation).bright_white(),
-                    format!("${:.4}", active_order.price).cyan(),
-                    format!("${:.4}", hedge_price).cyan(),
-                    format!("{:.3}", age_ms as f64 / 1000.0).bright_white(),
-                    "Cancelling".yellow()
-                );
-
-                // Cancel all orders for this symbol (only if no fills detected above)
-                let cancel_result = self.pacifica_trading
-                    .cancel_all_orders(false, Some(&active_order.symbol), false)
-                    .await;
-
-                match cancel_result {
-                    Ok(_) => {
-                        // Success - reset rate limit tracking
-                        cancel_rate_limit.record_success();
-                    }
-                    Err(e) => {
-                        // Check if it's a rate limit error
-                        if is_rate_limit_error(&e) {
-                            cancel_rate_limit.record_error();
-                            let backoff_secs = cancel_rate_limit.get_backoff_secs();
-                            tprintln!(
-                                "{} {} Failed to cancel: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                "[MONITOR]".yellow().bold(),
-                                "⚠".yellow().bold(),
-                                backoff_secs,
-                                cancel_rate_limit.consecutive_errors()
-                            );
-                        } else {
-                            // Other error - log but don't backoff
-                            tprintln!("{} {} Failed to cancel order: {}", "[MONITOR]".yellow().bold(), "✗".red().bold(), e);
-                        }
-
-                        // Check if order is still active (might have been filled/cancelled)
-                        let state = self.bot_state.read().await;
-                        if state.active_order.is_none() {
-                            // Order already cleared by fill detection or another task
-                            continue;
-                        }
-                        drop(state);
-                        continue;
-                    }
+                FillCheckResult::NoFills => {
+                    // Safe to proceed with cancellation
                 }
-
-                // Clear active order ONLY if not filled/hedging
-                let mut state = self.bot_state.write().await;
-                match &state.status {
-                    BotStatus::OrderPlaced => {
-                        // Normal cancellation - safe to clear
-                        state.clear_active_order();
-                    }
-                    BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
-                        // Order was filled during cancellation - DO NOT reset to Idle
-                        debug!("[MONITOR] Profit check: state is {:?}, not clearing", state.status);
-                    }
-                    _ => {}
-                }
-                drop(state);
-
-                // Force fresh price fetch from REST API after cancellation (both exchanges)
-                // Pacifica REST API
-                {
-                    match self.pacifica_trading.get_best_bid_ask_rest(&self.config.symbol, self.config.agg_level).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.pacifica_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Pacifica via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Pacifica bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Pacifica prices: {}", e);
-                        }
-                    }
-                }
-
-                // Hyperliquid REST API
-                {
-                    match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.hyperliquid_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Hyperliquid via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Hyperliquid bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Hyperliquid prices: {}", e);
-                        }
-                    }
+                FillCheckResult::CheckFailed(e) => {
+                    debug!("[CANCEL] Fill check failed: {} - proceeding with cancellation", e);
+                    // Continue with cancellation (safer than leaving hanging orders)
                 }
             }
+
+            // Log the cancellation reason
+            match &request {
+                CancelRequest::AgeExpiry { reason, .. } => {
+                    info!("[CANCEL] Age expiry: {}", reason);
                 }
+                CancelRequest::ProfitDeviation { current_profit_bps, deviation_bps, .. } => {
+                    info!(
+                        "[CANCEL] Profit deviation: current={:.2} bps, deviation={:.2} bps",
+                        current_profit_bps, deviation_bps
+                    );
+                }
+            }
 
-                _ = log_interval.tick() => {
-                    // Periodic profit logging every 2 seconds
-                    let state = self.bot_state.read().await;
+            // Execute cancellation
+            let symbol = match &request {
+                CancelRequest::AgeExpiry { symbol, .. } => symbol,
+                CancelRequest::ProfitDeviation { symbol, .. } => symbol,
+            };
 
-                    // Only log profit for actively placed orders
-                    if !matches!(state.status, BotStatus::OrderPlaced) {
-                        continue;
+            match self.pacifica_trading.cancel_all_orders(false, Some(symbol), false).await {
+                Ok(_) => {
+                    rate_limit.record_success();
+                    
+                    // Clear state only if still in OrderPlaced
+                    let mut state = self.bot_state.write().await;
+                    if matches!(state.status, BotStatus::OrderPlaced) {
+                        state.clear_active_order();
+                        self.atomic_status.store(AtomicBotStatus::Idle as u8, Ordering::Release);
+                        self.order_snapshot.set(None);
                     }
-
-                    let active_order = match &state.active_order {
-                        Some(order) => order.clone(),
-                        None => continue,
-                    };
                     drop(state);
 
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
-                    if hl_bid == 0.0 || hl_ask == 0.0 {
-                        continue;
+                    // Refresh prices in parallel (not blocking the handler)
+                    self.refresh_prices_parallel().await;
+                }
+                Err(e) => {
+                    if is_rate_limit_error(&e) {
+                        rate_limit.record_error();
+                        warn!(
+                            "[CANCEL] Rate limit exceeded. Backing off for {}s (attempt #{})",
+                            rate_limit.get_backoff_secs(),
+                            rate_limit.consecutive_errors()
+                        );
+                    } else {
+                        warn!("[CANCEL] Failed to cancel: {}", e);
                     }
-
-                    let temp_opp = Opportunity {
-                        direction: active_order.side,
-                        pacifica_price: active_order.price,
-                        hyperliquid_price: 0.0,
-                        size: active_order.size,
-                        initial_profit_bps: active_order.initial_profit_bps,
-                        timestamp: 0,
-                    };
-
-                    let current_profit = self.evaluator.recalculate_profit(&temp_opp, hl_bid, hl_ask);
-                    let profit_change = current_profit - active_order.initial_profit_bps;
-                    let age_ms = active_order.placed_at.elapsed().as_millis();
-
-                    let hedge_price = match active_order.side {
-                        OrderSide::Buy => hl_bid,
-                        OrderSide::Sell => hl_ask,
-                    };
-
-                    tprintln!(
-                        "{} Current: {} bps (initial: {}, change: {}) | PAC: {} | HL: {} | Age: {}s",
-                        "[PROFIT]".bright_blue().bold(),
-                        format!("{:.2}", current_profit).bright_white().bold(),
-                        format!("{:.2}", active_order.initial_profit_bps).bright_white(),
-                        if profit_change >= 0.0 { format!("{:+.2}", profit_change).green() } else { format!("{:+.2}", profit_change).red() },
-                        format!("${:.4}", active_order.price).cyan(),
-                        format!("${:.4}", hedge_price).cyan(),
-                        format!("{:.3}", age_ms as f64 / 1000.0).bright_white()
-                    );
                 }
             }
         }
     }
+
+    /// Periodic profit logging task - runs at 0.5 Hz (every 2 seconds)
+    pub async fn run_profit_logger(&self) {
+        let mut log_interval = interval(Duration::from_secs(2));
+
+        loop {
+            log_interval.tick().await;
+
+            // Only log for active orders
+            let status = self.atomic_status.load(Ordering::Acquire);
+            if status != AtomicBotStatus::OrderPlaced as u8 {
+                continue;
+            }
+
+            let snapshot = match self.order_snapshot.get() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+            if hl_bid == 0.0 || hl_ask == 0.0 {
+                continue;
+            }
+
+            let current_profit = self.evaluator.recalculate_profit_raw(
+                snapshot.side,
+                snapshot.price,
+                hl_bid,
+                hl_ask,
+            );
+            let profit_change = current_profit - snapshot.initial_profit_bps;
+            let age_ms = snapshot.placed_at.elapsed().as_millis();
+
+            let hedge_price = match snapshot.side {
+                OrderSide::Buy => hl_bid,
+                OrderSide::Sell => hl_ask,
+            };
+
+            info!(
+                "[PROFIT] Current: {:.2} bps (initial: {:.2}, change: {:+.2}) | PAC: ${:.4} | HL: ${:.4} | Age: {:.3}s",
+                current_profit,
+                snapshot.initial_profit_bps,
+                profit_change,
+                snapshot.price,
+                hedge_price,
+                age_ms as f64 / 1000.0
+            );
+        }
+    }
+
+    /// Check if order has fills (called from cancellation handler, not hot path)
+    async fn check_for_fills(&self) -> FillCheckResult {
+        // Get client_order_id from full state (only in cancellation handler)
+        let state = self.bot_state.read().await;
+        let client_order_id = match &state.active_order {
+            Some(order) => order.client_order_id.clone(),
+            None => return FillCheckResult::NotFound,
+        };
+        drop(state);
+
+        match self.pacifica_trading.get_open_orders().await {
+            Ok(orders) => {
+                if let Some(order) = orders.iter().find(|o| o.client_order_id == client_order_id) {
+                    let filled_amount: f64 = fast_float::parse(&order.filled_amount).unwrap_or(0.0);
+                    if filled_amount > 0.0 {
+                        FillCheckResult::HasFills(filled_amount)
+                    } else {
+                        FillCheckResult::NoFills
+                    }
+                } else {
+                    FillCheckResult::NotFound
+                }
+            }
+            Err(e) => FillCheckResult::CheckFailed(e.to_string()),
+        }
+    }
+
+    /// Refresh prices from both exchanges in parallel
+    async fn refresh_prices_parallel(&self) {
+        let pac_future = self.pacifica_trading.get_best_bid_ask_rest(
+            &self.config.symbol,
+            self.config.agg_level,
+        );
+        let hl_future = self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol);
+
+        let (pac_result, hl_result) = tokio::join!(pac_future, hl_future);
+
+        if let Ok(Some((bid, ask))) = pac_result {
+            *self.pacifica_prices.lock() = (bid, ask);
+            debug!("[REFRESH] Pacifica: bid=${:.6}, ask=${:.6}", bid, ask);
+        }
+
+        if let Ok(Some((bid, ask))) = hl_result {
+            *self.hyperliquid_prices.lock() = (bid, ask);
+            debug!("[REFRESH] Hyperliquid: bid=${:.6}, ask=${:.6}", bid, ask);
+        }
+    }
+}
+
+/// Result of checking for partial fills
+enum FillCheckResult {
+    HasFills(f64),
+    NoFills,
+    NotFound,
+    CheckFailed(String),
+}
+
+// ============================================================================
+// HELPER: Update atomic status when BotState changes
+// ============================================================================
+
+/// Call this whenever BotState.status changes to keep atomic in sync
+#[inline]
+pub fn sync_atomic_status(atomic: &AtomicU8, status: &BotStatus) {
+    let atomic_val = AtomicBotStatus::from(status) as u8;
+    atomic.store(atomic_val, Ordering::Release);
+}
+
+/// Call this when placing a new order to update snapshot
+#[inline]
+pub fn update_order_snapshot(
+    snapshot: &SharedOrderSnapshot,
+    side: OrderSide,
+    price: f64,
+    size: f64,
+    initial_profit_bps: f64,
+) {
+    snapshot.set(Some(OrderSnapshot {
+        side,
+        price,
+        size,
+        initial_profit_bps,
+        placed_at: Instant::now(),
+    }));
+}
+
+// ============================================================================
+// STARTUP HELPER
+// ============================================================================
+
+/// Spawn all monitor tasks
+pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>, cancel_rx: mpsc::Receiver<CancelRequest>) {
+    // Hot path monitor (1kHz)
+    let service_clone = Arc::clone(&service);
+    tokio::spawn(async move {
+        service_clone.run_monitor_loop().await;
+    });
+
+    // Cancellation handler (processes cancel requests)
+    let service_clone = Arc::clone(&service);
+    tokio::spawn(async move {
+        service_clone.run_cancellation_handler(cancel_rx).await;
+    });
+
+    // Profit logger (0.5 Hz)
+    let service_clone = Arc::clone(&service);
+    tokio::spawn(async move {
+        service_clone.run_profit_logger().await;
+    });
 }
 
 
@@ -13788,9 +13945,11 @@ FILE: src\services\orderbook.rs
 PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PACIFICA_HYPERLIQUID\src\services\orderbook.rs
 ================================================================================
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use anyhow::{Context, Result};
 use colored::Colorize;
+use fast_float::parse;
 
 use crate::connector::pacifica::{OrderbookClient as PacificaOrderbookClient, OrderbookConfig as PacificaOrderbookConfig};
 use crate::connector::hyperliquid::{OrderbookClient as HyperliquidOrderbookClient, OrderbookConfig as HyperliquidOrderbookConfig};
@@ -13833,9 +13992,9 @@ impl PacificaOrderbookService {
         tprintln!("{} Starting orderbook client", "[PACIFICA_OB]".magenta().bold());
         pacifica_ob_client
             .start(move |bid, ask, _symbol, _ts| {
-                let bid_price: f64 = bid.parse().unwrap_or(0.0);
-                let ask_price: f64 = ask.parse().unwrap_or(0.0);
-                *pac_prices_clone.lock().unwrap() = (bid_price, ask_price);
+                let bid_price: f64 = parse(&bid).unwrap_or(0.0);
+                let ask_price: f64 = parse(&ask).unwrap_or(0.0);
+                *pac_prices_clone.lock() = (bid_price, ask_price);
             })
             .await
             .ok();
@@ -13870,9 +14029,9 @@ impl HyperliquidOrderbookService {
         tprintln!("{} Starting orderbook client", "[HYPERLIQUID_OB]".magenta().bold());
         hyperliquid_ob_client
             .start(move |bid, ask, _coin, _ts| {
-                let bid_price: f64 = bid.parse().unwrap_or(0.0);
-                let ask_price: f64 = ask.parse().unwrap_or(0.0);
-                *hl_prices_clone.lock().unwrap() = (bid_price, ask_price);
+                let bid_price: f64 = parse(&bid).unwrap_or(0.0);
+                let ask_price: f64 = parse(&ask).unwrap_or(0.0);
+                *hl_prices_clone.lock() = (bid_price, ask_price);
             })
             .await
             .ok();
@@ -13890,10 +14049,11 @@ PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PA
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio::time::interval;
+use tokio::sync::{mpsc, RwLock};
 use tracing::debug;
 use colored::Colorize;
+use fast_float::parse;
+use parking_lot::Mutex;
 
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
@@ -13928,11 +14088,15 @@ pub struct PositionMonitorService {
 
 impl PositionMonitorService {
     pub async fn run(self) {
-        let mut poll_interval = interval(Duration::from_millis(500)); // 500ms polling
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         loop {
-            poll_interval.tick().await;
+            // Adaptive polling: fast when order active, slow when idle
+            let has_active_order = {
+                let state = self.bot_state.read().await;
+                state.has_active_order_fast()
+            };
+
+            let poll_ms = if has_active_order { 250 } else { 2000 };
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
             // Only check if we have an active order
             let active_order_info = {
@@ -13956,10 +14120,10 @@ impl PositionMonitorService {
                 match self.pacifica_trading.get_positions().await {
                     Ok(positions) => {
                         let position = positions.iter().find(|p| p.symbol == self.symbol);
-                        let mut snapshot = self.last_position_snapshot.lock().await;
+                        let mut snapshot = self.last_position_snapshot.lock();
 
                         if let Some(pos) = position {
-                            let amount: f64 = pos.amount.parse().unwrap_or(0.0);
+                            let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
                             *snapshot = Some(PositionSnapshot {
                                 amount,
                                 side: pos.side.clone(),
@@ -13987,7 +14151,7 @@ impl PositionMonitorService {
             match positions_result {
                 Ok(positions) => {
                     let current_position = positions.iter().find(|p| p.symbol == self.symbol);
-                    let last_snapshot = self.last_position_snapshot.lock().await.clone();
+                    let last_snapshot = self.last_position_snapshot.lock().clone();
 
                     // Calculate position delta
                     let (last_amount, last_side) = if let Some(ref snap) = last_snapshot {
@@ -14037,6 +14201,25 @@ impl PositionMonitorService {
                             format!("{:.4}", delta.abs()).green().bold()
                         );
 
+                        // CRITICAL FIX: Skip if this is first position change from None baseline (startup)
+                        // This prevents hedging the bot's first order fill which establishes initial position
+                        if last_snapshot.is_none() && last_signed.abs() < 0.0001 {
+                            tprintln!(
+                                "{} {} Skipping hedge for first position change from baseline (startup initialization)",
+                                "[POSITION_MONITOR]".bright_cyan().bold(),
+                                "ℹ".blue().bold()
+                            );
+
+                            // Update snapshot to prevent continuous detection
+                            let mut snapshot = self.last_position_snapshot.lock();
+                            *snapshot = Some(PositionSnapshot {
+                                amount: current_amount,
+                                side: current_side,
+                                last_check: std::time::Instant::now(),
+                            });
+                            continue;
+                        }
+
                         // Check bot state - don't trigger duplicate hedges
                         let current_state = {
                             let state = self.bot_state.read().await;
@@ -14058,7 +14241,7 @@ impl PositionMonitorService {
                             );
 
                             // Update snapshot to prevent continuous detection
-                            let mut snapshot = self.last_position_snapshot.lock().await;
+                            let mut snapshot = self.last_position_snapshot.lock();
                             *snapshot = Some(PositionSnapshot {
                                 amount: current_amount,
                                 side: current_side,
@@ -14069,12 +14252,17 @@ impl PositionMonitorService {
 
                         // Check if already processed - use consistent fill_id format with WebSocket detection
                         let fill_id = format!("full_{}", client_order_id);
-                        let mut processed = self.processed_fills.lock().await;
+                        let should_process = {
+                            let mut processed = self.processed_fills.lock();
+                            if !processed.contains(&fill_id) {
+                                processed.insert(fill_id.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        }; // MutexGuard is dropped here
 
-                        if !processed.contains(&fill_id) {
-                            processed.insert(fill_id.clone());
-                            drop(processed);
-
+                        if should_process {
                             tprintln!(
                                 "{} {} FILL DETECTED via position change!",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
@@ -14151,7 +14339,7 @@ impl PositionMonitorService {
                         }
 
                         // Update snapshot
-                        let mut snapshot = self.last_position_snapshot.lock().await;
+                        let mut snapshot = self.last_position_snapshot.lock();
                         *snapshot = Some(PositionSnapshot {
                             amount: current_amount,
                             side: current_side,
@@ -14177,9 +14365,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::interval;
 use tracing::debug;
 use colored::Colorize;
+use fast_float::parse;
 
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
@@ -14208,20 +14396,25 @@ pub struct RestFillDetectionService {
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub min_hedge_notional: f64,
+    pub poll_interval_ms: u64,
 }
 
 impl RestFillDetectionService {
     pub async fn run(self) {
-        let mut poll_interval = interval(Duration::from_millis(500)); // Poll every 500ms (0.5s)
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         let mut consecutive_errors = 0u32;
         let mut last_known_filled_amount: f64 = 0.0;
 
         loop {
-            poll_interval.tick().await;
+            // Adaptive polling: fast when order active, slow when idle
+            let has_active_order = {
+                let state = self.bot_state.read().await;
+                state.has_active_order_fast() || matches!(state.status, crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging)
+            };
+
+            let poll_ms = if has_active_order { self.poll_interval_ms } else { 1000 };
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
             // Get active order info, with recovery logic for recent cancellations
             let active_order_info = {
@@ -14272,15 +14465,15 @@ impl RestFillDetectionService {
                             orders.len()
                         );
                         orders.iter().filter(|o| o.symbol == self.symbol).find(|o| {
-                            let filled: f64 = o.filled_amount.parse().unwrap_or(0.0);
+                            let filled: f64 = parse(&o.filled_amount).unwrap_or(0.0);
                             filled > 0.0
                         })
                     };
 
                     if let Some(order) = our_order {
-                        let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
-                        let initial_amount: f64 = order.initial_amount.parse().unwrap_or(0.0);
-                        let price: f64 = order.price.parse().unwrap_or(0.0);
+                        let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
+                        let initial_amount: f64 = parse(&order.initial_amount).unwrap_or(0.0);
+                        let price: f64 = parse(&order.price).unwrap_or(0.0);
 
                         // Check if there's a NEW fill (filled_amount increased since last check)
                         if filled_amount > last_known_filled_amount && filled_amount > 0.0 {
@@ -14304,7 +14497,7 @@ impl RestFillDetectionService {
                                 let fill_id = format!("{}_{}_rest", fill_type, cloid);
 
                                 // Check if already processed (prevent duplicate hedges from WebSocket)
-                                let mut processed = self.processed_fills.lock().await;
+                                let mut processed = self.processed_fills.lock();
                                 if processed.contains(&fill_id)
                                     || processed.contains(&format!("full_{}", cloid))
                                     || processed.contains(&format!("partial_{}", cloid))
@@ -14462,7 +14655,8 @@ FILE: src\services\rest_poll.rs
 PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PACIFICA_HYPERLIQUID\src\services\rest_poll.rs
 ================================================================================
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::debug;
@@ -14494,7 +14688,7 @@ impl PacificaRestPollService {
             match self.pacifica_trading.get_best_bid_ask_rest(&self.symbol, self.agg_level).await {
                 Ok(Some((bid, ask))) => {
                     // Update shared orderbook prices
-                    *self.prices.lock().unwrap() = (bid, ask);
+                    *self.prices.lock() = (bid, ask);
                     debug!(
                         "[PACIFICA_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
                         bid, ask
@@ -14534,7 +14728,7 @@ impl HyperliquidRestPollService {
             match self.hyperliquid_trading.get_l2_snapshot(&self.symbol).await {
                 Ok(Some((bid, ask))) => {
                     // Update shared orderbook prices
-                    *self.prices.lock().unwrap() = (bid, ask);
+                    *self.prices.lock() = (bid, ask);
                     debug!(
                         "[HYPERLIQUID_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
                         bid, ask
@@ -14567,12 +14761,12 @@ FILE: src\strategy\opportunity.rs
 PATH: C:\Users\david\Desktop\freqtrade\XEMM\XEMM_CROSS_EXCHANGE_MARKET_MAKING_PACIFICA_HYPERLIQUID\src\strategy\opportunity.rs
 ================================================================================
 
-
 /// Order side (Buy or Sell)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum OrderSide {
-    Buy,
-    Sell,
+    Buy = 0,
+    Sell = 1,
 }
 
 /// Trading opportunity with calculated parameters
@@ -14592,6 +14786,23 @@ pub struct Opportunity {
     pub timestamp: u64,
 }
 
+/// Precomputed fee factors to avoid repeated calculations
+#[derive(Debug, Clone, Copy)]
+struct FeeFactors {
+    /// 1.0 + maker_fee
+    one_plus_maker: f64,
+    /// 1.0 - maker_fee
+    one_minus_maker: f64,
+    /// 1.0 + taker_fee
+    one_plus_taker: f64,
+    /// 1.0 - taker_fee
+    one_minus_taker: f64,
+    /// 1.0 + maker_fee + profit_rate (buy denominator)
+    buy_denominator: f64,
+    /// 1.0 - maker_fee - profit_rate (sell denominator)
+    sell_denominator: f64,
+}
+
 /// Opportunity evaluator for XEMM strategy
 #[derive(Debug, Clone)]
 pub struct OpportunityEvaluator {
@@ -14603,6 +14814,10 @@ pub struct OpportunityEvaluator {
     profit_rate: f64,
     /// Pacifica tick size (minimum price increment)
     pacifica_tick_size: f64,
+    /// Inverse tick size for faster division
+    inv_tick_size: f64,
+    /// Precomputed fee factors
+    fee_factors: FeeFactors,
 }
 
 impl OpportunityEvaluator {
@@ -14619,11 +14834,26 @@ impl OpportunityEvaluator {
         profit_rate_bps: f64,
         pacifica_tick_size: f64,
     ) -> Self {
+        let maker_fee = maker_fee_bps * 0.0001; // Multiply instead of divide
+        let taker_fee = taker_fee_bps * 0.0001;
+        let profit_rate = profit_rate_bps * 0.0001;
+
+        let fee_factors = FeeFactors {
+            one_plus_maker: 1.0 + maker_fee,
+            one_minus_maker: 1.0 - maker_fee,
+            one_plus_taker: 1.0 + taker_fee,
+            one_minus_taker: 1.0 - taker_fee,
+            buy_denominator: 1.0 + maker_fee + profit_rate,
+            sell_denominator: 1.0 - maker_fee - profit_rate,
+        };
+
         Self {
-            maker_fee: maker_fee_bps / 10000.0,
-            taker_fee: taker_fee_bps / 10000.0,
-            profit_rate: profit_rate_bps / 10000.0,
+            maker_fee,
+            taker_fee,
+            profit_rate,
             pacifica_tick_size,
+            inv_tick_size: 1.0 / pacifica_tick_size, // Precompute for faster rounding
+            fee_factors,
         }
     }
 
@@ -14634,17 +14864,20 @@ impl OpportunityEvaluator {
     /// # Arguments
     /// * `hl_bid` - Current Hyperliquid best bid
     /// * `notional_usd` - Notional order size in USD
+    /// * `timestamp_ms` - Current timestamp in milliseconds (pass from caller to avoid syscall)
     ///
     /// # Returns
     /// Some(Opportunity) if profitable, None otherwise
+    #[inline]
     pub fn evaluate_buy_opportunity(
         &self,
         hl_bid: f64,
         notional_usd: f64,
+        timestamp_ms: u64,
     ) -> Option<Opportunity> {
-        // Calculate ideal limit price
+        // Calculate ideal limit price using precomputed factors
         // buy_limit_price = (HL_bid * (1 - takerFee)) / (1 + makerFee + profitRate)
-        let buy_limit_price = (hl_bid * (1.0 - self.taker_fee)) / (1.0 + self.maker_fee + self.profit_rate);
+        let buy_limit_price = (hl_bid * self.fee_factors.one_minus_taker) / self.fee_factors.buy_denominator;
 
         // Round DOWN to tick (conservative for buy)
         let buy_limit_rounded = self.round_price_down(buy_limit_price);
@@ -14653,10 +14886,9 @@ impl OpportunityEvaluator {
         let size = notional_usd / buy_limit_rounded;
 
         // Calculate actual profit after rounding (in bps)
-        let buy_cost = buy_limit_rounded * (1.0 + self.maker_fee);
-        let buy_revenue = hl_bid * (1.0 - self.taker_fee);
-        let buy_profit_rate = (buy_revenue - buy_cost) / buy_cost;
-        let buy_profit_bps = buy_profit_rate * 10000.0;
+        let buy_cost = buy_limit_rounded * self.fee_factors.one_plus_maker;
+        let buy_revenue = hl_bid * self.fee_factors.one_minus_taker;
+        let buy_profit_bps = ((buy_revenue - buy_cost) / buy_cost) * 10000.0;
 
         // Only return if profitable
         if buy_profit_bps > 0.0 {
@@ -14666,10 +14898,7 @@ impl OpportunityEvaluator {
                 hyperliquid_price: hl_bid,
                 size,
                 initial_profit_bps: buy_profit_bps,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
+                timestamp: timestamp_ms,
             })
         } else {
             None
@@ -14683,17 +14912,20 @@ impl OpportunityEvaluator {
     /// # Arguments
     /// * `hl_ask` - Current Hyperliquid best ask
     /// * `notional_usd` - Notional order size in USD
+    /// * `timestamp_ms` - Current timestamp in milliseconds (pass from caller to avoid syscall)
     ///
     /// # Returns
     /// Some(Opportunity) if profitable, None otherwise
+    #[inline]
     pub fn evaluate_sell_opportunity(
         &self,
         hl_ask: f64,
         notional_usd: f64,
+        timestamp_ms: u64,
     ) -> Option<Opportunity> {
-        // Calculate ideal limit price
+        // Calculate ideal limit price using precomputed factors
         // sell_limit_price = (HL_ask * (1 + takerFee)) / (1 - makerFee - profitRate)
-        let sell_limit_price = (hl_ask * (1.0 + self.taker_fee)) / (1.0 - self.maker_fee - self.profit_rate);
+        let sell_limit_price = (hl_ask * self.fee_factors.one_plus_taker) / self.fee_factors.sell_denominator;
 
         // Round UP to tick (conservative for sell)
         let sell_limit_rounded = self.round_price_up(sell_limit_price);
@@ -14702,10 +14934,9 @@ impl OpportunityEvaluator {
         let size = notional_usd / sell_limit_rounded;
 
         // Calculate actual profit after rounding (in bps)
-        let sell_revenue = sell_limit_rounded * (1.0 - self.maker_fee);
-        let sell_cost = hl_ask * (1.0 + self.taker_fee);
-        let sell_profit_rate = (sell_revenue - sell_cost) / sell_cost;
-        let sell_profit_bps = sell_profit_rate * 10000.0;
+        let sell_revenue = sell_limit_rounded * self.fee_factors.one_minus_maker;
+        let sell_cost = hl_ask * self.fee_factors.one_plus_taker;
+        let sell_profit_bps = ((sell_revenue - sell_cost) / sell_cost) * 10000.0;
 
         // Only return if profitable
         if sell_profit_bps > 0.0 {
@@ -14715,10 +14946,7 @@ impl OpportunityEvaluator {
                 hyperliquid_price: hl_ask,
                 size,
                 initial_profit_bps: sell_profit_bps,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
+                timestamp: timestamp_ms,
             })
         } else {
             None
@@ -14736,26 +14964,53 @@ impl OpportunityEvaluator {
     ///
     /// # Returns
     /// Current profit in basis points
+    #[inline]
     pub fn recalculate_profit(
         &self,
         opportunity: &Opportunity,
         current_hl_bid: f64,
         current_hl_ask: f64,
     ) -> f64 {
-        match opportunity.direction {
+        self.recalculate_profit_raw(
+            opportunity.direction,
+            opportunity.pacifica_price,
+            current_hl_bid,
+            current_hl_ask,
+        )
+    }
+
+    /// Recalculate profit without requiring an Opportunity struct
+    ///
+    /// Avoids temporary allocations in hot paths
+    ///
+    /// # Arguments
+    /// * `direction` - Order direction (Buy or Sell)
+    /// * `pacifica_price` - The Pacifica limit price
+    /// * `current_hl_bid` - Current Hyperliquid best bid
+    /// * `current_hl_ask` - Current Hyperliquid best ask
+    ///
+    /// # Returns
+    /// Current profit in basis points
+    #[inline(always)]
+    pub fn recalculate_profit_raw(
+        &self,
+        direction: OrderSide,
+        pacifica_price: f64,
+        current_hl_bid: f64,
+        current_hl_ask: f64,
+    ) -> f64 {
+        match direction {
             OrderSide::Buy => {
-                // BUY on Pacifica (at opportunity.pacifica_price) → SELL on Hyperliquid (at current_hl_bid)
-                let buy_cost = opportunity.pacifica_price * (1.0 + self.maker_fee);
-                let buy_revenue = current_hl_bid * (1.0 - self.taker_fee);
-                let buy_profit_rate = (buy_revenue - buy_cost) / buy_cost;
-                buy_profit_rate * 10000.0
+                // BUY on Pacifica (at pacifica_price) → SELL on Hyperliquid (at current_hl_bid)
+                let buy_cost = pacifica_price * self.fee_factors.one_plus_maker;
+                let buy_revenue = current_hl_bid * self.fee_factors.one_minus_taker;
+                ((buy_revenue - buy_cost) / buy_cost) * 10000.0
             }
             OrderSide::Sell => {
-                // SELL on Pacifica (at opportunity.pacifica_price) → BUY on Hyperliquid (at current_hl_ask)
-                let sell_revenue = opportunity.pacifica_price * (1.0 - self.maker_fee);
-                let sell_cost = current_hl_ask * (1.0 + self.taker_fee);
-                let sell_profit_rate = (sell_revenue - sell_cost) / sell_cost;
-                sell_profit_rate * 10000.0
+                // SELL on Pacifica (at pacifica_price) → BUY on Hyperliquid (at current_hl_ask)
+                let sell_revenue = pacifica_price * self.fee_factors.one_minus_maker;
+                let sell_cost = current_hl_ask * self.fee_factors.one_plus_taker;
+                ((sell_revenue - sell_cost) / sell_cost) * 10000.0
             }
         }
     }
@@ -14771,6 +15026,7 @@ impl OpportunityEvaluator {
     ///
     /// # Returns
     /// The best opportunity, or None if both are None
+    #[inline]
     pub fn pick_best_opportunity(
         buy_opp: Option<Opportunity>,
         sell_opp: Option<Opportunity>,
@@ -14803,19 +15059,22 @@ impl OpportunityEvaluator {
     }
 
     /// Round price down to nearest tick size (for BUY orders)
+    #[inline(always)]
     fn round_price_down(&self, price: f64) -> f64 {
-        (price / self.pacifica_tick_size).floor() * self.pacifica_tick_size
+        (price * self.inv_tick_size).floor() * self.pacifica_tick_size
     }
 
     /// Round price up to nearest tick size (for SELL orders)
+    #[inline(always)]
     fn round_price_up(&self, price: f64) -> f64 {
-        (price / self.pacifica_tick_size).ceil() * self.pacifica_tick_size
+        (price * self.inv_tick_size).ceil() * self.pacifica_tick_size
     }
 }
 
 impl OrderSide {
     /// Convert to string representation
-    pub fn as_str(&self) -> &'static str {
+    #[inline(always)]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             OrderSide::Buy => "BUY",
             OrderSide::Sell => "SELL",
@@ -14823,11 +15082,53 @@ impl OrderSide {
     }
 
     /// Get opposite side (for hedging)
-    pub fn opposite(&self) -> OrderSide {
+    #[inline(always)]
+    pub const fn opposite(&self) -> OrderSide {
         match self {
             OrderSide::Buy => OrderSide::Sell,
             OrderSide::Sell => OrderSide::Buy,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fee_factors_precomputation() {
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
+        
+        // Verify precomputed factors
+        assert!((evaluator.fee_factors.one_plus_maker - 1.0001).abs() < 1e-10);
+        assert!((evaluator.fee_factors.one_minus_taker - 0.99975).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_recalculate_profit_raw_matches_struct_version() {
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
+        
+        let opp = Opportunity {
+            direction: OrderSide::Buy,
+            pacifica_price: 100.0,
+            hyperliquid_price: 100.5,
+            size: 1.0,
+            initial_profit_bps: 5.0,
+            timestamp: 0,
+        };
+        
+        let hl_bid = 100.3;
+        let hl_ask = 100.4;
+        
+        let profit_struct = evaluator.recalculate_profit(&opp, hl_bid, hl_ask);
+        let profit_raw = evaluator.recalculate_profit_raw(
+            opp.direction,
+            opp.pacifica_price,
+            hl_bid,
+            hl_ask,
+        );
+        
+        assert!((profit_struct - profit_raw).abs() < 1e-10);
     }
 }
 

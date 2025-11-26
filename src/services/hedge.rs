@@ -8,6 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 use fast_float::parse;
+use tracing::{info, warn, error};
 
 use crate::bot::BotState;
 use crate::config::Config;
@@ -23,15 +24,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 type WsRead = futures_util::stream::SplitStream<WsStream>;
 
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
-}
+
 
 /// Hedge execution service
 ///
@@ -66,7 +59,7 @@ impl HedgeService {
         if use_ws_for_hedge {
             match self.connect_hyperliquid_ws().await {
                 Ok((write, read)) => {
-                    tprintln!(
+                    info!(
                         "{} {} Hyperliquid trading WebSocket connected (hedge execution via WS)",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "✓".green().bold(),
@@ -75,7 +68,7 @@ impl HedgeService {
                     ws_read = Some(read);
                 }
                 Err(e) => {
-                    tprintln!(
+                    warn!(
                         "{} {} Failed to pre-connect Hyperliquid trading WebSocket (using REST until reconnect succeeds): {}",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "⚠".yellow().bold(),
@@ -95,7 +88,7 @@ impl HedgeService {
                 _ = keepalive_interval.tick() => {
                     if let Some(write) = ws_write.as_mut() {
                         if let Err(e) = write.send(Message::Ping(vec![])).await {
-                            tprintln!("{} {} Failed to send keepalive ping: {}",
+                            warn!("{} {} Failed to send keepalive ping: {}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "⚠".yellow().bold(),
                                 e
@@ -109,7 +102,7 @@ impl HedgeService {
                 // Main hedge event processing
                 Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv() => {
             let reception_latency = fill_timestamp.elapsed();
-            tprintln!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
+            info!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                 side.as_str().bright_yellow(),
                 size,
@@ -119,27 +112,33 @@ impl HedgeService {
 
             // *** CRITICAL: CANCEL ALL ORDERS BEFORE HEDGE ***
             // Extra safety: cancel again in case fill detection missed anything
-            // or there was a race condition
-            tprintln!("{} {} Pre-hedge safety: Cancelling all Pacifica orders...",
-                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                "⚡".yellow().bold()
-            );
+            // or there was a race condition.
+            // MOVED TO BACKGROUND TASK to avoid blocking hedge execution latency.
+            let pacifica_trading_bg = self.pacifica_trading.clone();
+            let symbol_bg = self.config.symbol.clone();
 
-            if let Err(e) = self.pacifica_trading
-                .cancel_all_orders(false, Some(&self.config.symbol), false)
-                .await
-            {
-                tprintln!("{} {} Failed to cancel orders before hedge: {}",
-                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                    "⚠".yellow().bold(),
-                    e
+            tokio::spawn(async move {
+                info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
+                    format!("[{} HEDGE]", symbol_bg).bright_magenta().bold(),
+                    "⚡".yellow().bold()
                 );
-            } else {
-                tprintln!("{} {} Pre-hedge cancellation complete",
-                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                    "✓".green().bold()
-                );
-            }
+
+                if let Err(e) = pacifica_trading_bg
+                    .cancel_all_orders(false, Some(&symbol_bg), false)
+                    .await
+                {
+                    warn!("{} {} Failed to cancel orders before hedge: {}",
+                        format!("[{} HEDGE]", symbol_bg).bright_magenta().bold(),
+                        "⚠".yellow().bold(),
+                        e
+                    );
+                } else {
+                    info!("{} {} Pre-hedge cancellation complete",
+                        format!("[{} HEDGE]", symbol_bg).bright_magenta().bold(),
+                        "✓".green().bold()
+                    );
+                }
+            });
 
             // Update status
             {
@@ -156,7 +155,7 @@ impl HedgeService {
             let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock();
 
             if hl_bid <= 0.0 || hl_ask <= 0.0 {
-                tprintln!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
+                warn!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                     "⚠".yellow().bold()
                 );
@@ -169,7 +168,7 @@ impl HedgeService {
                             hl_ask = ask;
                             let mut cache = self.hyperliquid_prices.lock();
                             *cache = (bid, ask);
-                            tprintln!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
+                            info!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✓".green().bold(),
                                 hl_bid,
@@ -178,7 +177,7 @@ impl HedgeService {
                             break;
                         }
                         Ok(_) => {
-                            tprintln!("{} {} Snapshot missing bid/ask data (attempt {}/{})",
+                            warn!("{} {} Snapshot missing bid/ask data (attempt {}/{})",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "⚠".yellow().bold(),
                                 attempt,
@@ -186,7 +185,7 @@ impl HedgeService {
                             );
                         }
                         Err(err) => {
-                            tprintln!("{} {} Failed to fetch Hyperliquid snapshot (attempt {}/{}): {}",
+                            warn!("{} {} Failed to fetch Hyperliquid snapshot (attempt {}/{}): {}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "⚠".yellow().bold(),
                                 attempt,
@@ -202,7 +201,7 @@ impl HedgeService {
                         hl_bid = cached.0;
                         hl_ask = cached.1;
                         if hl_bid > 0.0 && hl_ask > 0.0 {
-                            tprintln!("{} {} Hyperliquid prices populated by feed during wait",
+                            info!("{} {} Hyperliquid prices populated by feed during wait",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✓".green().bold()
                             );
@@ -212,7 +211,7 @@ impl HedgeService {
                 }
 
                 if hl_bid <= 0.0 || hl_ask <= 0.0 {
-                    tprintln!("{} {} Unable to obtain Hyperliquid prices - aborting hedge for safety",
+                    error!("{} {} Unable to obtain Hyperliquid prices - aborting hedge for safety",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "✗".red().bold()
                     );
@@ -225,7 +224,7 @@ impl HedgeService {
                 }
             }
 
-            tprintln!(
+            info!(
                 "{} Executing {} {} on Hyperliquid",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                 if is_buy { "BUY".green().bold() } else { "SELL".red().bold() },
@@ -237,7 +236,7 @@ impl HedgeService {
                 if ws_write.is_none() || ws_read.is_none() {
                     match self.connect_hyperliquid_ws().await {
                         Ok((write, read)) => {
-                            tprintln!(
+                            info!(
                                 "{} {} Reconnected Hyperliquid trading WebSocket for hedge execution",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✓".green().bold()
@@ -246,7 +245,7 @@ impl HedgeService {
                             ws_read = Some(read);
                         }
                         Err(e) => {
-                            tprintln!(
+                            warn!(
                                 "{} {} Failed to connect Hyperliquid trading WebSocket, falling back to REST for this hedge: {}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "⚠".yellow().bold(),
@@ -263,7 +262,7 @@ impl HedgeService {
                     {
                         Ok(response) => Ok(response),
                         Err(e) => {
-                            tprintln!(
+                            warn!(
                                 "{} {} WebSocket hedge execution failed, falling back to REST: {}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "⚠".yellow().bold(),
@@ -323,7 +322,7 @@ impl HedgeService {
                         crate::connector::hyperliquid::OrderResponseContent::Error(error) => {
                             // This should not happen as trading.rs already handles errors,
                             // but handle it defensively
-                            tprintln!("{} {} Hedge response contains error: {}",
+                            error!("{} {} Hedge response contains error: {}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✗".red().bold(),
                                 error
@@ -345,7 +344,7 @@ impl HedgeService {
                     let hedge_fill_price = if let Some(status) = response_data.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
-                                tprintln!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
+                                info!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✓".green().bold(),
                                     filled.totalSz,
@@ -355,7 +354,7 @@ impl HedgeService {
                                 filled.avgPx.parse::<f64>().ok()
                             }
                             crate::connector::hyperliquid::OrderStatus::Error { error } => {
-                                tprintln!("{} {} Hedge order FAILED: {}",
+                                error!("{} {} Hedge order FAILED: {}",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✗".red().bold(),
                                     error
@@ -372,7 +371,7 @@ impl HedgeService {
                                 return;  // Exit hedge service immediately
                             }
                             crate::connector::hyperliquid::OrderStatus::Resting { resting } => {
-                                tprintln!("{} {} Hedge order is RESTING (oid: {}) - unexpected for IOC market order",
+                                warn!("{} {} Hedge order is RESTING (oid: {}) - unexpected for IOC market order",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "⚠".yellow().bold(),
                                     resting.oid
@@ -389,7 +388,7 @@ impl HedgeService {
                             }
                         }
                     } else {
-                        tprintln!("{} {} Hedge response has no statuses - unexpected API response",
+                        warn!("{} {} Hedge response has no statuses - unexpected API response",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                             "⚠".yellow().bold()
                         );
@@ -400,7 +399,7 @@ impl HedgeService {
                     let hedge_fill_price = match hedge_fill_price {
                         Some(price) => price,
                         None => {
-                            tprintln!("{} {} No hedge fill price available - hedge may have failed",
+                            error!("{} {} No hedge fill price available - hedge may have failed",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✗".red().bold()
                             );
@@ -422,7 +421,7 @@ impl HedgeService {
                     };
 
                     // Wait for trades to propagate to exchange APIs (20 seconds)
-                    tprintln!("{} Waiting 20 seconds for trades to propagate to APIs...",
+                    info!("{} Waiting 20 seconds for trades to propagate to APIs...",
                         format!("[{} PROFIT]", self.config.symbol).bright_blue().bold()
                     );
                     tokio::time::sleep(Duration::from_secs(20)).await;
@@ -441,7 +440,7 @@ impl HedgeService {
                             &cloid,
                             3, // max_attempts
                             |msg| {
-                                tprintln!("{} {}",
+                                info!("{} {}",
                                     format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
                                     msg
                                 );
@@ -462,7 +461,7 @@ impl HedgeService {
                             3, // max_attempts
                             30, // time_window_secs
                             |msg| {
-                                tprintln!("{} {}",
+                                info!("{} {}",
                                     format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
                                     msg
                                 );
@@ -503,7 +502,7 @@ impl HedgeService {
                             }
                             _ => {
                                 // Fallback to fill event data if trade history unavailable
-                                tprintln!("{} {} Using fill event data (trade history unavailable)",
+                                warn!("{} {} Using fill event data (trade history unavailable)",
                                     format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
                                     "⚠".yellow().bold()
                                 );
@@ -561,13 +560,13 @@ impl HedgeService {
 
                         let csv_file = format!("{}_trades.csv", self.config.symbol.to_lowercase());
                         if let Err(e) = csv_logger::log_trade(&csv_file, &trade_record) {
-                            tprintln!("{} {} Failed to log trade to CSV: {}",
+                            warn!("{} {} Failed to log trade to CSV: {}",
                                 format!("[{} CSV]", self.config.symbol).bright_yellow().bold(),
                                 "⚠".yellow().bold(),
                                 e
                             );
                         } else {
-                            tprintln!("{} {} Trade logged to {}",
+                            info!("{} {} Trade logged to {}",
                                 format!("[{} CSV]", self.config.symbol).bright_green().bold(),
                                 "✓".green().bold(),
                                 csv_file
@@ -576,13 +575,13 @@ impl HedgeService {
                     }
 
                     // Display comprehensive summary
-                    tprintln!("{}", "═══════════════════════════════════════════════════".green().bold());
-                    tprintln!("{}", "  BOT CYCLE COMPLETE!".green().bold());
-                    tprintln!("{}", "═══════════════════════════════════════════════════".green().bold());
-                    tprintln!("");
-                    tprintln!("{}", "📊 TRADE SUMMARY:".bright_white().bold());
+                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
+                    info!("{}", "  BOT CYCLE COMPLETE!".green().bold());
+                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
+                    info!("");
+                    info!("{}", "📊 TRADE SUMMARY:".bright_white().bold());
                     if let Some(pac_price) = pacifica_actual_price {
-                        tprintln!("  {}: {} {} {} @ {} {}",
+                        info!("  {}: {} {} {} @ {} {}",
                             "Pacifica".bright_magenta(),
                             side.as_str().bright_yellow(),
                             format!("{:.4}", size).bright_white(),
@@ -592,7 +591,7 @@ impl HedgeService {
                         );
                     }
                     if let Some(hl_price) = hl_actual_price {
-                        tprintln!("  {}: {} {} {} @ {} {}",
+                        info!("  {}: {} {} {} @ {} {}",
                             "Hyperliquid".bright_magenta(),
                             if is_buy { "BUY".green() } else { "SELL".red() },
                             format!("{:.4}", size).bright_white(),
@@ -601,50 +600,50 @@ impl HedgeService {
                             "(actual fill)".bright_black()
                         );
                     }
-                    tprintln!("");
-                    tprintln!("{}", "💰 PROFITABILITY:".bright_white().bold());
+                    info!("");
+                    info!("{}", "💰 PROFITABILITY:".bright_white().bold());
                     if let Some(expected) = expected_profit_bps {
-                        tprintln!("  Expected: {} bps", format!("{:.2}", expected).bright_white());
+                        info!("  Expected: {} bps", format!("{:.2}", expected).bright_white());
                     }
                     if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
                         let profit_color = if actual_profit_bps > 0.0 { format!("{:.2}", actual_profit_bps).green().bold() } else { format!("{:.2}", actual_profit_bps).red().bold() };
                         let usd_color = if actual_profit_usd > 0.0 { format!("${:.4}", actual_profit_usd).green().bold() } else { format!("${:.4}", actual_profit_usd).red().bold() };
-                        tprintln!("  Actual:   {} bps ({})", profit_color, usd_color);
+                        info!("  Actual:   {} bps ({})", profit_color, usd_color);
                         if let Some(expected) = expected_profit_bps {
                             let diff = actual_profit_bps - expected;
                             let diff_sign = if diff >= 0.0 { "+" } else { "" };
                             let diff_color = if diff >= 0.0 { format!("{}{:.2}", diff_sign, diff).green() } else { format!("{:.2}", diff).red() };
-                            tprintln!("  Difference: {} bps", diff_color);
+                            info!("  Difference: {} bps", diff_color);
                         }
                     } else {
-                        tprintln!("  {} Unable to calculate actual profit (trade history unavailable)", "⚠".yellow().bold());
+                        warn!("  {} Unable to calculate actual profit (trade history unavailable)", "⚠".yellow().bold());
                     }
-                    tprintln!("");
-                    tprintln!("{}", "📈 FEES:".bright_white().bold());
+                    info!("");
+                    info!("{}", "📈 FEES:".bright_white().bold());
                     if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
                         // Show actual fees paid
-                        tprintln!("  Pacifica: {} {}",
+                        info!("  Pacifica: {} {}",
                             format!("${:.4}", pac_fee_usd).yellow(),
                             if pacifica_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
                         );
-                        tprintln!("  Hyperliquid: {} {}",
+                        info!("  Hyperliquid: {} {}",
                             format!("${:.4}", hl_fee_usd).yellow(),
                             if hl_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
                         );
-                        tprintln!("  Total: {}", format!("${:.4}", pac_fee_usd + hl_fee_usd).yellow().bold());
+                        info!("  Total: {}", format!("${:.4}", pac_fee_usd + hl_fee_usd).yellow().bold());
                     } else {
                         // Fallback to theoretical fees
-                        tprintln!("  Pacifica (maker): {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps).yellow());
-                        tprintln!("  Hyperliquid (taker): {} bps", format!("{:.2}", self.config.hyperliquid_taker_fee_bps).yellow());
-                        tprintln!("  Total fees: {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps + self.config.hyperliquid_taker_fee_bps).yellow().bold());
+                        info!("  Pacifica (maker): {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps).yellow());
+                        info!("  Hyperliquid (taker): {} bps", format!("{:.2}", self.config.hyperliquid_taker_fee_bps).yellow());
+                        info!("  Total fees: {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps + self.config.hyperliquid_taker_fee_bps).yellow().bold());
                     }
-                    tprintln!("{}", "═══════════════════════════════════════════════════".green().bold());
+                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
 
                     // *** CRITICAL: FINAL SAFETY CANCELLATION ***
                     // Cancel all orders one last time before marking complete
                     // This ensures no stray orders remain active
-                    tprintln!("");
-                    tprintln!("{} {} Post-hedge safety: Final cancellation of all Pacifica orders...",
+                    info!("");
+                    info!("{} {} Post-hedge safety: Final cancellation of all Pacifica orders...",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "⚡".yellow().bold()
                     );
@@ -653,13 +652,13 @@ impl HedgeService {
                         .cancel_all_orders(false, Some(&self.config.symbol), false)
                         .await
                     {
-                        tprintln!("{} {} Failed to cancel orders after hedge completion: {}",
+                        warn!("{} {} Failed to cancel orders after hedge completion: {}",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                             "⚠".yellow().bold(),
                             e
                         );
                     } else {
-                        tprintln!("{} {} Final cancellation complete",
+                        info!("{} {} Final cancellation complete",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                             "✓".green().bold()
                         );
@@ -667,14 +666,14 @@ impl HedgeService {
 
                     // *** POST-HEDGE POSITION VERIFICATION ***
                     // Wait for positions to propagate and verify net position is neutral
-                    tprintln!("");
-                    tprintln!("{} {} Post-hedge verification: Waiting 8 seconds for positions to propagate...",
+                    info!("");
+                    info!("{} {} Post-hedge verification: Waiting 8 seconds for positions to propagate...",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "⏱".cyan().bold()
                     );
                     tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
 
-                    tprintln!("{} Verifying final positions on both exchanges...",
+                    info!("{} Verifying final positions on both exchanges...",
                         format!("[{} VERIFY]", self.config.symbol).cyan().bold()
                     );
 
@@ -685,7 +684,7 @@ impl HedgeService {
                                 let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
                                 let signed_amount = if pos.side == "bid" { amount } else { -amount };
 
-                                tprintln!("{} Pacifica: {} {} (signed: {:.4})",
+                                info!("{} Pacifica: {} {} (signed: {:.4})",
                                     format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                                     amount,
                                     pos.side,
@@ -693,14 +692,14 @@ impl HedgeService {
                                 );
                                 Some(signed_amount)
                             } else {
-                                tprintln!("{} Pacifica: No position (flat)",
+                                info!("{} Pacifica: No position (flat)",
                                     format!("[{} VERIFY]", self.config.symbol).cyan().bold()
                                 );
                                 Some(0.0)
                             }
                         }
                         Err(e) => {
-                            tprintln!("{} {} Failed to fetch Pacifica position: {}",
+                            warn!("{} {} Failed to fetch Pacifica position: {}",
                                 format!("[{} VERIFY]", self.config.symbol).yellow().bold(),
                                 "⚠".yellow().bold(),
                                 e
@@ -716,7 +715,7 @@ impl HedgeService {
                     // Try up to 3 times with delays if position not found
                     for retry in 0..3 {
                         if retry > 0 {
-                            tprintln!("{} Retry {} - waiting 3 more seconds for Hyperliquid position...",
+                            info!("{} Retry {} - waiting 3 more seconds for Hyperliquid position...",
                                 format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                                 retry
                             );
@@ -727,7 +726,7 @@ impl HedgeService {
                             Ok(user_state) => {
                                 if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == self.config.symbol) {
                                     let szi: f64 = parse(&asset_pos.position.szi).unwrap_or(0.0);
-                                    tprintln!("{} Hyperliquid: {} (signed: {:.4})",
+                                    info!("{} Hyperliquid: {} (signed: {:.4})",
                                         format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                                         if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
                                         szi
@@ -735,7 +734,7 @@ impl HedgeService {
                                     hyperliquid_position = Some(szi);
                                     break;
                                 } else if retry == 2 {
-                                    tprintln!("{} Hyperliquid: No position found after 3 attempts (flat)",
+                                    info!("{} Hyperliquid: No position found after 3 attempts (flat)",
                                         format!("[{} VERIFY]", self.config.symbol).cyan().bold()
                                     );
                                     hyperliquid_position = Some(0.0);
@@ -743,7 +742,7 @@ impl HedgeService {
                             }
                             Err(e) => {
                                 if retry == 2 {
-                                    tprintln!("{} {} Failed to fetch Hyperliquid position after 3 attempts: {}",
+                                    warn!("{} {} Failed to fetch Hyperliquid position after 3 attempts: {}",
                                         format!("[{} VERIFY]", self.config.symbol).yellow().bold(),
                                         "⚠".yellow().bold(),
                                         e
@@ -758,8 +757,8 @@ impl HedgeService {
                     if let (Some(pac_pos), Some(hl_pos)) = (pacifica_position, hyperliquid_position) {
                         let net_position = pac_pos + hl_pos;
 
-                        tprintln!("");
-                        tprintln!("{} Net Position: {:.4} (Pacifica: {:.4} + Hyperliquid: {:.4})",
+                        info!("");
+                        info!("{} Net Position: {:.4} (Pacifica: {:.4} + Hyperliquid: {:.4})",
                             format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                             net_position,
                             pac_pos,
@@ -768,44 +767,44 @@ impl HedgeService {
 
                         // Check if net position is close to neutral
                         if net_position.abs() < 0.01 {
-                            tprintln!("{} {} Net position is NEUTRAL (properly hedged across both exchanges)",
+                            info!("{} {} Net position is NEUTRAL (properly hedged across both exchanges)",
                                 format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                                 "✓".green().bold()
                             );
                         } else {
-                            tprintln!("");
-                            tprintln!("{}", "⚠".repeat(80).yellow());
-                            tprintln!("{} {} WARNING: Net position NOT neutral!",
+                            info!("");
+                            warn!("{}", "⚠".repeat(80).yellow());
+                            warn!("{} {} WARNING: Net position NOT neutral!",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold(),
                                 "⚠".yellow().bold()
                             );
-                            tprintln!("{} Position delta: {:.4} {}",
+                            warn!("{} Position delta: {:.4} {}",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold(),
                                 net_position.abs(),
                                 self.config.symbol
                             );
-                            tprintln!("{} This indicates a potential hedge failure or partial fill.",
+                            warn!("{} This indicates a potential hedge failure or partial fill.",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold()
                             );
-                            tprintln!("{} Please check positions manually and rebalance if needed!",
+                            warn!("{} Please check positions manually and rebalance if needed!",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold()
                             );
-                            tprintln!("{}", "⚠".repeat(80).yellow());
-                            tprintln!("");
+                            warn!("{}", "⚠".repeat(80).yellow());
+                            info!("");
                         }
                     } else {
-                        tprintln!("");
-                        tprintln!("{} {} WARNING: Could not verify net position!",
+                        info!("");
+                        warn!("{} {} WARNING: Could not verify net position!",
                             format!("[{} VERIFY]", self.config.symbol).yellow().bold(),
                             "⚠".yellow().bold()
                         );
-                        tprintln!("{} Failed to fetch positions from one or both exchanges.",
+                        warn!("{} Failed to fetch positions from one or both exchanges.",
                             format!("[{} VERIFY]", self.config.symbol).yellow().bold()
                         );
-                        tprintln!("{} Please check positions manually!",
+                        warn!("{} Please check positions manually!",
                             format!("[{} VERIFY]", self.config.symbol).yellow().bold()
                         );
-                        tprintln!("");
+                        info!("");
                     }
 
                     // Mark cycle as complete AFTER displaying profit AND final cancellation
@@ -817,7 +816,7 @@ impl HedgeService {
                     self.shutdown_tx.send(()).await.ok();
                 }
                 Err(e) => {
-                    tprintln!("{} {} Hedge failed: {}",
+                    error!("{} {} Hedge failed: {}",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "✗".red().bold(),
                         e.to_string().red()
@@ -825,7 +824,7 @@ impl HedgeService {
 
                     // *** CRITICAL: CANCEL ALL ORDERS ON ERROR ***
                     // Even if hedge fails, cancel all orders to prevent stray positions
-                    tprintln!("{} {} Error recovery: Cancelling all Pacifica orders...",
+                    info!("{} {} Error recovery: Cancelling all Pacifica orders...",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "⚡".yellow().bold()
                     );
@@ -834,13 +833,13 @@ impl HedgeService {
                         .cancel_all_orders(false, Some(&self.config.symbol), false)
                         .await
                     {
-                        tprintln!("{} {} Failed to cancel orders after hedge error: {}",
+                        warn!("{} {} Failed to cancel orders after hedge error: {}",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                             "⚠".yellow().bold(),
                             cancel_err
                         );
                     } else {
-                        tprintln!("{} {} Error recovery cancellation complete",
+                        info!("{} {} Error recovery cancellation complete",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                             "✓".green().bold()
                         );
@@ -910,7 +909,7 @@ impl HedgeService {
         };
 
         let request_json = serde_json::to_string(&ws_request)?;
-        tprintln!(
+        info!(
             "{} Sending Hyperliquid hedge order via WebSocket (id={})",
             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
             request_id

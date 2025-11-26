@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tracing::debug;
+use tracing::{debug, info, warn, error};
 use colored::Colorize;
 use fast_float::parse;
 
@@ -12,16 +12,6 @@ use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
 use crate::util::rate_limit::is_rate_limit_error;
-
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
-}
 
 /// REST API fill detection service (backup/fallback method)
 ///
@@ -163,7 +153,7 @@ impl RestFillDetectionService {
                                     }
                                 };
 
-                                tprintln!(
+                                info!(
                                     "{} {} {} FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {} {}",
                                     "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                     "✓".green().bold(),
@@ -192,14 +182,14 @@ impl RestFillDetectionService {
                                         state.mark_filled(filled_amount, order_side);
                                     }
 
-                                    tprintln!(
+                                    info!(
                                         "{} {} State updated to Filled (REST)",
                                         "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                         "✓".green().bold()
                                     );
 
                                     // Dual cancellation
-                                    tprintln!(
+                                    info!(
                                         "{} {} Dual cancellation (REST + WebSocket)...",
                                         "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                         "⚡".yellow().bold()
@@ -208,7 +198,7 @@ impl RestFillDetectionService {
                                     match dual_cancel(&pac_trading_clone, &pac_ws_trading_clone, &symbol_clone).await
                                     {
                                         Ok((rest_count, ws_count)) => {
-                                            tprintln!(
+                                            info!(
                                                 "{} {} Dual cancellation complete (REST: {}, WS: {})",
                                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                                 "✓✓".green().bold(),
@@ -217,7 +207,7 @@ impl RestFillDetectionService {
                                             );
                                         }
                                         Err(e) => {
-                                            tprintln!(
+                                            error!(
                                                 "{} {} Dual cancellation failed: {}",
                                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                                 "✗".red().bold(),
@@ -226,7 +216,7 @@ impl RestFillDetectionService {
                                         }
                                     }
 
-                                    tprintln!(
+                                    info!(
                                         "{} {}, triggering hedge (REST)",
                                         format!("[{}]", symbol_clone).bright_white().bold(),
                                         "Order filled".green().bold()
@@ -256,7 +246,7 @@ impl RestFillDetectionService {
                     if is_rate_limit {
                         // Exponential backoff for rate limits: 1s, 2s, 4s, 8s, 16s, 32s (max)
                         let backoff_secs = std::cmp::min(2u64.pow(consecutive_errors - 1), 32);
-                        tprintln!(
+                        warn!(
                             "{} {} Rate limit hit, backing off for {} seconds...",
                             "[REST_FILL_DETECTION]".bright_cyan().bold(),
                             "⚠".yellow().bold(),
@@ -272,7 +262,7 @@ impl RestFillDetectionService {
 
                         // If too many consecutive errors, log warning
                         if consecutive_errors >= 5 {
-                            tprintln!(
+                            warn!(
                                 "{} {} {} consecutive errors fetching open orders",
                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                 "⚠".yellow().bold(),

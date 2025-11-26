@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tracing::debug;
+use tracing::{debug, info, warn, error};
 use colored::Colorize;
 use fast_float::parse;
 use parking_lot::Mutex;
@@ -12,16 +12,6 @@ use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
-
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
-}
 
 /// Position-based fill detection service (4th layer - ground truth)
 ///
@@ -142,7 +132,7 @@ impl PositionMonitorService {
                         // Position changed in expected direction - fill detected!
                         let fill_size = delta.abs();
 
-                        tprintln!(
+                        info!(
                             "{} {} Position delta detected: {} {} → {} {} (Δ {:.4})",
                             "[POSITION_MONITOR]".bright_cyan().bold(),
                             "⚡".yellow().bold(),
@@ -156,7 +146,7 @@ impl PositionMonitorService {
                         // CRITICAL FIX: Skip if this is first position change from None baseline (startup)
                         // This prevents hedging the bot's first order fill which establishes initial position
                         if last_snapshot.is_none() && last_signed.abs() < 0.0001 {
-                            tprintln!(
+                            info!(
                                 "{} {} Skipping hedge for first position change from baseline (startup initialization)",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
                                 "ℹ".blue().bold()
@@ -185,7 +175,7 @@ impl PositionMonitorService {
                             crate::bot::BotStatus::Hedging |
                             crate::bot::BotStatus::Complete
                         ) {
-                            tprintln!(
+                            info!(
                                 "{} {} Fill already handled by primary detection (state: {:?}), skipping duplicate hedge",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
                                 "ℹ".blue().bold(),
@@ -215,7 +205,7 @@ impl PositionMonitorService {
                         }; // MutexGuard is dropped here
 
                         if should_process {
-                            tprintln!(
+                            info!(
                                 "{} {} FILL DETECTED via position change!",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
                                 "✓".green().bold()
@@ -228,7 +218,7 @@ impl PositionMonitorService {
                             }
 
                             // Dual cancellation
-                            tprintln!("{} {} Dual cancellation (REST + WebSocket)...",
+                            info!("{} {} Dual cancellation (REST + WebSocket)...",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
                                 "⚡".yellow().bold()
                             );
@@ -239,14 +229,14 @@ impl PositionMonitorService {
 
                             match rest_result {
                                 Ok(count) => {
-                                    tprintln!("{} {} REST API cancelled {} order(s)",
+                                    info!("{} {} REST API cancelled {} order(s)",
                                         "[POSITION_MONITOR]".bright_cyan().bold(),
                                         "✓".green().bold(),
                                         count
                                     );
                                 }
                                 Err(e) => {
-                                    tprintln!("{} {} REST API cancel failed: {}",
+                                    warn!("{} {} REST API cancel failed: {}",
                                         "[POSITION_MONITOR]".bright_cyan().bold(),
                                         "⚠".yellow().bold(),
                                         e
@@ -260,14 +250,14 @@ impl PositionMonitorService {
 
                             match ws_result {
                                 Ok(count) => {
-                                    tprintln!("{} {} WebSocket cancelled {} order(s)",
+                                    info!("{} {} WebSocket cancelled {} order(s)",
                                         "[POSITION_MONITOR]".bright_cyan().bold(),
                                         "✓".green().bold(),
                                         count
                                     );
                                 }
                                 Err(e) => {
-                                    tprintln!("{} {} WebSocket cancel failed: {}",
+                                    warn!("{} {} WebSocket cancel failed: {}",
                                         "[POSITION_MONITOR]".bright_cyan().bold(),
                                         "⚠".yellow().bold(),
                                         e
@@ -280,7 +270,7 @@ impl PositionMonitorService {
                                 .and_then(|p| p.entry_price.parse::<f64>().ok())
                                 .unwrap_or(0.0);
 
-                            tprintln!("{} Triggering hedge for position-detected fill",
+                            info!("{} Triggering hedge for position-detected fill",
                                 "[POSITION_MONITOR]".bright_cyan().bold()
                             );
 

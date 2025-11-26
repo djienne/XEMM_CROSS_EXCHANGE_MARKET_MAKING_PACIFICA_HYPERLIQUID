@@ -3,19 +3,10 @@ use parking_lot::Mutex;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use fast_float::parse;
+use tracing::info;
 
 use crate::connector::pacifica::{OrderbookClient as PacificaOrderbookClient, OrderbookConfig as PacificaOrderbookConfig};
 use crate::connector::hyperliquid::{OrderbookClient as HyperliquidOrderbookClient, OrderbookConfig as HyperliquidOrderbookConfig};
-
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
-}
 
 /// Pacifica orderbook service
 ///
@@ -42,7 +33,7 @@ impl PacificaOrderbookService {
         let mut pacifica_ob_client = PacificaOrderbookClient::new(pacifica_ob_config)
             .context("Failed to create Pacifica orderbook client")?;
 
-        tprintln!("{} Starting orderbook client", "[PACIFICA_OB]".magenta().bold());
+        info!("{} Starting orderbook client", "[PACIFICA_OB]".magenta().bold());
         pacifica_ob_client
             .start(move |bid, ask, _symbol, _ts| {
                 let bid_price: f64 = parse(&bid).unwrap_or(0.0);
@@ -79,7 +70,7 @@ impl HyperliquidOrderbookService {
         let mut hyperliquid_ob_client = HyperliquidOrderbookClient::new(hyperliquid_ob_config)
             .context("Failed to create Hyperliquid orderbook client")?;
 
-        tprintln!("{} Starting orderbook client", "[HYPERLIQUID_OB]".magenta().bold());
+        info!("{} Starting orderbook client", "[HYPERLIQUID_OB]".magenta().bold());
         hyperliquid_ob_client
             .start(move |bid, ask, _coin, _ts| {
                 let bid_price: f64 = parse(&bid).unwrap_or(0.0);

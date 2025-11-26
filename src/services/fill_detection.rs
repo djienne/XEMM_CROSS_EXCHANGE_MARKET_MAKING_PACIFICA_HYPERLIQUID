@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::debug;
+use tracing::{debug, info, warn, error};
 use colored::Colorize;
 use fast_float::parse;
 
@@ -13,16 +13,6 @@ use crate::connector::pacifica::{
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
-
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
-}
 
 /// WebSocket-based fill detection service (primary fill detection method)
 pub struct FillDetectionService {
@@ -40,12 +30,12 @@ pub struct FillDetectionService {
 
 impl FillDetectionService {
     pub async fn run(self) {
-        tprintln!("{} Starting fill detection client", "[FILL_DETECTION]".magenta().bold());
+        info!("{} Starting fill detection client", "[FILL_DETECTION]".magenta().bold());
 
         let mut fill_client = match FillDetectionClient::new(self.fill_config, false) {
             Ok(client) => client,
             Err(e) => {
-                tprintln!("{} {} Failed to create fill detection client: {}",
+                error!("{} {} Failed to create fill detection client: {}",
                     "[FILL_DETECTION]".magenta().bold(),
                     "✗".red().bold(),
                     e
@@ -76,7 +66,7 @@ impl FillDetectionService {
                         client_order_id,
                         ..
                     } => {
-                        tprintln!(
+                        info!(
                             "{} {} FULL FILL: {} {} {} @ {} (cloid: {})",
                             "[FILL_DETECTION]".magenta().bold(),
                             "✓".green().bold(),
@@ -131,7 +121,7 @@ impl FillDetectionService {
                                     "buy" | "bid" => OrderSide::Buy,
                                     "sell" | "ask" => OrderSide::Sell,
                                     _ => {
-                                        tprintln!("{} {} Unknown side: {}", "[FILL_DETECTION]".magenta().bold(), "✗".red().bold(), side_str);
+                                        error!("{} {} Unknown side: {}", "[FILL_DETECTION]".magenta().bold(), "✗".red().bold(), side_str);
                                         return;
                                     }
                                 };
@@ -143,7 +133,7 @@ impl FillDetectionService {
                                     state.mark_filled(filled_size, order_side);
                                 }
 
-                                tprintln!("{} {} FILL DETECTED - State updated to Filled",
+                                info!("{} {} FILL DETECTED - State updated to Filled",
                                     "[FILL_DETECTION]".magenta().bold(),
                                     "✓".green().bold()
                                 );
@@ -152,7 +142,7 @@ impl FillDetectionService {
                                 // State machine (mark_filled) already prevents new orders
                                 // Dual cancel runs async while hedge triggers immediately
                                 // Pre-hedge cancellation in hedge.rs provides defensive redundancy
-                                tprintln!("{} {} Spawning async dual cancellation (REST + WebSocket)...",
+                                info!("{} {} Spawning async dual cancellation (REST + WebSocket)...",
                                     "[FILL_DETECTION]".magenta().bold(),
                                     "⚡".yellow().bold()
                                 );
@@ -170,7 +160,7 @@ impl FillDetectionService {
                                         &symbol_bg
                                     ).await {
                                         Ok((rest_count, ws_count)) => {
-                                            tprintln!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
+                                            info!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
                                                 "[FILL_DETECTION]".magenta().bold(),
                                                 "✓✓".green().bold(),
                                                 rest_count,
@@ -178,7 +168,7 @@ impl FillDetectionService {
                                             );
                                         }
                                         Err(e) => {
-                                            tprintln!("{} {} Background dual cancellation failed: {}",
+                                            error!("{} {} Background dual cancellation failed: {}",
                                                 "[FILL_DETECTION]".magenta().bold(),
                                                 "✗".red().bold(),
                                                 e
@@ -199,7 +189,7 @@ impl FillDetectionService {
 
                                 // *** TRIGGER HEDGE IMMEDIATELY (PARALLEL WITH CANCELLATION) ***
                                 let hedge_trigger_latency = fill_detect_start.elapsed();
-                                tprintln!("{} {} ⚡ PARALLEL EXECUTION: Hedge triggered in {:.1}ms (cancellation running async)",
+                                info!("{} {} ⚡ PARALLEL EXECUTION: Hedge triggered in {:.1}ms (cancellation running async)",
                                     format!("[{}]", symbol_clone).bright_white().bold(),
                                     "Order filled".green().bold(),
                                     hedge_trigger_latency.as_secs_f64() * 1000.0
@@ -279,7 +269,7 @@ impl FillDetectionService {
                         let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
                         let notional_value = filled_size * fill_price;
 
-                        tprintln!(
+                        info!(
                             "{} {} PARTIAL FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {}",
                             "[FILL_DETECTION]".magenta().bold(),
                             "⚡".yellow().bold(),
@@ -294,7 +284,7 @@ impl FillDetectionService {
 
                         // Only hedge if notional value > $10
                         if notional_value > 10.0 {
-                            tprintln!(
+                            info!(
                                 "{} {} Partial fill notional ${:.2} > $10.00 threshold, initiating hedge",
                                 "[FILL_DETECTION]".magenta().bold(),
                                 "✓".green().bold(),
@@ -344,7 +334,7 @@ impl FillDetectionService {
                                         "buy" | "bid" => OrderSide::Buy,
                                         "sell" | "ask" => OrderSide::Sell,
                                         _ => {
-                                            tprintln!("{} {} Unknown side: {}", "[FILL_DETECTION]".magenta().bold(), "✗".red().bold(), side_str);
+                                            error!("{} {} Unknown side: {}", "[FILL_DETECTION]".magenta().bold(), "✗".red().bold(), side_str);
                                             return;
                                         }
                                     };
@@ -356,7 +346,7 @@ impl FillDetectionService {
                                         state.mark_filled(filled_size, order_side);
                                     }
 
-                                    tprintln!("{} {} PARTIAL FILL DETECTED - State updated to Filled",
+                                    info!("{} {} PARTIAL FILL DETECTED - State updated to Filled",
                                         "[FILL_DETECTION]".magenta().bold(),
                                         "✓".green().bold()
                                     );
@@ -365,7 +355,7 @@ impl FillDetectionService {
                                     // State machine (mark_filled) already prevents new orders
                                     // Dual cancel runs async while hedge triggers immediately
                                     // Pre-hedge cancellation in hedge.rs provides defensive redundancy
-                                    tprintln!("{} {} Spawning async dual cancellation (REST + WebSocket)...",
+                                    info!("{} {} Spawning async dual cancellation (REST + WebSocket)...",
                                         "[FILL_DETECTION]".magenta().bold(),
                                         "⚡".yellow().bold()
                                     );
@@ -383,7 +373,7 @@ impl FillDetectionService {
                                             &symbol_bg
                                         ).await {
                                             Ok((rest_count, ws_count)) => {
-                                                tprintln!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
+                                                info!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
                                                     "[FILL_DETECTION]".magenta().bold(),
                                                     "✓✓".green().bold(),
                                                     rest_count,
@@ -391,7 +381,7 @@ impl FillDetectionService {
                                                 );
                                             }
                                             Err(e) => {
-                                                tprintln!("{} {} Background dual cancellation failed: {}",
+                                                error!("{} {} Background dual cancellation failed: {}",
                                                     "[FILL_DETECTION]".magenta().bold(),
                                                     "✗".red().bold(),
                                                     e
@@ -411,7 +401,7 @@ impl FillDetectionService {
 
                                     // *** TRIGGER HEDGE IMMEDIATELY (PARALLEL WITH CANCELLATION) ***
                                     let hedge_trigger_latency = fill_detect_start.elapsed();
-                                    tprintln!("{} {} ⚡ PARALLEL EXECUTION: Hedge triggered in {:.1}ms (cancellation running async)",
+                                    info!("{} {} ⚡ PARALLEL EXECUTION: Hedge triggered in {:.1}ms (cancellation running async)",
                                         format!("[{}]", symbol_clone).bright_white().bold(),
                                         "Partial fill".green().bold(),
                                         hedge_trigger_latency.as_secs_f64() * 1000.0
@@ -422,7 +412,7 @@ impl FillDetectionService {
                                 }
                             });
                         } else {
-                            tprintln!(
+                            info!(
                                 "{} {} Partial fill notional ${:.2} < $10.00 threshold, skipping hedge",
                                 "[FILL_DETECTION]".magenta().bold(),
                                 "→".bright_black(),

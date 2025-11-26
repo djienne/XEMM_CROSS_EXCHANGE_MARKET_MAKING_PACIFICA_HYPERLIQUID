@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::bot::{ActiveOrder, BotState, BotStatus};
 use crate::config::Config;
@@ -27,15 +27,7 @@ use crate::services::{
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
-}
+
 
 /// Position snapshot for tracking position deltas
 #[derive(Debug, Clone)]
@@ -100,133 +92,65 @@ impl XemmBot {
     pub async fn new() -> Result<Self> {
         use colored::Colorize;
 
-        println!(
-            "{} {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
-            "═══════════════════════════════════════════════════"
+        info!("{}", "═══════════════════════════════════════════════════"
                 .bright_cyan()
                 .bold()
         );
-        println!(
-            "{} {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
-            "  XEMM Bot - Cross-Exchange Market Making"
+        info!("{}", "  XEMM Bot - Cross-Exchange Market Making"
                 .bright_cyan()
                 .bold()
         );
-        println!(
-            "{} {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
-            "═══════════════════════════════════════════════════"
+        info!("{}", "═══════════════════════════════════════════════════"
                 .bright_cyan()
                 .bold()
         );
-        println!();
+        info!("");
 
         // Load configuration
         let config = Config::load_default().context("Failed to load config.json")?;
         config.validate().context("Invalid configuration")?;
 
-        println!(
-            "{} {} Symbol: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Symbol: {}",
             "[CONFIG]".blue().bold(),
             config.symbol.bright_white().bold()
         );
-        println!(
-            "{} {} Order Notional: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Order Notional: {}",
             "[CONFIG]".blue().bold(),
             format!("${:.2}", config.order_notional_usd).bright_white()
         );
-        println!(
-            "{} {} Pacifica Maker Fee: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Pacifica Maker Fee: {}",
             "[CONFIG]".blue().bold(),
             format!("{} bps", config.pacifica_maker_fee_bps).bright_white()
         );
-        println!(
-            "{} {} Hyperliquid Taker Fee: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Hyperliquid Taker Fee: {}",
             "[CONFIG]".blue().bold(),
             format!("{} bps", config.hyperliquid_taker_fee_bps).bright_white()
         );
-        println!(
-            "{} {} Target Profit: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Target Profit: {}",
             "[CONFIG]".blue().bold(),
             format!("{} bps", config.profit_rate_bps).green().bold()
         );
-        println!(
-            "{} {} Profit Cancel Threshold: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Profit Cancel Threshold: {}",
             "[CONFIG]".blue().bold(),
             format!("{} bps", config.profit_cancel_threshold_bps).yellow()
         );
-        println!(
-            "{} {} Order Refresh Interval: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Order Refresh Interval: {}",
             "[CONFIG]".blue().bold(),
             format!("{} secs", config.order_refresh_interval_secs).bright_white()
         );
-        println!(
-            "{} {} Pacifica REST Poll Interval: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Pacifica REST Poll Interval: {}",
             "[CONFIG]".blue().bold(),
             format!("{} secs", config.pacifica_rest_poll_interval_secs).bright_white()
         );
-        println!(
-            "{} {} Active Order REST Poll Interval: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Active Order REST Poll Interval: {}",
             "[CONFIG]".blue().bold(),
             format!("{} ms", config.pacifica_active_order_rest_poll_interval_ms).bright_white()
         );
-        println!(
-            "{} {} Hyperliquid Market Order maximum allowed Slippage: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Hyperliquid Market Order maximum allowed Slippage: {}",
             "[CONFIG]".blue().bold(),
             format!("{}%", config.hyperliquid_slippage * 100.0).bright_white()
         );
-        println!();
+        info!("");
 
         // Load credentials
         dotenv::dotenv().ok();
@@ -235,12 +159,7 @@ impl XemmBot {
         let hyperliquid_credentials =
             HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials from environment")?;
 
-        println!(
-            "{} {} {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} {}",
             "[INIT]".cyan().bold(),
             "Credentials loaded successfully".green()
         );
@@ -279,23 +198,13 @@ impl XemmBot {
                 .context("Failed to create Hyperliquid trading client")?,
         );
 
-        println!(
-            "{} {} {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} {}",
             "[INIT]".cyan().bold(),
             "Trading clients initialized (6 REST instances + WebSocket)".green()
         );
 
         // Pre-fetch Hyperliquid metadata (szDecimals, etc.) to reduce hedge latency
-        println!(
-            "{} {} Pre-fetching Hyperliquid metadata for {}...",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Pre-fetching Hyperliquid metadata for {}...",
             "[INIT]".cyan().bold(),
             config.symbol.bright_white()
         );
@@ -303,45 +212,25 @@ impl XemmBot {
             .get_meta()
             .await
             .context("Failed to pre-fetch Hyperliquid metadata")?;
-        println!(
-            "{} {} {} Hyperliquid metadata cached",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} {} Hyperliquid metadata cached",
             "[INIT]".cyan().bold(),
             "✓".green().bold()
         );
 
         // Cancel any existing orders on Pacifica at startup
-        println!(
-            "{} {} Cancelling any existing orders on Pacifica...",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Cancelling any existing orders on Pacifica...",
             "[INIT]".cyan().bold()
         );
         match pacifica_trading_main
             .cancel_all_orders(false, Some(&config.symbol), false)
             .await
         {
-            Ok(count) => println!(
-                "{} {} {} Cancelled {} existing order(s)",
-                chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                    .to_string()
-                    .bright_black(),
+            Ok(count) => info!("{} {} Cancelled {} existing order(s)",
                 "[INIT]".cyan().bold(),
                 "✓".green().bold(),
                 count
             ),
-            Err(e) => println!(
-                "{} {} {} Failed to cancel existing orders: {}",
-                chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                    .to_string()
-                    .bright_black(),
+            Err(e) => info!("{} {} Failed to cancel existing orders: {}",
                 "[INIT]".cyan().bold(),
                 "⚠".yellow().bold(),
                 e
@@ -360,12 +249,7 @@ impl XemmBot {
             symbol_info.tick_size.parse().context("Failed to parse tick size")?
         };
 
-        println!(
-            "{} {} Pacifica tick size for {}: {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} Pacifica tick size for {}: {}",
             "[INIT]".cyan().bold(),
             config.symbol.bright_white(),
             format!("{}", pacifica_tick_size).bright_white()
@@ -379,12 +263,7 @@ impl XemmBot {
             pacifica_tick_size,
         );
 
-        println!(
-            "{} {} {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} {}",
             "[INIT]".cyan().bold(),
             "Opportunity evaluator created".green()
         );
@@ -406,16 +285,11 @@ impl XemmBot {
         let processed_fills = Arc::new(parking_lot::Mutex::new(HashSet::<String>::new()));
         let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
 
-        println!(
-            "{} {} {}",
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string()
-                .bright_black(),
+        info!("{} {}",
             "[INIT]".cyan().bold(),
             "State and channels initialized".green()
         );
-        println!();
+        info!("");
 
         // Initialize order monitor state
         let atomic_status = Arc::new(AtomicU8::new(AtomicBotStatus::Idle as u8));
@@ -525,7 +399,7 @@ impl XemmBot {
         });
 
         // Wait for initial orderbook data
-        tprintln!("{} Waiting for orderbook data...", "[INIT]".cyan().bold());
+        info!("{} Waiting for orderbook data...", "[INIT]".cyan().bold());
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Service 5: REST Fill Detection (backup)
@@ -596,43 +470,44 @@ impl XemmBot {
         // MAIN OPPORTUNITY EVALUATION LOOP
         // ═══════════════════════════════════════════════════
 
-        tprintln!("{} Starting opportunity evaluation loop",
+        info!("{} Starting opportunity evaluation loop",
             format!("[{} MAIN]", self.config.symbol).bright_white().bold()
         );
-        tprintln!("");
+        info!("");
 
         let mut eval_interval = interval(Duration::from_millis(1));
         let mut order_placement_rate_limit = RateLimitTracker::new();
 
-        // Helper async function to wait for SIGTERM
-        async fn wait_for_sigterm() {
-            #[cfg(unix)]
-            {
-                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to setup SIGTERM handler");
-                sigterm.recv().await;
-            }
-
-            #[cfg(not(unix))]
-            {
-                std::future::pending::<()>().await;
-            }
-        }
+        let sigint = signal::ctrl_c();
+        tokio::pin!(sigint);
+        
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to setup SIGTERM handler");
 
         let mut shutdown_rx = self.shutdown_rx.take().unwrap();
 
         loop {
             tokio::select! {
-                _ = signal::ctrl_c() => {
-                    tprintln!("{} {} Received SIGINT (Ctrl+C), initiating graceful shutdown...",
+                _ = &mut sigint => {
+                    info!("{} {} Received SIGINT (Ctrl+C), initiating graceful shutdown...",
                         format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
                         "⚠".yellow().bold()
                     );
                     break;
                 }
 
-                _ = wait_for_sigterm() => {
-                    tprintln!("{} {} Received SIGTERM (Docker shutdown), initiating graceful shutdown...",
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        sigterm.recv().await
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::future::pending::<Option<()>>().await
+                    }
+                } => {
+                    info!("{} {} Received SIGTERM (Docker shutdown), initiating graceful shutdown...",
                         format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
                         "⚠".yellow().bold()
                     );
@@ -695,7 +570,7 @@ impl XemmBot {
                             continue;
                         }
 
-                        tprintln!(
+                        info!(
                             "{} {} @ {} → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
                             format!("[{} OPPORTUNITY]", self.config.symbol).bright_green().bold(),
                             opp.direction.as_str().bright_yellow().bold(),
@@ -710,7 +585,7 @@ impl XemmBot {
                         );
 
                         // Place order
-                        tprintln!("{} Placing {} on Pacifica...",
+                        info!("{} Placing {} on Pacifica...",
                             format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
                             opp.direction.as_str().bright_yellow().bold()
                         );
@@ -737,7 +612,7 @@ impl XemmBot {
 
                                 if let Some(client_order_id) = order_data.client_order_id {
                                     let order_id = order_data.order_id.unwrap_or(0);
-                                    tprintln!(
+                                    info!(
                                         "{} {} Placed {} #{} @ {} | cloid: {}...{}",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
                                         "✓".green().bold(),
@@ -770,7 +645,7 @@ impl XemmBot {
                                         opp.initial_profit_bps,
                                     );
                                 } else {
-                                    tprintln!("{} {} Order placed but no client_order_id returned",
+                                    info!("{} {} Order placed but no client_order_id returned",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
                                         "✗".red().bold()
                                     );
@@ -780,7 +655,7 @@ impl XemmBot {
                                 if is_rate_limit_error(&e) {
                                     order_placement_rate_limit.record_error();
                                     let backoff_secs = order_placement_rate_limit.get_backoff_secs();
-                                    tprintln!(
+                                    info!(
                                         "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
                                         "⚠".yellow().bold(),
@@ -788,7 +663,7 @@ impl XemmBot {
                                         order_placement_rate_limit.consecutive_errors()
                                     );
                                 } else {
-                                    tprintln!("{} {} Failed to place order: {}",
+                                    info!("{} {} Failed to place order: {}",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
                                         "✗".red().bold(),
                                         e.to_string().red()
@@ -800,7 +675,7 @@ impl XemmBot {
                 }
 
                 _ = shutdown_rx.recv() => {
-                    tprintln!("{} Shutdown signal received",
+                    info!("{} Shutdown signal received",
                         format!("[{} MAIN]", self.config.symbol).bright_white().bold()
                     );
                     break;
@@ -812,18 +687,18 @@ impl XemmBot {
         // SHUTDOWN CLEANUP
         // ═══════════════════════════════════════════════════
 
-        tprintln!("");
-        tprintln!("{} Cancelling any remaining orders...",
+        info!("");
+        info!("{} Cancelling any remaining orders...",
             format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold()
         );
 
         match self.pacifica_trading_main.cancel_all_orders(false, Some(&self.config.symbol), false).await {
-            Ok(count) => tprintln!("{} {} Cancelled {} order(s)",
+            Ok(count) => info!("{} {} Cancelled {} order(s)",
                 format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold(),
                 "✓".green().bold(),
                 count
             ),
-            Err(e) => tprintln!("{} {} Failed to cancel orders: {}",
+            Err(e) => info!("{} {} Failed to cancel orders: {}",
                 format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold(),
                 "⚠".yellow().bold(),
                 e
@@ -834,19 +709,19 @@ impl XemmBot {
         let final_state = self.bot_state.read().await;
         match &final_state.status {
             BotStatus::Complete => {
-                tprintln!("");
-                tprintln!("{} {}", "✓".green().bold(), "Bot completed successfully!".green().bold());
-                tprintln!("Final position: {}", final_state.position);
+                info!("");
+                info!("{} {}", "✓".green().bold(), "Bot completed successfully!".green().bold());
+                info!("Final position: {}", final_state.position);
                 Ok(())
             }
             BotStatus::Error(e) => {
-                tprintln!("");
-                tprintln!("{} {}: {}", "✗".red().bold(), "Bot terminated with error".red().bold(), e.to_string().red());
+                info!("");
+                info!("{} {}: {}", "✗".red().bold(), "Bot terminated with error".red().bold(), e.to_string().red());
                 anyhow::bail!("Bot failed: {}", e)
             }
             _ => {
-                tprintln!("");
-                tprintln!("{} Bot terminated in unexpected state: {:?}", "⚠".yellow().bold(), final_state.status);
+                info!("");
+                info!("{} Bot terminated in unexpected state: {:?}", "⚠".yellow().bold(), final_state.status);
                 Ok(())
             }
         }
