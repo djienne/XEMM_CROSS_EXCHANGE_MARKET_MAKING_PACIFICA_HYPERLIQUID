@@ -85,6 +85,13 @@ impl BotState {
         self.last_cancel_ms.store(now_ms, Ordering::Release);
     }
 
+    /// Clear active order without updating the cancellation grace timer
+    pub fn clear_active_order_no_grace(&mut self) {
+        self.active_order = None;
+        self.status = BotStatus::Idle;
+        self.status_atomic.store(0, Ordering::Release); // 0 = Idle
+    }
+
     /// Mark order as filled
     pub fn mark_filled(&mut self, filled_size: f64, side: OrderSide) {
         self.status = BotStatus::Filled;

@@ -8,6 +8,7 @@ pub mod order_monitor;
 pub mod hedge;
 pub mod orderbook;
 pub mod rest_poll;
+pub mod ws_health;
 
 use crate::strategy::OrderSide;
 

@@ -15,9 +15,10 @@ use crate::strategy::OrderSide;
 
 /// Position-based fill detection service (4th layer - ground truth)
 ///
-/// Polls Pacifica positions via REST API every 500ms to detect position changes.
-/// This is the ultimate fallback - if position changed in the expected direction,
-/// a fill definitely occurred regardless of WebSocket/REST/order status detection.
+/// Polls Pacifica positions via REST API on an adaptive interval to detect
+/// position changes. This is the ultimate fallback - if position changed in the
+/// expected direction, a fill definitely occurred regardless of WebSocket/REST/order
+/// status detection.
 pub struct PositionMonitorService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,

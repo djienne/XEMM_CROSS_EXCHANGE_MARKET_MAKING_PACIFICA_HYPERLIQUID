@@ -15,8 +15,9 @@ use crate::util::rate_limit::is_rate_limit_error;
 
 /// REST API fill detection service (backup/fallback method)
 ///
-/// Polls open_orders via REST API every 500ms to detect fills that may have been
-/// missed by WebSocket. This provides redundancy and recovery capabilities.
+/// Polls open_orders via REST API on a configurable interval (fast when active,
+/// slower when idle) to detect fills missed by WebSocket. This provides redundancy
+/// and recovery capabilities.
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,

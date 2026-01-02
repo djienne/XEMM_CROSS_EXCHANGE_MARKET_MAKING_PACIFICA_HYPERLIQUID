@@ -99,8 +99,9 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 - ✅ **Multi-source Orderbook** - WebSocket primary, REST API fallback
 - ✅ **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
 - ✅ **Auto-reconnect** - Exponential backoff on connection failures
-- ✅ **Concurrent Tasks** - 10 async tasks running in parallel
+- ✅ **Concurrent Tasks** - 11 async tasks running in parallel
 - ✅ **Event-driven Monitoring** - Profit checks and opportunity evaluation react to WS updates
+- ✅ **WebSocket Health Monitor** - Cancels orders and reconnects on stale feeds
 - ✅ **Startup Sanity Checks** - Verify WS feeds + trading API access before trading
 - ✅ **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
 - ✅ **Graceful Shutdown** - Cancels orders on Ctrl+C
@@ -137,6 +138,7 @@ Edit `config.json`:
   "symbol": "SOL",
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
+  "ws_stale_threshold_ms": 2000,
   "pacifica_maker_fee_bps": 1.5,
   "hyperliquid_taker_fee_bps": 4.0,
   "profit_rate_bps": 15.0,
@@ -144,7 +146,8 @@ Edit `config.json`:
   "profit_cancel_threshold_bps": 3.0,
   "order_refresh_interval_secs": 60,
   "hyperliquid_slippage": 0.05,
-  "pacifica_rest_poll_interval_secs": 2
+  "pacifica_rest_poll_interval_secs": 2,
+  "pacifica_active_order_rest_poll_interval_ms": 250
 }
 ```
 
@@ -223,18 +226,19 @@ The bot uses a state machine to track lifecycle:
 
 ### Concurrent Tasks
 
-The XEMM bot orchestrates 10 async tasks running in parallel:
+The XEMM bot orchestrates 11 async tasks running in parallel:
 
 1. **Pacifica Orderbook (WebSocket)** - Real-time bid/ask feed
 2. **Hyperliquid Orderbook (WebSocket)** - Real-time bid/ask feed
 3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations (primary + position delta)
 4. **Pacifica REST API Polling** - Fallback orderbook data (every 2s)
 5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
-6. **REST API Fill Detection** - Backup fill polling (every 500ms)
-7. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
+6. **REST API Fill Detection** - Backup fill polling (adaptive; uses `pacifica_active_order_rest_poll_interval_ms` when an order is active)
+7. **Position Monitor** - Position-based fill detection (adaptive polling, ground truth)
 8. **Order Monitoring** - Profit tracking and order refresh (event-driven on price updates)
 9. **Hedge Execution** - Executes Hyperliquid hedge after fill
 10. **Main Opportunity Loop** - Evaluates and places orders (event-driven on orderbook updates)
+11. **WebSocket Health Monitor** - Cancels orders and reconnects on stale feeds
 
 ## Configuration Parameters
 
@@ -244,6 +248,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | `reconnect_attempts` | 5 | Number of WebSocket reconnection attempts with exponential backoff |
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `ping_interval_secs` | 15 | WebSocket ping interval in seconds (max 30s) |
+| `ws_stale_threshold_ms` | 2000 | WebSocket staleness threshold in milliseconds |
 | `low_latency_mode` | false | Low-latency mode: minimal logging and processing |
 | `pacifica_maker_fee_bps` | 1.5 | Pacifica maker fee in basis points |
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
@@ -254,19 +259,20 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
 | `hyperliquid_use_ws_for_hedge` | true | Use WebSocket for hedge execution (faster) vs REST |
 | `pacifica_rest_poll_interval_secs` | 2 | REST API fallback polling interval in seconds |
+| `pacifica_active_order_rest_poll_interval_ms` | 250 | REST fill detection polling interval when an order is active |
 
 ## Trading Workflow
 
 1. **Startup**: Verify orderbook WS + trading API access, then cancel existing Pacifica orders
-2. **Wait**: Gather initial orderbook data (3s warmup)
+2. **Wait**: Confirm orderbook WS readiness (first updates)
 3. **Evaluate**: Check both BUY and SELL opportunities on every orderbook update
 4. **Calculate & Place**: Calculate Pacifica limit price from Hyperliquid hedge price with target profit margin (`profit_rate_bps`) embedded, place order if still profitable after rounding
 5. **Monitor**: Track profit on price updates, cancel if deviation >3 bps or age >60s
 6. **Fill Detection**: 5-layer system detects when order fills
    - WebSocket fill detection (primary, real-time via account_order_updates)
    - WebSocket position detection (redundancy, real-time via account_positions)
-   - REST API order polling (backup, 500ms)
-   - Position monitor (ground truth, 500ms via REST)
+   - REST API order polling (backup, adaptive; uses `pacifica_active_order_rest_poll_interval_ms` when active)
+   - Position monitor (ground truth, adaptive polling via REST)
    - Monitor safety check (pre-cancellation)
    - **Dual Cancellation**: Immediately cancel all orders via REST + WebSocket
 7. **Hedge**: Execute market order on Hyperliquid (opposite direction)

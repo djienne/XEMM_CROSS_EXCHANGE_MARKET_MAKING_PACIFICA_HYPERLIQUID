@@ -13,15 +13,16 @@ use anyhow::Result;
 ///
 /// Tasks:
 /// 1. Pacifica Orderbook (WebSocket - real-time push)
-/// 2. Hyperliquid Orderbook (WebSocket - 99ms request/response)
+/// 2. Hyperliquid Orderbook (WebSocket - real-time push)
 /// 3. Fill Detection (WebSocket - primary, real-time)
 /// 4. Pacifica REST Polling (orderbook fallback, every 2s)
 /// 4.5. Hyperliquid REST Polling (orderbook fallback, every 2s)
-/// 5. REST API Fill Detection (backup, 500ms polling with rate limit handling)
-/// 5.5. Position Monitor (4th layer, ground truth, 500ms polling)
+/// 5. REST API Fill Detection (backup, adaptive polling with rate limit handling)
+/// 5.5. Position Monitor (4th layer, ground truth, adaptive polling)
 /// 6. Order Monitoring (profit/age checks, event-driven on price updates)
 /// 7. Hedge Execution
 /// 8. Main Opportunity Loop (event-driven on orderbook updates)
+/// 9. WebSocket Health Monitor (cancel + reconnect on stale feeds)
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Initialize logging

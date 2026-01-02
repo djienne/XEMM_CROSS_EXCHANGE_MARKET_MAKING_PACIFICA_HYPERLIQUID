@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::signal;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, info};
 
 use crate::bot::{ActiveOrder, BotState, BotStatus};
@@ -21,7 +21,7 @@ use crate::services::{
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     market_event::{MarketEventHub, MarketSource},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
-    rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
+    rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, ws_health::{WsHealth, WsHealthMonitor}, HedgeEvent,
 };
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
@@ -312,11 +312,16 @@ impl XemmBot {
         // PRE-FLIGHT: ORDERBOOK WS + TRADING API SANITY
         // ═══════════════════════════════════════════════════
         let market_events = Arc::new(MarketEventHub::new(1024));
+        let ws_health = Arc::new(WsHealth::new());
+        let (pacifica_reconnect_tx, pacifica_reconnect_rx) = watch::channel(0u64);
+        let (hyperliquid_reconnect_tx, hyperliquid_reconnect_rx) = watch::channel(0u64);
 
         // Service 1: Pacifica Orderbook (WebSocket)
         let pacifica_ob_service = PacificaOrderbookService {
             prices: self.pacifica_prices.clone(),
             market_events: market_events.clone(),
+            ws_health: ws_health.clone(),
+            reconnect_rx: pacifica_reconnect_rx,
             symbol: self.config.symbol.clone(),
             agg_level: self.config.agg_level,
             reconnect_attempts: self.config.reconnect_attempts,
@@ -330,12 +335,30 @@ impl XemmBot {
         let hyperliquid_ob_service = HyperliquidOrderbookService {
             prices: self.hyperliquid_prices.clone(),
             market_events: market_events.clone(),
+            ws_health: ws_health.clone(),
+            reconnect_rx: hyperliquid_reconnect_rx,
             symbol: self.config.symbol.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
         };
         tokio::spawn(async move {
             hyperliquid_ob_service.run().await.ok();
+        });
+
+        let ws_health_monitor = WsHealthMonitor {
+            symbol: self.config.symbol.clone(),
+            health: ws_health.clone(),
+            bot_state: self.bot_state.clone(),
+            pacifica_trading: self.pacifica_trading_main.clone(),
+            pacifica_ws_trading: self.pacifica_ws_trading.clone(),
+            atomic_status: self.atomic_status.clone(),
+            order_snapshot: self.order_snapshot.clone(),
+            pacifica_reconnect_tx,
+            hyperliquid_reconnect_tx,
+            stale_threshold_ms: self.config.ws_stale_threshold_ms,
+        };
+        tokio::spawn(async move {
+            ws_health_monitor.run().await;
         });
 
         self.wait_for_ws_ready(&market_events).await?;
@@ -493,6 +516,10 @@ impl XemmBot {
                 let status = self.atomic_status.load(Ordering::Acquire);
                 if status == AtomicBotStatus::Complete as u8 || status == AtomicBotStatus::Error as u8 {
                     break 'main;
+                }
+
+                if !ws_health.is_healthy() {
+                    continue;
                 }
 
                 if status == AtomicBotStatus::OrderPlaced as u8 {

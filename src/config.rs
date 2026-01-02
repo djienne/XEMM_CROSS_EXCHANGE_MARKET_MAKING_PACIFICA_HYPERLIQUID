@@ -21,6 +21,10 @@ pub struct Config {
     #[serde(default = "default_ping_interval")]
     pub ping_interval_secs: u64,
 
+    /// WebSocket staleness threshold in milliseconds
+    #[serde(default = "default_ws_stale_threshold_ms")]
+    pub ws_stale_threshold_ms: u64,
+
     /// Low-latency mode: minimal logging and processing
     #[serde(default = "default_low_latency")]
     pub low_latency_mode: bool,
@@ -81,6 +85,10 @@ fn default_ping_interval() -> u64 {
     15 // 15 seconds
 }
 
+fn default_ws_stale_threshold_ms() -> u64 {
+    2000 // 2 seconds
+}
+
 fn default_low_latency() -> bool {
     false
 }
@@ -122,7 +130,7 @@ fn default_pacifica_rest_poll_interval() -> u64 {
 }
 
 fn default_pacifica_active_order_rest_poll_interval() -> u64 {
-    500 // 500 ms (safer than 100ms to avoid rate limits)
+    250 // 250 ms (aggressive but still avoids tight rate limits)
 }
 
 impl Default for Config {
@@ -132,6 +140,7 @@ impl Default for Config {
             agg_level: default_agg_level(),
             reconnect_attempts: default_reconnect_attempts(),
             ping_interval_secs: default_ping_interval(),
+            ws_stale_threshold_ms: default_ws_stale_threshold_ms(),
             low_latency_mode: default_low_latency(),
             pacifica_maker_fee_bps: default_pacifica_maker_fee(),
             hyperliquid_taker_fee_bps: default_hyperliquid_taker_fee(),
@@ -194,6 +203,12 @@ impl Config {
         anyhow::ensure!(
             self.ping_interval_secs > 0 && self.ping_interval_secs <= 30,
             "Ping interval must be between 1 and 30 seconds"
+        );
+
+        // Check WebSocket staleness threshold is reasonable
+        anyhow::ensure!(
+            self.ws_stale_threshold_ms > 0,
+            "WebSocket staleness threshold must be greater than 0"
         );
 
         // Check reconnect attempts is reasonable
