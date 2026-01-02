@@ -2,7 +2,7 @@
   "symbol": "SOL",
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
-  "ws_stale_threshold_ms": 2000,
+  "ws_stale_threshold_ms": 20000,
   "pacifica_maker_fee_bps": 1.5,
   "hyperliquid_taker_fee_bps": 4.0,
   "profit_rate_bps": 15.0,

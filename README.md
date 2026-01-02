@@ -138,7 +138,7 @@ Edit `config.json`:
   "symbol": "SOL",
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
-  "ws_stale_threshold_ms": 2000,
+  "ws_stale_threshold_ms": 20000,
   "pacifica_maker_fee_bps": 1.5,
   "hyperliquid_taker_fee_bps": 4.0,
   "profit_rate_bps": 15.0,
@@ -248,7 +248,7 @@ The XEMM bot orchestrates 11 async tasks running in parallel:
 | `reconnect_attempts` | 5 | Number of WebSocket reconnection attempts with exponential backoff |
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `ping_interval_secs` | 15 | WebSocket ping interval in seconds (max 30s) |
-| `ws_stale_threshold_ms` | 2000 | WebSocket staleness threshold in milliseconds |
+| `ws_stale_threshold_ms` | 20000 | WebSocket staleness threshold in milliseconds |
 | `low_latency_mode` | false | Low-latency mode: minimal logging and processing |
 | `pacifica_maker_fee_bps` | 1.5 | Pacifica maker fee in basis points |
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |

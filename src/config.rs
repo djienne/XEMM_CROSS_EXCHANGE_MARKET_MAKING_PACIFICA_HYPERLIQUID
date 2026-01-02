@@ -86,7 +86,7 @@ fn default_ping_interval() -> u64 {
 }
 
 fn default_ws_stale_threshold_ms() -> u64 {
-    2000 // 2 seconds
+    20000 // 20 seconds
 }
 
 fn default_low_latency() -> bool {
