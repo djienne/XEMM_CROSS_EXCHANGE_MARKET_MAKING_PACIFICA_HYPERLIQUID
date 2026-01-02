@@ -26,6 +26,8 @@ pub struct FillDetectionService {
     pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
     /// Minimum notional value (USD) to trigger hedge on partial fills
     pub min_hedge_notional: f64,
+    /// Expected client_order_id for fast ownership check (shared with FillHandler)
+    pub expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl FillDetectionService {
@@ -44,8 +46,8 @@ impl FillDetectionService {
             }
         };
 
-        // Create the unified fill handler
-        let fill_handler = FillHandler::new(
+        // Create the unified fill handler with atomic fast-path support
+        let fill_handler = FillHandler::with_atomic_status(
             self.bot_state.clone(),
             self.hedge_tx.clone(),
             self.pacifica_trading.clone(),
@@ -53,6 +55,8 @@ impl FillDetectionService {
             self.symbol.clone(),
             self.processed_fills.clone(),
             Some(self.baseline_updater.clone()),
+            self.atomic_status.clone(),
+            self.expected_cloid.clone(),
         );
 
         // Clone dependencies for the callback closure
@@ -75,15 +79,10 @@ impl FillDetectionService {
                         let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
                         let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
 
-                        info!(
-                            "{} {} FULL FILL: {} {} {} @ {} (cloid: {})",
-                            "[FILL_DETECTION]".magenta().bold(),
-                            "✓".green().bold(),
-                            side.bright_yellow(),
-                            filled_amount.bright_white(),
-                            fill_symbol.bright_white().bold(),
-                            avg_price.cyan(),
-                            client_order_id.as_deref().unwrap_or("None")
+                        // Minimal hot-path logging (colored formatting is expensive)
+                        debug!(
+                            "[FILL_DETECTION] FULL FILL: {} {} {} @ {}",
+                            side, filled_amount, fill_symbol, avg_price
                         );
 
                         let handler = fill_handler.clone();
@@ -159,28 +158,19 @@ impl FillDetectionService {
                         let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
                         let notional_value = filled_size * fill_price;
 
-                        info!(
-                            "{} {} PARTIAL FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {}",
-                            "[FILL_DETECTION]".magenta().bold(),
-                            "⚡".yellow().bold(),
-                            side.bright_yellow(),
-                            filled_amount.bright_white(),
-                            fill_symbol.bright_white().bold(),
-                            avg_price.cyan(),
-                            filled_amount.bright_white(),
-                            original_amount,
-                            format!("${:.2}", notional_value).cyan().bold()
+                        // Minimal hot-path logging (colored formatting is expensive)
+                        debug!(
+                            "[FILL_DETECTION] PARTIAL FILL: {} {} {} @ {} | {}/{} | ${:.2}",
+                            side, filled_amount, fill_symbol, avg_price,
+                            filled_amount, original_amount, notional_value
                         );
 
                         // Only hedge if notional value exceeds threshold
                         let min_notional = self.min_hedge_notional;
                         if notional_value > min_notional {
-                            info!(
-                                "{} {} Partial fill notional ${:.2} > ${:.2} threshold, initiating hedge",
-                                "[FILL_DETECTION]".magenta().bold(),
-                                "✓".green().bold(),
-                                notional_value,
-                                min_notional
+                            debug!(
+                                "[FILL_DETECTION] Partial fill ${:.2} > ${:.2}, hedging",
+                                notional_value, min_notional
                             );
 
                             let handler = fill_handler.clone();
@@ -199,12 +189,9 @@ impl FillDetectionService {
                                 ).await;
                             });
                         } else {
-                            info!(
-                                "{} {} Partial fill notional ${:.2} < ${:.2} threshold, skipping hedge",
-                                "[FILL_DETECTION]".magenta().bold(),
-                                "→".bright_black(),
-                                notional_value,
-                                min_notional
+                            debug!(
+                                "[FILL_DETECTION] Partial fill ${:.2} < ${:.2}, skipping",
+                                notional_value, min_notional
                             );
                         }
                     }

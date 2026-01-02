@@ -4,6 +4,7 @@
 //! fill processing logic used by WebSocket, REST, and position-based detection.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,6 +18,12 @@ use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading, PositionBas
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
+
+/// Status values for atomic fast-path checks (must match BotStatus encoding)
+const STATUS_IDLE: u8 = 0;
+const STATUS_ORDER_PLACED: u8 = 1;
+const STATUS_FILLED: u8 = 2;
+const STATUS_HEDGING: u8 = 3;
 
 /// Identifies the source of fill detection for logging.
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +83,10 @@ pub struct FillHandler {
     symbol: String,
     processed_fills: Arc<Mutex<HashSet<String>>>,
     baseline_updater: Option<PositionBaselineUpdater>,
+    /// Atomic status for lock-free fast-path rejection
+    atomic_status: Arc<AtomicU8>,
+    /// Expected client_order_id for fast ownership check (avoids RwLock)
+    expected_cloid: Arc<Mutex<Option<String>>>,
 }
 
 impl FillHandler {
@@ -96,7 +107,44 @@ impl FillHandler {
             symbol,
             processed_fills,
             baseline_updater,
+            atomic_status: Arc::new(AtomicU8::new(STATUS_IDLE)),
+            expected_cloid: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Create with external atomic status (for sharing with other services)
+    pub fn with_atomic_status(
+        bot_state: Arc<RwLock<BotState>>,
+        hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+        pacifica_trading: Arc<PacificaTrading>,
+        pacifica_ws_trading: Arc<PacificaWsTrading>,
+        symbol: String,
+        processed_fills: Arc<Mutex<HashSet<String>>>,
+        baseline_updater: Option<PositionBaselineUpdater>,
+        atomic_status: Arc<AtomicU8>,
+        expected_cloid: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            bot_state,
+            hedge_tx,
+            pacifica_trading,
+            pacifica_ws_trading,
+            symbol,
+            processed_fills,
+            baseline_updater,
+            atomic_status,
+            expected_cloid,
+        }
+    }
+
+    /// Update expected client_order_id when placing an order
+    pub fn set_expected_cloid(&self, cloid: Option<String>) {
+        *self.expected_cloid.lock() = cloid;
+    }
+
+    /// Get the atomic status handle for external updates
+    pub fn atomic_status(&self) -> &Arc<AtomicU8> {
+        &self.atomic_status
     }
 
     /// Parse order side from string (handles both "buy"/"sell" and "bid"/"ask").
@@ -127,6 +175,27 @@ impl FillHandler {
 
         processed.insert(fill_id);
         true
+    }
+
+    /// Fast-path check using atomics - no locks needed.
+    /// Returns true if fill processing should continue, false to reject early.
+    #[inline]
+    fn atomic_fast_path_check(&self) -> bool {
+        let status = self.atomic_status.load(Ordering::Acquire);
+        // Only process fills when we have an active order (OrderPlaced state)
+        status == STATUS_ORDER_PLACED
+    }
+
+    /// Fast ownership check using cached cloid - uses parking_lot Mutex (no async)
+    #[inline]
+    fn fast_is_our_order(&self, client_order_id: Option<&str>) -> bool {
+        match client_order_id {
+            Some(cloid) => {
+                let expected = self.expected_cloid.lock();
+                expected.as_ref().map(|e| e == cloid).unwrap_or(false)
+            }
+            None => false,
+        }
     }
 
     /// Process a fill event - the core unified logic.
@@ -234,7 +303,7 @@ impl FillHandler {
         fill_start
     }
 
-    /// Check if an order is ours by comparing client_order_id.
+    /// Check if an order is ours by comparing client_order_id (async fallback).
     pub async fn is_our_order(&self, client_order_id: Option<&str>) -> bool {
         let state = self.bot_state.read().await;
         state
@@ -246,7 +315,7 @@ impl FillHandler {
 
     /// Convenience method for the full fill handling flow (async).
     ///
-    /// Combines ownership check, deduplication, and processing.
+    /// Optimized with atomic fast-path rejection and batched lock acquisitions.
     pub async fn handle_fill(
         &self,
         source: FillSource,
@@ -256,41 +325,48 @@ impl FillHandler {
         filled_size: f64,
         fill_price: f64,
     ) -> bool {
-        let prefix = source.log_prefix();
-
-        // Check if this is our order
-        if !self.is_our_order(client_order_id).await {
-            debug!("{} Fill is not for our order, ignoring", prefix);
+        // FAST PATH 1: Atomic status check (no locks)
+        if !self.atomic_fast_path_check() {
             return false;
         }
 
-        // Check for duplicate
+        // FAST PATH 2: Ownership check using cached cloid (parking_lot Mutex - fast)
+        if !self.fast_is_our_order(client_order_id) {
+            debug!("{} Fill is not for our order, ignoring", source.log_prefix());
+            return false;
+        }
+
+        // FAST PATH 3: Client order ID required for deduplication
         let cloid = match client_order_id {
             Some(id) => id,
             None => {
-                debug!("{} No client_order_id, cannot deduplicate", prefix);
+                debug!("{} No client_order_id, cannot deduplicate", source.log_prefix());
                 return false;
             }
         };
 
+        // FAST PATH 4: Deduplication check (parking_lot Mutex - fast)
         if !self.try_mark_processed(fill_type, cloid) {
             debug!(
                 "{} {:?} fill already processed (duplicate), skipping",
-                prefix, fill_type
+                source.log_prefix(), fill_type
             );
             return false;
         }
 
-        // Parse side
+        // Parse side (no locks)
         let side = match Self::parse_side(side_str) {
             Some(s) => s,
             None => {
-                error!("{} {} Unknown side: {}", prefix, "✗".red().bold(), side_str);
+                error!("{} Unknown side: {}", source.log_prefix(), side_str);
                 return false;
             }
         };
 
-        // Process the fill
+        // Update atomic status immediately (lock-free)
+        self.atomic_status.store(STATUS_FILLED, Ordering::Release);
+
+        // Process the fill (async state update + hedge trigger)
         self.process_fill(source, fill_type, side, filled_size, fill_price, Some(side_str))
             .await;
 

@@ -365,6 +365,29 @@ impl HyperliquidTrading {
         let asset_id = self.get_asset_id(coin).await?;
         let asset_info = self.get_asset_info(coin).await?;
 
+        self.build_market_order_request_with_meta(
+            coin, is_buy, size, slippage, reduce_only, bid, ask,
+            asset_id, asset_info.sz_decimals
+        ).await
+    }
+
+    /// Build a signed market order request with pre-cached asset metadata.
+    ///
+    /// This is the low-latency version that skips metadata lookups.
+    /// Use this when you have pre-fetched asset_id and sz_decimals.
+    #[inline]
+    pub async fn build_market_order_request_with_meta(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        size: f64,
+        slippage: f64,
+        reduce_only: bool,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        asset_id: u32,
+        sz_decimals: i32,
+    ) -> Result<OrderRequest> {
         // Check if we have bid/ask prices
         if bid.is_none() || ask.is_none() {
             anyhow::bail!("Bid and ask prices are required. Please provide them from the orderbook client.");
@@ -385,18 +408,17 @@ impl HyperliquidTrading {
 
         // Round price and size
         let is_spot = asset_id >= 10000;
-        let limit_price_str = Self::round_price(limit_price, asset_info.sz_decimals, is_spot, is_buy, true); // aggressive=true for market orders
-        let size_str = Self::round_size(size, asset_info.sz_decimals);
+        let limit_price_str = Self::round_price(limit_price, sz_decimals, is_spot, is_buy, true); // aggressive=true for market orders
+        let size_str = Self::round_size(size, sz_decimals);
 
-        info!(
-            "[HYPERLIQUID] Market order {} {} {} at limit {} (mid: {:.2}, slippage: {}%, szDecimals: {})",
+        debug!(
+            "[HYPERLIQUID] Market order {} {} {} at limit {} (mid: {:.2}, slippage: {}%)",
             if is_buy { "BUY" } else { "SELL" },
             size_str,
             coin,
             limit_price_str,
             mid_price,
-            slippage * 100.0,
-            asset_info.sz_decimals
+            slippage * 100.0
         );
 
         // Construct order

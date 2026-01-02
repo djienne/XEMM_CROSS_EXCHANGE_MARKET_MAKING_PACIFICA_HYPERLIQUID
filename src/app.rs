@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicU8};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 use crate::bot::{BotState, BotStatus};
 use crate::config::Config;
@@ -66,6 +66,8 @@ pub struct XemmBot {
     pub atomic_status: Arc<AtomicU8>,
     pub last_cancel_ms: Arc<AtomicU64>,
     pub order_snapshot: Arc<SharedOrderSnapshot>,
+    /// Expected client_order_id for fast fill ownership check
+    pub expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
 
     // Channels
     pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
@@ -176,6 +178,7 @@ impl XemmBot {
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
             min_hedge_notional: self.config.min_hedge_notional_usd,
+            expected_cloid: self.expected_cloid.clone(),
         };
         tokio::spawn(async move {
             fill_service.run().await;
@@ -255,6 +258,31 @@ impl XemmBot {
         spawn_monitor_tasks(order_monitor_service.clone(), cancel_rx);
 
         // Service 7: Hedge Execution
+        // Pre-fetch asset metadata for low-latency hedge execution
+        let cached_asset_meta = match self.hyperliquid_trading.get_asset_info(&self.config.symbol).await {
+            Ok(info) => {
+                let asset_id = self.hyperliquid_trading.get_asset_id(&self.config.symbol).await.unwrap_or(0);
+                info!("{} {} Pre-cached asset meta: id={}, sz_decimals={}",
+                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                    "✓".green().bold(),
+                    asset_id,
+                    info.sz_decimals
+                );
+                Some(crate::services::hedge::CachedAssetMeta {
+                    asset_id,
+                    sz_decimals: info.sz_decimals,
+                })
+            }
+            Err(e) => {
+                warn!("{} {} Failed to pre-cache asset meta (will fetch on demand): {}",
+                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                    "⚠".yellow().bold(),
+                    e
+                );
+                None
+            }
+        };
+
         let hedge_service = HedgeService {
             bot_state: self.bot_state.clone(),
             hedge_rx: self.hedge_rx.take().unwrap(),
@@ -263,6 +291,7 @@ impl XemmBot {
             hyperliquid_trading: self.hyperliquid_trading.clone(),
             pacifica_trading: self.pacifica_trading_hedge.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
+            cached_asset_meta,
         };
         tokio::spawn(async move {
             hedge_service.run().await;
@@ -290,6 +319,7 @@ impl XemmBot {
                 self.last_cancel_ms.clone(),
                 self.order_snapshot.clone(),
                 order_monitor_service.clone(),
+                self.expected_cloid.clone(),
             );
 
             // Run the opportunity loop (blocking until shutdown)

@@ -480,3 +480,25 @@ pub struct AccountPositionsResponse {
     pub channel: String,
     pub data: Vec<PositionData>,
 }
+
+/// Unified WebSocket message for fill detection (single-pass parsing optimization)
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FillDetectionWsMessage {
+    /// Account order updates (fills, cancellations)
+    OrderUpdates {
+        channel: String,
+        data: Vec<OrderUpdate>,
+    },
+    /// Account positions (for position-based fill detection)
+    Positions {
+        channel: String,
+        data: Vec<PositionData>,
+    },
+    /// Pong response
+    Pong {
+        channel: String,
+    },
+    /// Unknown/ignored message
+    Unknown(serde_json::Value),
+}

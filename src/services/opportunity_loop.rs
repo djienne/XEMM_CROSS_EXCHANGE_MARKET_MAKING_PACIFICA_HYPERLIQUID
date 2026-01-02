@@ -29,6 +29,8 @@ pub struct OpportunityLoopService {
     last_cancel_ms: Arc<AtomicU64>,
     order_snapshot: Arc<SharedOrderSnapshot>,
     order_monitor: Arc<OrderMonitorService>,
+    /// Expected client_order_id for fast fill ownership check
+    expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl OpportunityLoopService {
@@ -44,6 +46,7 @@ impl OpportunityLoopService {
         last_cancel_ms: Arc<AtomicU64>,
         order_snapshot: Arc<SharedOrderSnapshot>,
         order_monitor: Arc<OrderMonitorService>,
+        expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
     ) -> Self {
         Self {
             config,
@@ -56,6 +59,7 @@ impl OpportunityLoopService {
             last_cancel_ms,
             order_snapshot,
             order_monitor,
+            expected_cloid,
         }
     }
 
@@ -254,6 +258,9 @@ impl OpportunityLoopService {
                             &client_order_id[..8],
                             &client_order_id[client_order_id.len()-4..]
                         );
+
+                        // Update expected cloid for fast fill ownership check (before state lock)
+                        *self.expected_cloid.lock() = Some(client_order_id.clone());
 
                         let active_order = ActiveOrder {
                             client_order_id,

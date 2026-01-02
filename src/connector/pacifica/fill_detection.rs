@@ -9,8 +9,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use super::types::{
-    AccountOrderUpdatesResponse, AccountOrderUpdatesSubscribe, AccountPositionsResponse,
-    AccountPositionsSubscribe, FillEvent, PingMessage,
+    AccountOrderUpdatesSubscribe, AccountPositionsSubscribe,
+    FillDetectionWsMessage, FillEvent, PingMessage,
 };
 
 /// Configuration for fill detection client
@@ -328,67 +328,59 @@ impl FillDetectionClient {
         Ok(())
     }
 
-    /// Handle incoming WebSocket message
+    /// Handle incoming WebSocket message (single-pass parsing for low latency)
+    #[inline]
     fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
         F: FnMut(FillEvent) + Send + 'static,
     {
-        // Try to parse as a generic response first to check channel
-        let response: serde_json::Value = serde_json::from_str(text)?;
+        // Single-pass parsing using unified FillDetectionWsMessage enum
+        let msg: FillDetectionWsMessage = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(_) => return Ok(()), // Silently ignore unparseable messages in hot path
+        };
 
-        if let Some(channel) = response.get("channel").and_then(|v| v.as_str()) {
-            match channel {
-                "pong" => {
-                    debug!("Received pong");
-                }
-                "account_order_updates" => {
-                    // Parse as account order updates response
-                    let updates: AccountOrderUpdatesResponse = serde_json::from_str(text)?;
+        match msg {
+            FillDetectionWsMessage::OrderUpdates { channel, data } if channel == "account_order_updates" => {
+                debug!("Received {} order update(s)", data.len());
+
+                // Update last order fill time for cross-validation
+                *self.last_order_fill_time.lock() = Instant::now();
+
+                // Process each order update
+                for update in data {
                     debug!(
-                        "Received {} order update(s)",
-                        updates.data.len()
+                        "Order update - ID: {}, Status: {:?}, Event: {:?}, Filled: {}/{}",
+                        update.order_id,
+                        update.order_status,
+                        update.order_event,
+                        update.filled_amount,
+                        update.original_amount
                     );
 
-                    // Update last order fill time for cross-validation
-                    *self.last_order_fill_time.lock() = Instant::now();
+                    // Convert to fill event and call callback if applicable
+                    if let Some(fill_event) = update.to_fill_event() {
+                        callback(fill_event);
+                    }
+                }
+            }
+            FillDetectionWsMessage::Positions { channel, data } if channel == "account_positions" => {
+                if self.config.enable_position_fill_detection {
+                    debug!("Received {} position update(s)", data.len());
 
-                    // Process each order update
-                    for update in updates.data {
-                        debug!(
-                            "Order update - ID: {}, Status: {:?}, Event: {:?}, Filled: {}/{}",
-                            update.order_id,
-                            update.order_status,
-                            update.order_event,
-                            update.filled_amount,
-                            update.original_amount
-                        );
-
-                        // Convert to fill event and call callback if applicable
-                        if let Some(fill_event) = update.to_fill_event() {
+                    // Process each position update
+                    for position in data {
+                        if let Some(fill_event) = self.detect_fill_from_position(&position) {
                             callback(fill_event);
                         }
                     }
                 }
-                "account_positions" => {
-                    if self.config.enable_position_fill_detection {
-                        // Parse as account positions response
-                        let positions: AccountPositionsResponse = serde_json::from_str(text)?;
-                        debug!(
-                            "Received {} position update(s)",
-                            positions.data.len()
-                        );
-
-                        // Process each position update
-                        for position in positions.data {
-                            if let Some(fill_event) = self.detect_fill_from_position(&position) {
-                                callback(fill_event);
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    debug!("Received message on channel: {}", channel);
-                }
+            }
+            FillDetectionWsMessage::Pong { .. } => {
+                debug!("Received pong");
+            }
+            _ => {
+                // Unknown message type - ignore silently in hot path
             }
         }
 

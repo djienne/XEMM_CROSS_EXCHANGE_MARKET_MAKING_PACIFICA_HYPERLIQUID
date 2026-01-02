@@ -34,6 +34,13 @@ struct ProfitCalculation {
     hl_fee_usd: f64,
 }
 
+/// Pre-cached asset metadata for low-latency hedge execution
+#[derive(Debug, Clone)]
+pub struct CachedAssetMeta {
+    pub asset_id: u32,
+    pub sz_decimals: i32,
+}
+
 /// Hedge execution service
 ///
 /// Receives hedge triggers via mpsc channel and executes the hedge flow:
@@ -51,6 +58,8 @@ pub struct HedgeService {
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub shutdown_tx: mpsc::Sender<()>,
+    /// Pre-cached asset metadata (asset_id, sz_decimals) for low-latency hedge
+    pub cached_asset_meta: Option<CachedAssetMeta>,
 }
 
 impl HedgeService {
@@ -692,13 +701,25 @@ impl HedgeService {
         bid: f64,
         ask: f64,
     ) -> anyhow::Result<crate::connector::hyperliquid::OrderResponse> {
-        let payload = self.hyperliquid_trading
-            .build_market_order_request(
-                &self.config.symbol, is_buy, size,
-                self.config.hyperliquid_slippage, false,
-                Some(bid), Some(ask),
-            )
-            .await?;
+        // Use pre-cached metadata if available (avoids RwLock on hot path)
+        let payload = if let Some(ref meta) = self.cached_asset_meta {
+            self.hyperliquid_trading
+                .build_market_order_request_with_meta(
+                    &self.config.symbol, is_buy, size,
+                    self.config.hyperliquid_slippage, false,
+                    Some(bid), Some(ask),
+                    meta.asset_id, meta.sz_decimals,
+                )
+                .await?
+        } else {
+            self.hyperliquid_trading
+                .build_market_order_request(
+                    &self.config.symbol, is_buy, size,
+                    self.config.hyperliquid_slippage, false,
+                    Some(bid), Some(ask),
+                )
+                .await?
+        };
 
         *request_id_counter += 1;
         let request_id = *request_id_counter;
