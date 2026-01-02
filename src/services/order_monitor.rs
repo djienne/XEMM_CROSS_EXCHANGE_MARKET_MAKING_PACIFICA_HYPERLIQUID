@@ -177,7 +177,7 @@ impl OrderMonitorService {
     }
 
     /// Market-driven monitoring - triggered by incoming price updates.
-    pub fn check_on_market_event(&self, source: MarketSource) {
+    pub fn check_on_market_event(&self, _source: MarketSource) {
         // FAST PATH: Lock-free status check
         let status = self.atomic_status.load(Ordering::Acquire);
         if status != AtomicBotStatus::OrderPlaced as u8 {
@@ -202,11 +202,6 @@ impl OrderMonitorService {
                     self.config.order_refresh_interval_secs
                 ),
             });
-            return;
-        }
-
-        // Profit check only on Hyperliquid updates.
-        if !matches!(source, MarketSource::Hyperliquid) {
             return;
         }
 
