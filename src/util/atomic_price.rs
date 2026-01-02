@@ -41,6 +41,8 @@ impl AtomicPrice {
         loop {
             let seq1 = self.seq.load(Ordering::Acquire);
             if seq1 & 1 == 1 {
+                // Write in progress - spin with CPU hint
+                std::hint::spin_loop();
                 continue;
             }
             let bid = f64::from_bits(self.bid_bits.load(Ordering::Relaxed));
@@ -50,6 +52,8 @@ impl AtomicPrice {
             if seq1 == seq2 {
                 return PriceSnapshot { bid, ask, ts };
             }
+            // Inconsistent read - spin with CPU hint before retry
+            std::hint::spin_loop();
         }
     }
 

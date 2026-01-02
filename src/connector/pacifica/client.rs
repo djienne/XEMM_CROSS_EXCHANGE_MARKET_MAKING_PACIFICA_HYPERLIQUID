@@ -1,4 +1,4 @@
-use crate::connector::pacifica::types::*;
+use crate::connector::pacifica::types::{PingMessage, SubscribeMessage, WsMessage};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::{sleep, Duration, interval};
@@ -171,56 +171,38 @@ impl OrderbookClient {
         Ok(())
     }
 
-    /// Handle incoming WebSocket messages
+    /// Handle incoming WebSocket messages (single-pass parsing for low latency)
+    #[inline]
     fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
         F: FnMut(String, String, String, u64),
     {
-        // First try to parse as generic response to check channel
-        let response: WebSocketResponse = serde_json::from_str(text)?;
+        // Single-pass parsing using unified WsMessage enum
+        let msg: WsMessage = serde_json::from_str(text)?;
 
-        // Handle messages without channel field
-        let channel = match response.channel {
-            Some(ch) => ch,
-            None => {
-                debug!("[PACIFICA] Received message without channel field, ignoring: {}",
-                    if text.len() > 100 { &text[..100] } else { text });
-                return Ok(());
-            }
-        };
-
-        match channel.as_str() {
-            "pong" => {
-                debug!("[PACIFICA] Received pong response");
-                Ok(())
-            }
-            "book" => {
-                // Parse as orderbook response
-                let orderbook_response: OrderbookResponse = serde_json::from_str(text)?;
-                let orderbook_data = orderbook_response.data;
-
-                // Extract top of book
-                let tob = orderbook_data.get_top_of_book();
-
-                // Call the callback with top of book data
-                if let (Some(bid), Some(ask)) = (tob.best_bid, tob.best_ask) {
-                    callback(
-                        bid.price,
-                        ask.price,
-                        tob.symbol,
-                        tob.timestamp,
-                    );
-                } else {
-                    warn!("[PACIFICA] Incomplete top of book data received");
+        match msg {
+            WsMessage::Book { channel, data } if channel == "book" => {
+                // Extract top of book directly without extra allocation
+                if let (Some(bids), Some(asks)) = (data.levels.get(0), data.levels.get(1)) {
+                    if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
+                        callback(
+                            best_bid.price.clone(),
+                            best_ask.price.clone(),
+                            data.symbol,
+                            data.timestamp,
+                        );
+                    }
                 }
-
-                Ok(())
             }
-            other => {
-                debug!("[PACIFICA] Received unknown channel: {}", other);
-                Ok(())
+            WsMessage::Pong { channel } if channel == "pong" => {
+                // Pong received - no action needed
+            }
+            _ => {
+                // Unknown message type - ignore silently in hot path
             }
         }
+
+        Ok(())
     }
 }
 

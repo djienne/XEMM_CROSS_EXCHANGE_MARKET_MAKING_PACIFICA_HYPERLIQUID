@@ -39,12 +39,30 @@ pub struct L2BookPayload {
     pub mantissa: Option<u32>,
 }
 
-/// WebSocket response wrapper
+/// WebSocket response wrapper (kept for backwards compatibility)
 #[derive(Debug, Deserialize)]
 pub struct WebSocketResponse {
     pub channel: String,
     #[serde(default)]
     pub data: Option<serde_json::Value>,
+}
+
+/// Unified WebSocket message for single-pass parsing (hot path optimization)
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum HlWsMessage {
+    /// L2 Book subscription update
+    L2Book {
+        channel: String,
+        data: L2BookData,
+    },
+    /// Subscription confirmation
+    SubscriptionResponse {
+        channel: String,
+        data: serde_json::Value,
+    },
+    /// Unknown/ignored message
+    Unknown(serde_json::Value),
 }
 
 /// Generic WebSocket POST request wrapper (info or action)

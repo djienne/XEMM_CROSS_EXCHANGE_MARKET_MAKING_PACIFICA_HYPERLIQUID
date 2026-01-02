@@ -4,7 +4,7 @@ use tokio::time::{interval, sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
-use super::types::*;
+use super::types::{HlWsMessage, SubscriptionMessage, SubscriptionParams};
 
 const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
@@ -154,8 +154,6 @@ impl OrderbookClient {
 
                 // Send ping periodically
                 _ = ping_interval.tick() => {
-                    debug!("[HYPERLIQUID] Sending ping");
-                    debug!("[HYPERLIQUID] Sending ping");
                     write.send(Message::Ping(vec![])).await?;
                 }
             }
@@ -164,55 +162,39 @@ impl OrderbookClient {
         Ok(())
     }
 
-    /// Handle incoming WebSocket message
+    /// Handle incoming WebSocket message (single-pass parsing for low latency)
+    #[inline]
     async fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
         F: FnMut(String, String, String, u64) + Send + 'static,
     {
-        // Try to parse as generic response first
-        let response: WebSocketResponse = match serde_json::from_str(text) {
-            Ok(r) => r,
-            Err(e) => {
-                // Log at debug level - not all messages have a "channel" field
-                debug!("[HYPERLIQUID] Skipping non-standard message: {}", e);
-                return Ok(());
-            }
+        // Single-pass parsing using unified HlWsMessage enum
+        let msg: HlWsMessage = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(_) => return Ok(()), // Silently ignore unparseable messages in hot path
         };
 
-        match response.channel.as_str() {
-            "l2Book" => {
-                // Parse L2 book subscription response
-                match serde_json::from_str::<L2BookSubscriptionResponse>(text) {
-                    Ok(l2_response) => {
-                        let book_data = &l2_response.data;
-
-                        // Extract top of book
-                        if let Some(tob) = book_data.get_top_of_book() {
-                            debug!(
-                                "[HYPERLIQUID] TOB: Bid={} Ask={} ({} @ {})",
-                                tob.best_bid, tob.best_ask, tob.coin, tob.timestamp
-                            );
-
-                            callback(tob.best_bid, tob.best_ask, tob.coin, tob.timestamp);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[HYPERLIQUID] Failed to parse L2 book subscription: {}", e);
+        match msg {
+            HlWsMessage::L2Book { channel, data } if channel == "l2Book" => {
+                // Extract top of book directly without extra allocation
+                if data.levels.len() >= 2 {
+                    let bids = &data.levels[0];
+                    let asks = &data.levels[1];
+                    if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
+                        callback(
+                            best_bid.px.clone(),
+                            best_ask.px.clone(),
+                            data.coin,
+                            data.time,
+                        );
                     }
                 }
             }
-            "post" => {
-                // Keep for backward compatibility or other post requests
-                debug!("[HYPERLIQUID] Received post response (unexpected for subscription model)");
-            }
-            "pong" => {
-                debug!("[HYPERLIQUID] Received pong response");
-            }
-            "subscriptionResponse" => {
-                debug!("[HYPERLIQUID] Subscription confirmed");
+            HlWsMessage::SubscriptionResponse { channel, .. } if channel == "subscriptionResponse" => {
+                // Subscription confirmed - no action needed in hot path
             }
             _ => {
-                debug!("[HYPERLIQUID] Unknown channel: {}", response.channel);
+                // Unknown/other message types - ignore silently in hot path
             }
         }
 

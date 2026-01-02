@@ -28,7 +28,7 @@ pub struct PingMessage {
     pub method: String,
 }
 
-/// Generic websocket response
+/// Generic websocket response (kept for backwards compatibility)
 #[derive(Debug, Deserialize)]
 pub struct WebSocketResponse {
     pub channel: Option<String>,
@@ -36,11 +36,28 @@ pub struct WebSocketResponse {
     pub data: Option<serde_json::Value>,
 }
 
-/// Orderbook stream response
+/// Orderbook stream response (kept for backwards compatibility)
 #[derive(Debug, Deserialize)]
 pub struct OrderbookResponse {
     pub channel: String,
     pub data: OrderbookData,
+}
+
+/// Unified WebSocket message for single-pass parsing (hot path optimization)
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum WsMessage {
+    /// Orderbook update message
+    Book {
+        channel: String,
+        data: OrderbookData,
+    },
+    /// Pong response (channel only, no data)
+    Pong {
+        channel: String,
+    },
+    /// Unknown/ignored message
+    Unknown(serde_json::Value),
 }
 
 /// Orderbook data structure
