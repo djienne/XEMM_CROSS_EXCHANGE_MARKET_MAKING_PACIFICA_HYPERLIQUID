@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
@@ -490,7 +490,7 @@ impl XemmBot {
 
         'main: loop {
             while let Some(event) = market_events.pop() {
-                let status = self.atomic_status.load(std::sync::atomic::Ordering::Acquire);
+                let status = self.atomic_status.load(Ordering::Acquire);
                 if status == AtomicBotStatus::Complete as u8 || status == AtomicBotStatus::Error as u8 {
                     break 'main;
                 }
@@ -506,7 +506,7 @@ impl XemmBot {
 
                 let local_now_ms = now_epoch_ms();
                 let opp_timestamp = if event.ts > 0 { event.ts } else { local_now_ms };
-                let last_cancel_ms = self.last_cancel_ms.load(std::sync::atomic::Ordering::Acquire);
+                let last_cancel_ms = self.last_cancel_ms.load(Ordering::Acquire);
                 if last_cancel_ms != 0 && local_now_ms.saturating_sub(last_cancel_ms) < 3_000 {
                     continue;
                 }
@@ -546,7 +546,7 @@ impl XemmBot {
                 let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
 
                 if let Some(opp) = best_opp {
-                    if self.atomic_status.load(std::sync::atomic::Ordering::Acquire)
+                    if self.atomic_status.load(Ordering::Acquire)
                         != AtomicBotStatus::Idle as u8
                     {
                         continue;
