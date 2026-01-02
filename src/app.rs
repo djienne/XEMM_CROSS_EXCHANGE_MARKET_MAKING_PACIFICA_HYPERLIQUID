@@ -2,29 +2,28 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8};
 use std::time::{Duration, Instant};
-use tokio::signal;
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{debug, info};
+use tracing::{info, error};
 
-use crate::bot::{ActiveOrder, BotState, BotStatus};
+use crate::bot::{BotState, BotStatus};
 use crate::config::Config;
-use crate::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
+use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::{
     FillDetectionClient, FillDetectionConfig, PacificaCredentials, PacificaTrading,
-    PacificaWsTrading, OrderSide as PacificaOrderSide,
+    PacificaWsTrading,
 };
 use crate::services::{
     fill_detection::FillDetectionService, hedge::HedgeService,
-    order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks, sync_atomic_status, update_order_snapshot},
+    order_monitor::{OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks},
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     market_event::{MarketEventHub, MarketSource},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
     rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, ws_health::{WsHealth, WsHealthMonitor}, HedgeEvent,
 };
-use crate::strategy::{OpportunityEvaluator, OrderSide};
-use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
+use crate::strategy::OpportunityEvaluator;
+
 use crate::util::atomic_price::AtomicPrice;
 
 
@@ -80,230 +79,8 @@ pub struct XemmBot {
 
 impl XemmBot {
     /// Create and initialize a new XemmBot instance
-    ///
-    /// This performs all the wiring:
-    /// - Loads config and validates it
-    /// - Loads credentials from environment
-    /// - Creates all trading clients
-    /// - Pre-fetches Hyperliquid metadata
-    /// - Cancels existing orders
-    /// - Fetches Pacifica tick size
-    /// - Creates OpportunityEvaluator
-    /// - Initializes shared state and channels
     pub async fn new() -> Result<Self> {
-        use colored::Colorize;
-
-        info!("{}", "═══════════════════════════════════════════════════"
-                .bright_cyan()
-                .bold()
-        );
-        info!("{}", "  XEMM Bot - Cross-Exchange Market Making"
-                .bright_cyan()
-                .bold()
-        );
-        info!("{}", "═══════════════════════════════════════════════════"
-                .bright_cyan()
-                .bold()
-        );
-        info!("");
-
-        // Load configuration
-        let config = Config::load_default().context("Failed to load config.json")?;
-        config.validate().context("Invalid configuration")?;
-
-        info!("{} Symbol: {}",
-            "[CONFIG]".blue().bold(),
-            config.symbol.bright_white().bold()
-        );
-        info!("{} Order Notional: {}",
-            "[CONFIG]".blue().bold(),
-            format!("${:.2}", config.order_notional_usd).bright_white()
-        );
-        info!("{} Pacifica Maker Fee: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{} bps", config.pacifica_maker_fee_bps).bright_white()
-        );
-        info!("{} Hyperliquid Taker Fee: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{} bps", config.hyperliquid_taker_fee_bps).bright_white()
-        );
-        info!("{} Target Profit: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{} bps", config.profit_rate_bps).green().bold()
-        );
-        info!("{} Profit Cancel Threshold: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{} bps", config.profit_cancel_threshold_bps).yellow()
-        );
-        info!("{} Order Refresh Interval: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{} secs", config.order_refresh_interval_secs).bright_white()
-        );
-        info!("{} Pacifica REST Poll Interval: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{} secs", config.pacifica_rest_poll_interval_secs).bright_white()
-        );
-        info!("{} Active Order REST Poll Interval: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{} ms", config.pacifica_active_order_rest_poll_interval_ms).bright_white()
-        );
-        info!("{} Hyperliquid Market Order maximum allowed Slippage: {}",
-            "[CONFIG]".blue().bold(),
-            format!("{}%", config.hyperliquid_slippage * 100.0).bright_white()
-        );
-        info!("");
-
-        // Load credentials
-        dotenv::dotenv().ok();
-        let pacifica_credentials =
-            PacificaCredentials::from_env().context("Failed to load Pacifica credentials from environment")?;
-        let hyperliquid_credentials =
-            HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials from environment")?;
-
-        info!("{} {}",
-            "[INIT]".cyan().bold(),
-            "Credentials loaded successfully".green()
-        );
-
-        // Initialize trading clients
-        let pacifica_trading_main = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create main Pacifica trading client")?,
-        );
-        let pacifica_trading_fill = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create fill detection Pacifica trading client")?,
-        );
-        let pacifica_trading_rest_fill = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create REST fill detection Pacifica trading client")?,
-        );
-        let pacifica_trading_monitor = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create monitor Pacifica trading client")?,
-        );
-        let pacifica_trading_hedge = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create hedge Pacifica trading client")?,
-        );
-        let pacifica_trading_rest_poll = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create REST polling Pacifica trading client")?,
-        );
-
-        // Initialize WebSocket trading client for ultra-fast cancellations
-        let pacifica_ws_trading = Arc::new(PacificaWsTrading::new(pacifica_credentials.clone(), false)); // false = mainnet
-
-        let hyperliquid_trading = Arc::new(
-            HyperliquidTrading::new(hyperliquid_credentials, false)
-                .context("Failed to create Hyperliquid trading client")?,
-        );
-
-        info!("{} {}",
-            "[INIT]".cyan().bold(),
-            "Trading clients initialized (6 REST instances + WebSocket)".green()
-        );
-
-        // Pre-fetch Hyperliquid metadata (szDecimals, etc.) to reduce hedge latency
-        info!("{} Pre-fetching Hyperliquid metadata for {}...",
-            "[INIT]".cyan().bold(),
-            config.symbol.bright_white()
-        );
-        hyperliquid_trading
-            .get_meta()
-            .await
-            .context("Failed to pre-fetch Hyperliquid metadata")?;
-        info!("{} {} Hyperliquid metadata cached",
-            "[INIT]".cyan().bold(),
-            "✓".green().bold()
-        );
-
-        // Get market info to determine tick size
-        let pacifica_tick_size: f64 = {
-            let market_info = pacifica_trading_main
-                .get_market_info()
-                .await
-                .context("Failed to fetch Pacifica market info")?;
-            let symbol_info = market_info
-                .get(&config.symbol)
-                .with_context(|| format!("Symbol {} not found in market info", config.symbol))?;
-            symbol_info.tick_size.parse().context("Failed to parse tick size")?
-        };
-
-        info!("{} Pacifica tick size for {}: {}",
-            "[INIT]".cyan().bold(),
-            config.symbol.bright_white(),
-            format!("{}", pacifica_tick_size).bright_white()
-        );
-
-        // Create opportunity evaluator
-        let evaluator = OpportunityEvaluator::new(
-            config.pacifica_maker_fee_bps,
-            config.hyperliquid_taker_fee_bps,
-            config.profit_rate_bps,
-            pacifica_tick_size,
-        );
-
-        info!("{} {}",
-            "[INIT]".cyan().bold(),
-            "Opportunity evaluator created".green()
-        );
-
-        // Shared state for orderbook prices
-        let pacifica_prices = Arc::new(AtomicPrice::new()); // (bid, ask)
-        let hyperliquid_prices = Arc::new(AtomicPrice::new()); // (bid, ask)
-
-        // Shared bot state
-        let bot_state = Arc::new(RwLock::new(BotState::new()));
-
-        // Channels for communication
-        // Unbounded hedge event queue: producers never block when enqueueing,
-        // hedge executor processes events sequentially.
-        let (hedge_tx, hedge_rx) = mpsc::unbounded_channel::<HedgeEvent>(); // (side, size, avg_price, fill_timestamp)
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-
-        // Fill tracking state
-        let processed_fills = Arc::new(parking_lot::Mutex::new(HashSet::<String>::new()));
-        let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
-
-        info!("{} {}",
-            "[INIT]".cyan().bold(),
-            "State and channels initialized".green()
-        );
-        info!("");
-
-        // Initialize order monitor state (shared atomics)
-        let (atomic_status, last_cancel_ms) = {
-            let state = bot_state.read().await;
-            (state.status_atomic.clone(), state.last_cancel_ms.clone())
-        };
-        let order_snapshot = Arc::new(SharedOrderSnapshot::new());
-
-        Ok(XemmBot {
-            config,
-            bot_state,
-            pacifica_trading_main,
-            pacifica_trading_fill,
-            pacifica_trading_rest_fill,
-            pacifica_trading_monitor,
-            pacifica_trading_hedge,
-            pacifica_trading_rest_poll,
-            pacifica_ws_trading,
-            hyperliquid_trading,
-            pacifica_prices,
-            hyperliquid_prices,
-            evaluator,
-            processed_fills,
-            last_position_snapshot,
-            atomic_status,
-            last_cancel_ms,
-            order_snapshot,
-            hedge_tx,
-            hedge_rx: Some(hedge_rx),
-            shutdown_tx,
-            shutdown_rx: Some(shutdown_rx),
-            pacifica_credentials,
-        })
+        crate::bot::BotFactory::create().await
     }
 
     /// Run the bot - spawn all services and execute main loop
@@ -328,7 +105,10 @@ impl XemmBot {
             ping_interval_secs: self.config.ping_interval_secs,
         };
         tokio::spawn(async move {
-            pacifica_ob_service.run().await.ok();
+            if let Err(e) = pacifica_ob_service.run().await {
+                error!("{} {} Pacifica orderbook service exited: {}",
+                    "[ORDERBOOK]".cyan().bold(), "✗".red().bold(), e);
+            }
         });
 
         // Service 2: Hyperliquid Orderbook (WebSocket)
@@ -342,7 +122,10 @@ impl XemmBot {
             ping_interval_secs: self.config.ping_interval_secs,
         };
         tokio::spawn(async move {
-            hyperliquid_ob_service.run().await.ok();
+            if let Err(e) = hyperliquid_ob_service.run().await {
+                error!("{} {} Hyperliquid orderbook service exited: {}",
+                    "[ORDERBOOK]".cyan().bold(), "✗".red().bold(), e);
+            }
         });
 
         let ws_health_monitor = WsHealthMonitor {
@@ -392,6 +175,7 @@ impl XemmBot {
             baseline_updater,
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
+            min_hedge_notional: self.config.min_hedge_notional_usd,
         };
         tokio::spawn(async move {
             fill_service.run().await;
@@ -414,7 +198,7 @@ impl XemmBot {
             prices: self.hyperliquid_prices.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
             symbol: self.config.symbol.clone(),
-            poll_interval_secs: 2,
+            poll_interval_secs: self.config.hyperliquid_rest_poll_interval_secs,
         };
         tokio::spawn(async move {
             hyperliquid_rest_poll_service.run().await;
@@ -428,7 +212,7 @@ impl XemmBot {
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
-            min_hedge_notional: 10.0,
+            min_hedge_notional: self.config.min_hedge_notional_usd,
             poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
         };
         tokio::spawn(async move {
@@ -493,235 +277,42 @@ impl XemmBot {
         );
         info!("");
 
-        let mut order_placement_rate_limit = RateLimitTracker::new();
 
-        let sigint = signal::ctrl_c();
-        tokio::pin!(sigint);
-        
-        #[cfg(unix)]
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to setup SIGTERM handler");
 
-        let mut shutdown_rx = self.shutdown_rx.take().unwrap();
+            let opportunity_loop = crate::services::opportunity_loop::OpportunityLoopService::new(
+                self.config.clone(),
+                self.bot_state.clone(),
+                self.pacifica_trading_main.clone(),
+                self.pacifica_prices.clone(),
+                self.hyperliquid_prices.clone(),
+                self.evaluator.clone(),
+                self.atomic_status.clone(),
+                self.last_cancel_ms.clone(),
+                self.order_snapshot.clone(),
+                order_monitor_service.clone(),
+            );
 
-        let now_epoch_ms = || -> u64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        };
-
-        'main: loop {
-            while let Some(event) = market_events.pop() {
-                let status = self.atomic_status.load(Ordering::Acquire);
-                if status == AtomicBotStatus::Complete as u8 || status == AtomicBotStatus::Error as u8 {
-                    break 'main;
-                }
-
-                if !ws_health.is_healthy() {
-                    continue;
-                }
-
-                if status == AtomicBotStatus::OrderPlaced as u8 {
-                    order_monitor_service.check_on_market_event(event.source);
-                    continue;
-                }
-
-                if status != AtomicBotStatus::Idle as u8 {
-                    continue;
-                }
-
-                let local_now_ms = now_epoch_ms();
-                let opp_timestamp = if event.ts > 0 { event.ts } else { local_now_ms };
-                let last_cancel_ms = self.last_cancel_ms.load(Ordering::Acquire);
-                if last_cancel_ms != 0 && local_now_ms.saturating_sub(last_cancel_ms) < 3_000 {
-                    continue;
-                }
-
-                if order_placement_rate_limit.should_skip() {
-                    let remaining = order_placement_rate_limit.remaining_backoff_secs();
-                    if remaining as u64 % 5 == 0 || remaining < 1.0 {
-                        debug!(
-                            "[MAIN] Skipping order placement (rate limit backoff, {:.1}s remaining)",
-                            remaining
-                        );
+            // Run the opportunity loop (blocking until shutdown)
+            let shutdown_rx = self.shutdown_rx.take().unwrap();
+            if let Err(e) = opportunity_loop.run(&market_events, shutdown_rx).await {
+                match e.downcast_ref::<std::io::Error>() {
+                    Some(io_err) if io_err.kind() == std::io::ErrorKind::Interrupted => {
+                         // Ignore IO interruption (shutdown)
                     }
-                    continue;
-                }
-
-                let pac_snapshot = self.pacifica_prices.load();
-                let hl_snapshot = self.hyperliquid_prices.load();
-                let (pac_bid, pac_ask) = (pac_snapshot.bid, pac_snapshot.ask);
-                let (hl_bid, hl_ask) = (hl_snapshot.bid, hl_snapshot.ask);
-
-                if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {
-                    continue;
-                }
-
-                let buy_opp = self.evaluator.evaluate_buy_opportunity(
-                    hl_bid,
-                    self.config.order_notional_usd,
-                    opp_timestamp,
-                );
-                let sell_opp = self.evaluator.evaluate_sell_opportunity(
-                    hl_ask,
-                    self.config.order_notional_usd,
-                    opp_timestamp,
-                );
-
-                let pac_mid = (pac_bid + pac_ask) / 2.0;
-                let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
-
-                if let Some(opp) = best_opp {
-                    if self.atomic_status.load(Ordering::Acquire)
-                        != AtomicBotStatus::Idle as u8
-                    {
-                        continue;
-                    }
-
-                    let mut state = self.bot_state.write().await;
-                    if !state.is_idle() {
-                        continue;
-                    }
-
-                    info!(
-                        "{} {} @ {} → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
-                        format!("[{} OPPORTUNITY]", self.config.symbol).bright_green().bold(),
-                        opp.direction.as_str().bright_yellow().bold(),
-                        format!("${:.6}", opp.pacifica_price).cyan().bold(),
-                        format!("${:.6}", opp.hyperliquid_price).cyan(),
-                        format!("{:.4}", opp.size).bright_white(),
-                        format!("{:.2} bps", opp.initial_profit_bps).green().bold(),
-                        format!("${:.6}", pac_bid).cyan(),
-                        format!("${:.6}", pac_ask).cyan(),
-                        format!("${:.6}", hl_bid).cyan(),
-                        format!("${:.6}", hl_ask).cyan()
-                    );
-
-                    info!("{} Placing {} on Pacifica...",
-                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                        opp.direction.as_str().bright_yellow().bold()
-                    );
-
-                    let pacifica_side = match opp.direction {
-                        OrderSide::Buy => PacificaOrderSide::Buy,
-                        OrderSide::Sell => PacificaOrderSide::Sell,
-                    };
-
-                    match self.pacifica_trading_main
-                        .place_limit_order(
-                            &self.config.symbol,
-                            pacifica_side,
-                            opp.size,
-                            Some(opp.pacifica_price),
-                            0.0,
-                            Some(pac_bid),
-                            Some(pac_ask),
-                        )
-                        .await
-                    {
-                        Ok(order_data) => {
-                            order_placement_rate_limit.record_success();
-
-                            if let Some(client_order_id) = order_data.client_order_id {
-                                let order_id = order_data.order_id.unwrap_or(0);
-                                info!(
-                                    "{} {} Placed {} #{} @ {} | cloid: {}...{}",
-                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                    "✓".green().bold(),
-                                    opp.direction.as_str().bright_yellow(),
-                                    order_id,
-                                    format!("${:.4}", opp.pacifica_price).cyan().bold(),
-                                    &client_order_id[..8],
-                                    &client_order_id[client_order_id.len()-4..]
-                                );
-
-                                let active_order = ActiveOrder {
-                                    client_order_id,
-                                    symbol: self.config.symbol.clone(),
-                                    side: opp.direction,
-                                    price: opp.pacifica_price,
-                                    size: opp.size,
-                                    initial_profit_bps: opp.initial_profit_bps,
-                                    placed_at: Instant::now(),
-                                };
-
-                                state.set_active_order(active_order);
-
-                                sync_atomic_status(&self.atomic_status, &state.status);
-                                update_order_snapshot(
-                                    &self.order_snapshot,
-                                    opp.direction,
-                                    opp.pacifica_price,
-                                    opp.size,
-                                    opp.initial_profit_bps,
-                                );
-                            } else {
-                                info!("{} {} Order placed but no client_order_id returned",
-                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                    "✗".red().bold()
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if is_rate_limit_error(&e) {
-                                order_placement_rate_limit.record_error();
-                                let backoff_secs = order_placement_rate_limit.get_backoff_secs();
-                                info!(
-                                    "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                    "⚠".yellow().bold(),
-                                    backoff_secs,
-                                    order_placement_rate_limit.consecutive_errors()
-                                );
-                            } else {
-                                info!("{} {} Failed to place order: {}",
-                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                    "✗".red().bold(),
-                                    e.to_string().red()
-                                );
-                            }
-                        }
+                    _ => {
+                        error!("Opportunity loop error: {}", e);
                     }
                 }
             }
-
-            tokio::select! {
-                _ = market_events.notifier().notified() => {}
-
-                _ = &mut sigint => {
-                    info!("{} {} Received SIGINT (Ctrl+C), initiating graceful shutdown...",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
-                        "⚠".yellow().bold()
-                    );
-                    break;
-                }
-
-                _ = async {
-                    #[cfg(unix)]
-                    {
-                        sigterm.recv().await
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        std::future::pending::<Option<()>>().await
-                    }
-                } => {
-                    info!("{} {} Received SIGTERM (Docker shutdown), initiating graceful shutdown...",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
-                        "⚠".yellow().bold()
-                    );
-                    break;
-                }
-
-                _ = shutdown_rx.recv() => {
-                    info!("{} Shutdown signal received",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold()
-                    );
-                    break;
-                }
-            }
-        }
+            // Re-assign shutdown_rx to satisfy the compiler/struct if needed,
+            // or just break since we are shutting down.
+            // The `break` here is not strictly necessary as the function will return
+            // after this block, but it matches the original loop's exit logic.
+        // The original `main: loop` is replaced by the `opportunity_loop.run` call.
+        // The `break; }` from the instruction closes the implicit loop structure
+        // that the `opportunity_loop.run` call effectively replaces.
+        // Since `opportunity_loop.run` is blocking until shutdown,
+        // the code will proceed to cleanup after it returns.
 
         // ═══════════════════════════════════════════════════
         // SHUTDOWN CLEANUP

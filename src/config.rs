@@ -70,6 +70,30 @@ pub struct Config {
     /// Used by REST fill detection to poll more frequently when an order is active.
     #[serde(default = "default_pacifica_active_order_rest_poll_interval")]
     pub pacifica_active_order_rest_poll_interval_ms: u64,
+
+    /// Hyperliquid REST API polling interval in seconds (complement to WebSocket)
+    #[serde(default = "default_hyperliquid_rest_poll_interval")]
+    pub hyperliquid_rest_poll_interval_secs: u64,
+
+    /// Grace period (ms) to wait before re-evaluating orders after a cancellation
+    #[serde(default = "default_cancel_grace_period_ms")]
+    pub cancel_grace_period_ms: u64,
+
+    /// Wait time (seconds) after cancelling an order before placing a new one
+    #[serde(default = "default_post_cancel_wait_secs")]
+    pub post_cancel_wait_secs: f64,
+
+    /// Wait time (seconds) for trades to propagate to exchange APIs
+    #[serde(default = "default_trade_propagation_wait_secs")]
+    pub trade_propagation_wait_secs: u64,
+
+    /// Wait time (seconds) for position verification loop
+    #[serde(default = "default_position_verification_wait_secs")]
+    pub position_verification_wait_secs: u64,
+
+    /// Minimum notional value (USD) to trigger a hedge on partial fills
+    #[serde(default = "default_min_hedge_notional")]
+    pub min_hedge_notional_usd: f64,
 }
 
 // Default values
@@ -133,6 +157,30 @@ fn default_pacifica_active_order_rest_poll_interval() -> u64 {
     250 // 250 ms (aggressive but still avoids tight rate limits)
 }
 
+fn default_hyperliquid_rest_poll_interval() -> u64 {
+    2 // 2 seconds
+}
+
+fn default_cancel_grace_period_ms() -> u64 {
+    3000 // 3000 ms = 3 seconds
+}
+
+fn default_post_cancel_wait_secs() -> f64 {
+    3.0 // 3 seconds
+}
+
+fn default_trade_propagation_wait_secs() -> u64 {
+    20 // 20 seconds
+}
+
+fn default_position_verification_wait_secs() -> u64 {
+    8 // 8 seconds
+}
+
+fn default_min_hedge_notional() -> f64 {
+    10.0 // $10 USD minimum to hedge partial fills
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -152,6 +200,12 @@ impl Default for Config {
             hyperliquid_use_ws_for_hedge: default_hyperliquid_use_ws_for_hedge(),
             pacifica_rest_poll_interval_secs: default_pacifica_rest_poll_interval(),
             pacifica_active_order_rest_poll_interval_ms: default_pacifica_active_order_rest_poll_interval(),
+            hyperliquid_rest_poll_interval_secs: default_hyperliquid_rest_poll_interval(),
+            cancel_grace_period_ms: default_cancel_grace_period_ms(),
+            post_cancel_wait_secs: default_post_cancel_wait_secs(),
+            trade_propagation_wait_secs: default_trade_propagation_wait_secs(),
+            position_verification_wait_secs: default_position_verification_wait_secs(),
+            min_hedge_notional_usd: default_min_hedge_notional(),
         }
     }
 }

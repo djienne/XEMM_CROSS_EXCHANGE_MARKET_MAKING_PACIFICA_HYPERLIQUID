@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info};
 use colored::Colorize;
 use fast_float::parse;
 use parking_lot::Mutex;
@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
-use crate::services::HedgeEvent;
+use crate::services::{FillHandler, FillSource, FillType, HedgeEvent};
 use crate::strategy::OrderSide;
 
 /// Position-based fill detection service (4th layer - ground truth)
@@ -31,6 +31,17 @@ pub struct PositionMonitorService {
 
 impl PositionMonitorService {
     pub async fn run(self) {
+        // Create the unified fill handler (no baseline updater - we ARE the position monitor)
+        let fill_handler = FillHandler::new(
+            self.bot_state.clone(),
+            self.hedge_tx.clone(),
+            self.pacifica_trading.clone(),
+            self.pacifica_ws_trading.clone(),
+            self.symbol.clone(),
+            self.processed_fills.clone(),
+            None,
+        );
+
         loop {
             // Adaptive polling: fast when order active, slow when idle
             let has_active_order = {
@@ -86,6 +97,7 @@ impl PositionMonitorService {
                 continue;
             }
 
+            let has_active_order = active_order_info.is_some();
             let (client_order_id, order_side, _order_size) = active_order_info.unwrap();
 
             // Fetch current positions
@@ -130,11 +142,10 @@ impl PositionMonitorService {
 
                     // If delta is significant and matches order direction
                     if delta.abs() > 0.0001 && delta_matches_order {
-                        // Position changed in expected direction - fill detected!
                         let fill_size = delta.abs();
 
                         info!(
-                            "{} {} Position delta detected: {} {} → {} {} (Δ {:.4})",
+                            "{} {} Position delta detected: {} {} -> {} {} (delta {:.4})",
                             "[POSITION_MONITOR]".bright_cyan().bold(),
                             "⚡".yellow().bold(),
                             format!("{:.4}", last_signed).bright_white(),
@@ -144,16 +155,14 @@ impl PositionMonitorService {
                             format!("{:.4}", delta.abs()).green().bold()
                         );
 
-                        // CRITICAL FIX: Skip if this is first position change from None baseline (startup)
-                        // This prevents hedging the bot's first order fill which establishes initial position
-                        if last_snapshot.is_none() && last_signed.abs() < 0.0001 {
+                        // Skip if this is first position change from None baseline (startup)
+                        if last_snapshot.is_none() && last_signed.abs() < 0.0001 && has_active_order {
                             info!(
                                 "{} {} Skipping hedge for first position change from baseline (startup initialization)",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
-                                "ℹ".blue().bold()
+                                "i".blue().bold()
                             );
 
-                            // Update snapshot to prevent continuous detection
                             let mut snapshot = self.last_position_snapshot.lock();
                             *snapshot = Some(PositionSnapshot {
                                 amount: current_amount,
@@ -169,7 +178,6 @@ impl PositionMonitorService {
                             state.status.clone()
                         };
 
-                        // Skip if already filled, hedging, or complete
                         if matches!(
                             current_state,
                             crate::bot::BotStatus::Filled |
@@ -179,11 +187,10 @@ impl PositionMonitorService {
                             info!(
                                 "{} {} Fill already handled by primary detection (state: {:?}), skipping duplicate hedge",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
-                                "ℹ".blue().bold(),
+                                "i".blue().bold(),
                                 current_state
                             );
 
-                            // Update snapshot to prevent continuous detection
                             let mut snapshot = self.last_position_snapshot.lock();
                             *snapshot = Some(PositionSnapshot {
                                 amount: current_amount,
@@ -193,93 +200,42 @@ impl PositionMonitorService {
                             continue;
                         }
 
-                        // Check if already processed - use consistent fill_id format with WebSocket detection
-                        let fill_id = format!("full_{}", client_order_id);
-                        let should_process = {
-                            let mut processed = self.processed_fills.lock();
-                            if !processed.contains(&fill_id) {
-                                processed.insert(fill_id.clone());
-                                true
-                            } else {
-                                false
-                            }
-                        }; // MutexGuard is dropped here
-
-                        if should_process {
-                            info!(
-                                "{} {} FILL DETECTED via position change!",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
-                                "✓".green().bold()
-                            );
-
-                            // Update state to Filled
-                            {
-                                let mut state = self.bot_state.write().await;
-                                state.mark_filled(fill_size, order_side);
-                            }
-
-                            // Dual cancellation
-                            info!("{} {} Dual cancellation (REST + WebSocket)...",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
-                                "⚡".yellow().bold()
-                            );
-
-                            let rest_result = self.pacifica_trading
-                                .cancel_all_orders(false, Some(&self.symbol), false)
-                                .await;
-
-                            match rest_result {
-                                Ok(count) => {
-                                    info!("{} {} REST API cancelled {} order(s)",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "✓".green().bold(),
-                                        count
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("{} {} REST API cancel failed: {}",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "⚠".yellow().bold(),
-                                        e
-                                    );
-                                }
-                            }
-
-                            let ws_result = self.pacifica_ws_trading
-                                .cancel_all_orders_ws(false, Some(&self.symbol), false)
-                                .await;
-
-                            match ws_result {
-                                Ok(count) => {
-                                    info!("{} {} WebSocket cancelled {} order(s)",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "✓".green().bold(),
-                                        count
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("{} {} WebSocket cancel failed: {}",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "⚠".yellow().bold(),
-                                        e
-                                    );
-                                }
-                            }
-
-                            // Estimate fill price (use current entry price or mid)
-                            let estimated_price = current_position
-                                .and_then(|p| p.entry_price.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-
-                            info!("{} Triggering hedge for position-detected fill",
-                                "[POSITION_MONITOR]".bright_cyan().bold()
-                            );
-
-                            // Trigger hedge (with current timestamp since position monitor detects fills retroactively)
-                            let _ = self.hedge_tx.send((order_side, fill_size, estimated_price, std::time::Instant::now()));
-                        } else {
+                        // Check if already processed using unified handler
+                        if !fill_handler.try_mark_processed(FillType::Full, &client_order_id) {
                             debug!("[POSITION_MONITOR] Fill already processed by another detection method");
+                            let mut snapshot = self.last_position_snapshot.lock();
+                            *snapshot = Some(PositionSnapshot {
+                                amount: current_amount,
+                                side: current_side,
+                                last_check: std::time::Instant::now(),
+                            });
+                            continue;
                         }
+
+                        info!(
+                            "{} {} FILL DETECTED via position change!",
+                            "[POSITION_MONITOR]".bright_cyan().bold(),
+                            "✓".green().bold()
+                        );
+
+                        // Estimate fill price (use current entry price or mid)
+                        let estimated_price = current_position
+                            .and_then(|p| p.entry_price.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+
+                        // Process using unified handler
+                        let side_str = match order_side {
+                            OrderSide::Buy => "buy",
+                            OrderSide::Sell => "sell",
+                        };
+                        fill_handler.process_fill(
+                            FillSource::PositionDelta,
+                            FillType::Full,
+                            order_side,
+                            fill_size,
+                            estimated_price,
+                            Some(side_str),
+                        ).await;
 
                         // Update snapshot
                         let mut snapshot = self.last_position_snapshot.lock();

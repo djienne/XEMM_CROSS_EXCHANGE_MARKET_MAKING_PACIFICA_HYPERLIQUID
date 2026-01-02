@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 use uuid::Uuid;
+use async_trait::async_trait;
+use super::PacificaTradingClient;
 
 const MAINNET_REST_URL: &str = "https://api.pacifica.fi";
 
@@ -57,6 +59,15 @@ impl OrderSide {
         match self {
             OrderSide::Buy => "bid",
             OrderSide::Sell => "ask",
+        }
+    }
+}
+
+impl From<crate::strategy::OrderSide> for OrderSide {
+    fn from(side: crate::strategy::OrderSide) -> Self {
+        match side {
+            crate::strategy::OrderSide::Buy => OrderSide::Buy,
+            crate::strategy::OrderSide::Sell => OrderSide::Sell,
         }
     }
 }
@@ -376,7 +387,7 @@ impl PacificaTrading {
         let rounded = (price / tick).round() * tick;
 
         let decimal_places = if tick_size.contains('.') {
-            tick_size.split('.').nth(1).unwrap().len()
+            tick_size.split('.').nth(1).unwrap_or("").len()
         } else {
             0
         };
@@ -391,7 +402,7 @@ impl PacificaTrading {
         let rounded = (size / lot).round() * lot;
 
         let decimal_places = if lot_size.contains('.') {
-            lot_size.split('.').nth(1).unwrap().len()
+            lot_size.split('.').nth(1).unwrap_or("").len()
         } else {
             0
         };
@@ -444,142 +455,7 @@ impl PacificaTrading {
         Ok(bs58::encode(signature.to_bytes()).into_string())
     }
 
-    /// Place a limit order
-    ///
-    /// # Arguments
-    /// * `symbol` - Trading symbol (e.g., "SOL", "BTC")
-    /// * `side` - Order side (Buy or Sell)
-    /// * `size` - Order size
-    /// * `price` - Optional exact price. If None, uses mid_price_offset
-    /// * `mid_price_offset_pct` - Offset from mid price in percentage (default 1.0%)
-    /// * `current_bid` - Current best bid price (required if price is None)
-    /// * `current_ask` - Current best ask price (required if price is None)
-    pub async fn place_limit_order(
-        &self,
-        symbol: &str,
-        side: OrderSide,
-        size: f64,
-        price: Option<f64>,
-        mid_price_offset_pct: f64,
-        current_bid: Option<f64>,
-        current_ask: Option<f64>,
-    ) -> Result<OrderData> {
-        // Get market info and clone the strings we need
-        let market_info = self.get_market_info().await?;
-        let symbol_info = market_info
-            .get(symbol)
-            .context(format!("Market info not found for {}", symbol))?;
 
-        let tick_size = symbol_info.tick_size.clone();
-        let lot_size = symbol_info.lot_size.clone();
-
-        // Calculate price
-        let order_price = if let Some(p) = price {
-            p
-        } else {
-            // Calculate from mid price with offset
-            let bid = current_bid.context("current_bid required when price is None")?;
-            let ask = current_ask.context("current_ask required when price is None")?;
-            let mid = (bid + ask) / 2.0;
-
-            match side {
-                OrderSide::Buy => mid * (1.0 - mid_price_offset_pct / 100.0),
-                OrderSide::Sell => mid * (1.0 + mid_price_offset_pct / 100.0),
-            }
-        };
-
-        // Round to tick and lot size
-        let rounded_price = self.round_to_tick_size(order_price, tick_size.clone())?;
-        let rounded_size = self.round_to_lot_size(size, lot_size.clone())?;
-
-        info!(
-            "[PACIFICA] Placing {} order: {} {} @ ${} (tick: {}, lot: {})",
-            match side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" },
-            rounded_size,
-            symbol,
-            rounded_price,
-            tick_size,
-            lot_size
-        );
-
-        // Generate client order ID
-        let client_order_id = Uuid::new_v4().to_string();
-
-        // Build signature
-        let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window = 5000; // 5 seconds
-
-        let header = json!({
-            "type": "create_order",
-            "timestamp": timestamp,
-            "expiry_window": expiry_window
-        });
-
-        let payload = json!({
-            "symbol": symbol,
-            "price": rounded_price.to_string(),
-            "amount": rounded_size.to_string(),
-            "side": side.as_str(),
-            "tif": "ALO",  // Add Liquidity Only (post-only)
-            "reduce_only": false,
-            "client_order_id": client_order_id
-        });
-
-        let signature = self.sign_message(header, payload.clone())?;
-
-        // Build request
-        let request_body = serde_json::json!({
-            "account": self.credentials.account,
-            "signature": signature,
-            "timestamp": timestamp,
-            "expiry_window": expiry_window,
-            "symbol": symbol,
-            "price": rounded_price.to_string(),
-            "amount": rounded_size.to_string(),
-            "side": side.as_str(),
-            "tif": "ALO",
-            "reduce_only": false,
-            "client_order_id": client_order_id,
-            "agent_wallet": self.credentials.agent_wallet
-        });
-
-        debug!("[PACIFICA] Order request: {}", serde_json::to_string_pretty(&request_body)?);
-
-        // Send request
-        let url = format!("{}/api/v1/orders/create", self.rest_url);
-        let response = self.client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            anyhow::bail!("Order placement failed: {}", error_text);
-        }
-
-        let order_response: OrderResponse = response.json().await?;
-
-        let order_data = order_response.data
-            .context("No order data in response")?;
-
-        let order_id = order_data.order_id
-            .or(order_data.i)
-            .context("No order ID in response")?;
-
-        info!(
-            "[PACIFICA] Order placed successfully: ID={}, ClientID={}",
-            order_id,
-            client_order_id
-        );
-
-        Ok(OrderData {
-            order_id: Some(order_id),
-            i: Some(order_id),
-            client_order_id: Some(client_order_id),
-            symbol: Some(symbol.to_string()),
-        })
-    }
 
     /// Place a market order
     pub async fn place_market_order(
@@ -1026,5 +902,135 @@ pub fn canonicalize_json(value: &serde_json::Value) -> String {
 
             format!("{{{}}}", pairs.join(","))
         }
+    }
+}
+
+#[async_trait]
+impl PacificaTradingClient for PacificaTrading {
+    async fn place_limit_order(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        size: f64,
+        price: Option<f64>,
+        mid_price_offset_pct: f64,
+        current_bid: Option<f64>,
+        current_ask: Option<f64>,
+    ) -> Result<OrderData> {
+        // Get market info and clone the strings we need
+        let market_info = self.get_market_info().await?;
+        let symbol_info = market_info
+            .get(symbol)
+            .context(format!("Market info not found for {}", symbol))?;
+
+        let tick_size = symbol_info.tick_size.clone();
+        let lot_size = symbol_info.lot_size.clone();
+
+        // Calculate price
+        let order_price = if let Some(p) = price {
+            p
+        } else {
+            // Calculate from mid price with offset
+            let bid = current_bid.context("current_bid required when price is None")?;
+            let ask = current_ask.context("current_ask required when price is None")?;
+            let mid = (bid + ask) / 2.0;
+
+            match side {
+                OrderSide::Buy => mid * (1.0 - mid_price_offset_pct / 100.0),
+                OrderSide::Sell => mid * (1.0 + mid_price_offset_pct / 100.0),
+            }
+        };
+
+        // Round to tick and lot size
+        let rounded_price = self.round_to_tick_size(order_price, tick_size.clone())?;
+        let rounded_size = self.round_to_lot_size(size, lot_size.clone())?;
+
+        info!(
+            "[PACIFICA] Placing {} order: {} {} @ ${} (tick: {}, lot: {})",
+            match side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" },
+            rounded_size,
+            symbol,
+            rounded_price,
+            tick_size,
+            lot_size
+        );
+
+        // Generate client order ID
+        let client_order_id = Uuid::new_v4().to_string();
+
+        // Build signature
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let expiry_window = 5000; // 5 seconds
+
+        let header = json!({
+            "type": "create_order",
+            "timestamp": timestamp,
+            "expiry_window": expiry_window
+        });
+
+        let payload = json!({
+            "symbol": symbol,
+            "price": rounded_price.to_string(),
+            "amount": rounded_size.to_string(),
+            "side": side.as_str(),
+            "tif": "ALO",  // Add Liquidity Only (post-only)
+            "reduce_only": false,
+            "client_order_id": client_order_id
+        });
+
+        let signature = self.sign_message(header, payload.clone())?;
+
+        // Build request
+        let request_body = serde_json::json!({
+            "account": self.credentials.account,
+            "signature": signature,
+            "timestamp": timestamp,
+            "expiry_window": expiry_window,
+            "symbol": symbol,
+            "price": rounded_price.to_string(),
+            "amount": rounded_size.to_string(),
+            "side": side.as_str(),
+            "tif": "ALO",
+            "reduce_only": false,
+            "client_order_id": client_order_id,
+            "agent_wallet": self.credentials.agent_wallet
+        });
+
+        debug!("[PACIFICA] Order request: {}", serde_json::to_string_pretty(&request_body)?);
+
+        // Send request
+        let url = format!("{}/api/v1/orders/create", self.rest_url);
+        let response = self.client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Order placement failed: {}", error_text);
+        }
+
+        let order_response: OrderResponse = response.json().await?;
+
+        let order_data = order_response.data
+            .context("No order data in response")?;
+
+        let order_id = order_data.order_id
+            .or(order_data.i)
+            .context("No order ID in response")?;
+
+        info!(
+            "[PACIFICA] Order placed successfully: ID={}, ClientID={}",
+            order_id,
+            client_order_id
+        );
+
+        Ok(OrderData {
+            order_id: Some(order_id),
+            i: Some(order_id),
+            client_order_id: Some(client_order_id),
+            symbol: Some(symbol.to_string()),
+        })
     }
 }

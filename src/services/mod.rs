@@ -1,6 +1,7 @@
 /// Service modules - each task runs in its own service
 
 pub mod fill_detection;
+pub mod fill_handler;
 pub mod market_event;
 pub mod rest_fill_detection;
 pub mod position_monitor;
@@ -9,6 +10,9 @@ pub mod hedge;
 pub mod orderbook;
 pub mod rest_poll;
 pub mod ws_health;
+pub mod opportunity_loop;
+
+pub use fill_handler::{FillHandler, FillSource, FillType};
 
 use crate::strategy::OrderSide;
 

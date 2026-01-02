@@ -38,7 +38,6 @@ impl HyperliquidCredentials {
 
     /// Hyperliquid trading client
     pub struct HyperliquidTrading {
-        credentials: HyperliquidCredentials,
         info_url: String,
         exchange_url: String,
     client: Client,
@@ -65,7 +64,6 @@ impl HyperliquidTrading {
             .context("Failed to create wallet from private key")?;
 
         Ok(Self {
-            credentials,
             info_url,
             exchange_url,
             client: Client::new(),
