@@ -504,9 +504,10 @@ impl XemmBot {
                     continue;
                 }
 
-                let now_ms = if event.ts > 0 { event.ts } else { now_epoch_ms() };
+                let local_now_ms = now_epoch_ms();
+                let opp_timestamp = if event.ts > 0 { event.ts } else { local_now_ms };
                 let last_cancel_ms = self.last_cancel_ms.load(std::sync::atomic::Ordering::Acquire);
-                if last_cancel_ms != 0 && now_ms.saturating_sub(last_cancel_ms) < 3_000 {
+                if last_cancel_ms != 0 && local_now_ms.saturating_sub(last_cancel_ms) < 3_000 {
                     continue;
                 }
 
@@ -533,12 +534,12 @@ impl XemmBot {
                 let buy_opp = self.evaluator.evaluate_buy_opportunity(
                     hl_bid,
                     self.config.order_notional_usd,
-                    now_ms,
+                    opp_timestamp,
                 );
                 let sell_opp = self.evaluator.evaluate_sell_opportunity(
                     hl_ask,
                     self.config.order_notional_usd,
-                    now_ms,
+                    opp_timestamp,
                 );
 
                 let pac_mid = (pac_bid + pac_ask) / 2.0;
