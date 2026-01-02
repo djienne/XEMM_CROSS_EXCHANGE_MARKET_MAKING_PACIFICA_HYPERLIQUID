@@ -101,6 +101,7 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 - ✅ **Auto-reconnect** - Exponential backoff on connection failures
 - ✅ **Concurrent Tasks** - 10 async tasks running in parallel
 - ✅ **Event-driven Monitoring** - Profit checks and opportunity evaluation react to WS updates
+- ✅ **Startup Sanity Checks** - Verify WS feeds + trading API access before trading
 - ✅ **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
 - ✅ **Graceful Shutdown** - Cancels orders on Ctrl+C
 
@@ -256,7 +257,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 
 ## Trading Workflow
 
-1. **Startup**: Cancel all existing Pacifica orders
+1. **Startup**: Verify orderbook WS + trading API access, then cancel existing Pacifica orders
 2. **Wait**: Gather initial orderbook data (3s warmup)
 3. **Evaluate**: Check both BUY and SELL opportunities on every orderbook update
 4. **Calculate & Place**: Calculate Pacifica limit price from Hyperliquid hedge price with target profit margin (`profit_rate_bps`) embedded, place order if still profitable after rounding
