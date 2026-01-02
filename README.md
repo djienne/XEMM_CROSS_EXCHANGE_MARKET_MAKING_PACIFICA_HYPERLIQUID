@@ -100,7 +100,7 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 - ✅ **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
 - ✅ **Auto-reconnect** - Exponential backoff on connection failures
 - ✅ **Concurrent Tasks** - 10 async tasks running in parallel
-- ✅ **High-frequency Monitoring** - 25ms profit checks, 100ms opportunity evaluation
+- ✅ **Event-driven Monitoring** - Profit checks and opportunity evaluation react to WS updates
 - ✅ **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
 - ✅ **Graceful Shutdown** - Cancels orders on Ctrl+C
 
@@ -231,9 +231,9 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
 6. **REST API Fill Detection** - Backup fill polling (every 500ms)
 7. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
-8. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
+8. **Order Monitoring** - Profit tracking and order refresh (event-driven on price updates)
 9. **Hedge Execution** - Executes Hyperliquid hedge after fill
-10. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
+10. **Main Opportunity Loop** - Evaluates and places orders (event-driven on orderbook updates)
 
 ## Configuration Parameters
 
@@ -258,9 +258,9 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 
 1. **Startup**: Cancel all existing Pacifica orders
 2. **Wait**: Gather initial orderbook data (3s warmup)
-3. **Evaluate**: Check both BUY and SELL opportunities every 100ms
+3. **Evaluate**: Check both BUY and SELL opportunities on every orderbook update
 4. **Calculate & Place**: Calculate Pacifica limit price from Hyperliquid hedge price with target profit margin (`profit_rate_bps`) embedded, place order if still profitable after rounding
-5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >60s
+5. **Monitor**: Track profit on price updates, cancel if deviation >3 bps or age >60s
 6. **Fill Detection**: 5-layer system detects when order fills
    - WebSocket fill detection (primary, real-time via account_order_updates)
    - WebSocket position detection (redundancy, real-time via account_positions)

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
@@ -17,6 +16,7 @@ use crate::connector::hyperliquid::types::{WsPostRequest, WsPostRequestInner, Ws
 use crate::connector::pacifica::PacificaTrading;
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
+use crate::util::atomic_price::AtomicPrice;
 use crate::trade_fetcher;
 use crate::csv_logger;
 
@@ -41,7 +41,7 @@ type WsRead = futures_util::stream::SplitStream<WsStream>;
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_rx: mpsc::UnboundedReceiver<HedgeEvent>,
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+    pub hyperliquid_prices: Arc<AtomicPrice>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub pacifica_trading: Arc<PacificaTrading>,
@@ -152,7 +152,7 @@ impl HedgeService {
                 OrderSide::Sell => true, // Filled sell on Pacifica → buy on Hyperliquid
             };
 
-            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock();
+            let (mut hl_bid, mut hl_ask) = self.hyperliquid_prices.load_bid_ask();
 
             if hl_bid <= 0.0 || hl_ask <= 0.0 {
                 warn!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
@@ -166,8 +166,7 @@ impl HedgeService {
                         Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
                             hl_bid = bid;
                             hl_ask = ask;
-                            let mut cache = self.hyperliquid_prices.lock();
-                            *cache = (bid, ask);
+                            self.hyperliquid_prices.store(bid, ask, 0);
                             info!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✓".green().bold(),
@@ -197,7 +196,7 @@ impl HedgeService {
 
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let cached = *self.hyperliquid_prices.lock();
+                        let cached = self.hyperliquid_prices.load_bid_ask();
                         hl_bid = cached.0;
                         hl_ask = cached.1;
                         if hl_bid > 0.0 && hl_ask > 0.0 {

@@ -1,7 +1,7 @@
 use crate::strategy::OrderSide;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Bot status enumeration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,8 +50,8 @@ pub struct BotState {
     pub status: BotStatus,
     /// Atomic status for fast lock-free checks (0=Idle, 1=OrderPlaced, 2=Filled, 3=Hedging, 4=Complete, 5=Error)
     pub status_atomic: Arc<AtomicU8>,
-    /// Last time an order was cancelled (for grace period enforcement)
-    pub last_cancellation_time: Option<Instant>,
+    /// Last cancellation time in epoch ms (0 = none)
+    pub last_cancel_ms: Arc<AtomicU64>,
 }
 
 impl BotState {
@@ -62,7 +62,7 @@ impl BotState {
             position: 0.0,
             status: BotStatus::Idle,
             status_atomic: Arc::new(AtomicU8::new(0)), // 0 = Idle
-            last_cancellation_time: None,
+            last_cancel_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -78,7 +78,11 @@ impl BotState {
         self.active_order = None;
         self.status = BotStatus::Idle;
         self.status_atomic.store(0, Ordering::Release); // 0 = Idle
-        self.last_cancellation_time = Some(Instant::now());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_cancel_ms.store(now_ms, Ordering::Release);
     }
 
     /// Mark order as filled
@@ -139,11 +143,12 @@ impl BotState {
 
     /// Check if the grace period has passed since last cancellation
     /// Returns true if no cancellation or if grace_period_secs has elapsed
-    pub fn grace_period_elapsed(&self, grace_period_secs: u64) -> bool {
-        match self.last_cancellation_time {
-            None => true, // No previous cancellation
-            Some(last_cancel) => last_cancel.elapsed().as_secs() >= grace_period_secs,
+    pub fn grace_period_elapsed(&self, now_ms: u64, grace_period_secs: u64) -> bool {
+        let last_ms = self.last_cancel_ms.load(Ordering::Acquire);
+        if last_ms == 0 {
+            return true;
         }
+        now_ms.saturating_sub(last_ms) >= grace_period_secs * 1000
     }
 }
 

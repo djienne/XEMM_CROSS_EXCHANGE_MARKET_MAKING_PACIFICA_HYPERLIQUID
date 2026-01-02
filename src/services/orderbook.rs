@@ -1,19 +1,21 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use fast_float::parse;
 use tracing::info;
 
+use crate::services::market_event::{MarketEvent, MarketEventHub, MarketSource};
 use crate::connector::pacifica::{OrderbookClient as PacificaOrderbookClient, OrderbookConfig as PacificaOrderbookConfig};
 use crate::connector::hyperliquid::{OrderbookClient as HyperliquidOrderbookClient, OrderbookConfig as HyperliquidOrderbookConfig};
+use crate::util::atomic_price::AtomicPrice;
 
 /// Pacifica orderbook service
 ///
 /// Subscribes to Pacifica orderbook WebSocket and updates shared price state.
 /// Provides real-time bid/ask prices for opportunity evaluation.
 pub struct PacificaOrderbookService {
-    pub prices: Arc<Mutex<(f64, f64)>>,
+    pub prices: Arc<AtomicPrice>,
+    pub market_events: Arc<MarketEventHub>,
     pub symbol: String,
     pub agg_level: u32,
     pub reconnect_attempts: u32,
@@ -23,6 +25,7 @@ pub struct PacificaOrderbookService {
 impl PacificaOrderbookService {
     pub async fn run(self) -> Result<()> {
         let pac_prices_clone = self.prices.clone();
+        let market_events = self.market_events.clone();
         let pacifica_ob_config = PacificaOrderbookConfig {
             symbol: self.symbol.clone(),
             agg_level: self.agg_level,
@@ -38,7 +41,10 @@ impl PacificaOrderbookService {
             .start(move |bid, ask, _symbol, _ts| {
                 let bid_price: f64 = parse(&bid).unwrap_or(0.0);
                 let ask_price: f64 = parse(&ask).unwrap_or(0.0);
-                *pac_prices_clone.lock() = (bid_price, ask_price);
+                if bid_price > 0.0 && ask_price > 0.0 {
+                    pac_prices_clone.store(bid_price, ask_price, _ts);
+                    market_events.push(MarketEvent { source: MarketSource::Pacifica, ts: _ts });
+                }
             })
             .await
             .ok();
@@ -52,7 +58,8 @@ impl PacificaOrderbookService {
 /// Subscribes to Hyperliquid orderbook WebSocket and updates shared price state.
 /// Provides real-time bid/ask prices for hedge execution.
 pub struct HyperliquidOrderbookService {
-    pub prices: Arc<Mutex<(f64, f64)>>,
+    pub prices: Arc<AtomicPrice>,
+    pub market_events: Arc<MarketEventHub>,
     pub symbol: String,
     pub reconnect_attempts: u32,
     pub ping_interval_secs: u64,
@@ -61,6 +68,7 @@ pub struct HyperliquidOrderbookService {
 impl HyperliquidOrderbookService {
     pub async fn run(self) -> Result<()> {
         let hl_prices_clone = self.prices.clone();
+        let market_events = self.market_events.clone();
         let hyperliquid_ob_config = HyperliquidOrderbookConfig {
             coin: self.symbol.clone(),
             reconnect_attempts: self.reconnect_attempts,
@@ -75,7 +83,10 @@ impl HyperliquidOrderbookService {
             .start(move |bid, ask, _coin, _ts| {
                 let bid_price: f64 = parse(&bid).unwrap_or(0.0);
                 let ask_price: f64 = parse(&ask).unwrap_or(0.0);
-                *hl_prices_clone.lock() = (bid_price, ask_price);
+                if bid_price > 0.0 && ask_price > 0.0 {
+                    hl_prices_clone.store(bid_price, ask_price, _ts);
+                    market_events.push(MarketEvent { source: MarketSource::Hyperliquid, ts: _ts });
+                }
             })
             .await
             .ok();

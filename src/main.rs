@@ -19,10 +19,10 @@ use anyhow::Result;
 /// 4.5. Hyperliquid REST Polling (orderbook fallback, every 2s)
 /// 5. REST API Fill Detection (backup, 500ms polling with rate limit handling)
 /// 5.5. Position Monitor (4th layer, ground truth, 500ms polling)
-/// 6. Order Monitoring (profit/age checks, every 25ms)
+/// 6. Order Monitoring (profit/age checks, event-driven on price updates)
 /// 7. Hedge Execution
-/// 8. Main Opportunity Loop (every 100ms)
-#[tokio::main]
+/// 8. Main Opportunity Loop (event-driven on orderbook updates)
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()

@@ -2,13 +2,11 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicU8};
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::interval;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::bot::{ActiveOrder, BotState, BotStatus};
 use crate::config::Config;
@@ -21,11 +19,13 @@ use crate::services::{
     fill_detection::FillDetectionService, hedge::HedgeService,
     order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks, sync_atomic_status, update_order_snapshot},
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
+    market_event::{MarketEventHub, MarketSource},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
     rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
 };
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
+use crate::util::atomic_price::AtomicPrice;
 
 
 
@@ -53,8 +53,8 @@ pub struct XemmBot {
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
 
     // Shared state (prices)
-    pub pacifica_prices: Arc<Mutex<(f64, f64)>>, // (bid, ask)
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>, // (bid, ask)
+    pub pacifica_prices: Arc<AtomicPrice>, // (bid, ask)
+    pub hyperliquid_prices: Arc<AtomicPrice>, // (bid, ask)
 
     // Opportunity evaluator
     pub evaluator: OpportunityEvaluator,
@@ -65,6 +65,7 @@ pub struct XemmBot {
 
     // Order monitor state (lock-free)
     pub atomic_status: Arc<AtomicU8>,
+    pub last_cancel_ms: Arc<AtomicU64>,
     pub order_snapshot: Arc<SharedOrderSnapshot>,
 
     // Channels
@@ -217,26 +218,6 @@ impl XemmBot {
             "✓".green().bold()
         );
 
-        // Cancel any existing orders on Pacifica at startup
-        info!("{} Cancelling any existing orders on Pacifica...",
-            "[INIT]".cyan().bold()
-        );
-        match pacifica_trading_main
-            .cancel_all_orders(false, Some(&config.symbol), false)
-            .await
-        {
-            Ok(count) => info!("{} {} Cancelled {} existing order(s)",
-                "[INIT]".cyan().bold(),
-                "✓".green().bold(),
-                count
-            ),
-            Err(e) => info!("{} {} Failed to cancel existing orders: {}",
-                "[INIT]".cyan().bold(),
-                "⚠".yellow().bold(),
-                e
-            ),
-        }
-
         // Get market info to determine tick size
         let pacifica_tick_size: f64 = {
             let market_info = pacifica_trading_main
@@ -269,8 +250,8 @@ impl XemmBot {
         );
 
         // Shared state for orderbook prices
-        let pacifica_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
-        let hyperliquid_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
+        let pacifica_prices = Arc::new(AtomicPrice::new()); // (bid, ask)
+        let hyperliquid_prices = Arc::new(AtomicPrice::new()); // (bid, ask)
 
         // Shared bot state
         let bot_state = Arc::new(RwLock::new(BotState::new()));
@@ -291,8 +272,11 @@ impl XemmBot {
         );
         info!("");
 
-        // Initialize order monitor state
-        let atomic_status = Arc::new(AtomicU8::new(AtomicBotStatus::Idle as u8));
+        // Initialize order monitor state (shared atomics)
+        let (atomic_status, last_cancel_ms) = {
+            let state = bot_state.read().await;
+            (state.status_atomic.clone(), state.last_cancel_ms.clone())
+        };
         let order_snapshot = Arc::new(SharedOrderSnapshot::new());
 
         Ok(XemmBot {
@@ -312,6 +296,7 @@ impl XemmBot {
             processed_fills,
             last_position_snapshot,
             atomic_status,
+            last_cancel_ms,
             order_snapshot,
             hedge_tx,
             hedge_rx: Some(hedge_rx),
@@ -324,12 +309,14 @@ impl XemmBot {
     /// Run the bot - spawn all services and execute main loop
     pub async fn run(mut self) -> Result<()> {
         // ═══════════════════════════════════════════════════
-        // SPAWN ALL SERVICES
+        // PRE-FLIGHT: ORDERBOOK WS + TRADING API SANITY
         // ═══════════════════════════════════════════════════
+        let market_events = Arc::new(MarketEventHub::new(1024));
 
         // Service 1: Pacifica Orderbook (WebSocket)
         let pacifica_ob_service = PacificaOrderbookService {
             prices: self.pacifica_prices.clone(),
+            market_events: market_events.clone(),
             symbol: self.config.symbol.clone(),
             agg_level: self.config.agg_level,
             reconnect_attempts: self.config.reconnect_attempts,
@@ -342,6 +329,7 @@ impl XemmBot {
         // Service 2: Hyperliquid Orderbook (WebSocket)
         let hyperliquid_ob_service = HyperliquidOrderbookService {
             prices: self.hyperliquid_prices.clone(),
+            market_events: market_events.clone(),
             symbol: self.config.symbol.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
@@ -349,6 +337,17 @@ impl XemmBot {
         tokio::spawn(async move {
             hyperliquid_ob_service.run().await.ok();
         });
+
+        self.wait_for_ws_ready(&market_events).await?;
+        self.verify_trading_ready().await?;
+
+        // Cancel any existing orders on Pacifica only after sanity checks
+        self.cancel_existing_orders().await?;
+
+        // ═══════════════════════════════════════════════════
+        // SPAWN ALL SERVICES
+        // ═══════════════════════════════════════════════════
+
         let fill_config = FillDetectionConfig {
             account: self.pacifica_credentials.account.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
@@ -398,10 +397,6 @@ impl XemmBot {
             hyperliquid_rest_poll_service.run().await;
         });
 
-        // Wait for initial orderbook data
-        info!("{} Waiting for orderbook data...", "[INIT]".cyan().bold());
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
         // Service 5: REST Fill Detection (backup)
         let rest_fill_service = RestFillDetectionService {
             bot_state: self.bot_state.clone(),
@@ -450,7 +445,7 @@ impl XemmBot {
             self.hyperliquid_trading.clone(),
         );
         let order_monitor_service = Arc::new(order_monitor_service);
-        spawn_monitor_tasks(order_monitor_service, cancel_rx);
+        spawn_monitor_tasks(order_monitor_service.clone(), cancel_rx);
 
         // Service 7: Hedge Execution
         let hedge_service = HedgeService {
@@ -475,7 +470,6 @@ impl XemmBot {
         );
         info!("");
 
-        let mut eval_interval = interval(Duration::from_millis(1));
         let mut order_placement_rate_limit = RateLimitTracker::new();
 
         let sigint = signal::ctrl_c();
@@ -487,8 +481,186 @@ impl XemmBot {
 
         let mut shutdown_rx = self.shutdown_rx.take().unwrap();
 
-        loop {
+        let now_epoch_ms = || -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        };
+
+        'main: loop {
+            while let Some(event) = market_events.pop() {
+                let status = self.atomic_status.load(std::sync::atomic::Ordering::Acquire);
+                if status == AtomicBotStatus::Complete as u8 || status == AtomicBotStatus::Error as u8 {
+                    break 'main;
+                }
+
+                if status == AtomicBotStatus::OrderPlaced as u8 {
+                    order_monitor_service.check_on_market_event(event.source);
+                    continue;
+                }
+
+                if status != AtomicBotStatus::Idle as u8 {
+                    continue;
+                }
+
+                let now_ms = if event.ts > 0 { event.ts } else { now_epoch_ms() };
+                let last_cancel_ms = self.last_cancel_ms.load(std::sync::atomic::Ordering::Acquire);
+                if last_cancel_ms != 0 && now_ms.saturating_sub(last_cancel_ms) < 3_000 {
+                    continue;
+                }
+
+                if order_placement_rate_limit.should_skip() {
+                    let remaining = order_placement_rate_limit.remaining_backoff_secs();
+                    if remaining as u64 % 5 == 0 || remaining < 1.0 {
+                        debug!(
+                            "[MAIN] Skipping order placement (rate limit backoff, {:.1}s remaining)",
+                            remaining
+                        );
+                    }
+                    continue;
+                }
+
+                let pac_snapshot = self.pacifica_prices.load();
+                let hl_snapshot = self.hyperliquid_prices.load();
+                let (pac_bid, pac_ask) = (pac_snapshot.bid, pac_snapshot.ask);
+                let (hl_bid, hl_ask) = (hl_snapshot.bid, hl_snapshot.ask);
+
+                if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {
+                    continue;
+                }
+
+                let buy_opp = self.evaluator.evaluate_buy_opportunity(
+                    hl_bid,
+                    self.config.order_notional_usd,
+                    now_ms,
+                );
+                let sell_opp = self.evaluator.evaluate_sell_opportunity(
+                    hl_ask,
+                    self.config.order_notional_usd,
+                    now_ms,
+                );
+
+                let pac_mid = (pac_bid + pac_ask) / 2.0;
+                let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
+
+                if let Some(opp) = best_opp {
+                    if self.atomic_status.load(std::sync::atomic::Ordering::Acquire)
+                        != AtomicBotStatus::Idle as u8
+                    {
+                        continue;
+                    }
+
+                    let mut state = self.bot_state.write().await;
+                    if !state.is_idle() {
+                        continue;
+                    }
+
+                    info!(
+                        "{} {} @ {} → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
+                        format!("[{} OPPORTUNITY]", self.config.symbol).bright_green().bold(),
+                        opp.direction.as_str().bright_yellow().bold(),
+                        format!("${:.6}", opp.pacifica_price).cyan().bold(),
+                        format!("${:.6}", opp.hyperliquid_price).cyan(),
+                        format!("{:.4}", opp.size).bright_white(),
+                        format!("{:.2} bps", opp.initial_profit_bps).green().bold(),
+                        format!("${:.6}", pac_bid).cyan(),
+                        format!("${:.6}", pac_ask).cyan(),
+                        format!("${:.6}", hl_bid).cyan(),
+                        format!("${:.6}", hl_ask).cyan()
+                    );
+
+                    info!("{} Placing {} on Pacifica...",
+                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                        opp.direction.as_str().bright_yellow().bold()
+                    );
+
+                    let pacifica_side = match opp.direction {
+                        OrderSide::Buy => PacificaOrderSide::Buy,
+                        OrderSide::Sell => PacificaOrderSide::Sell,
+                    };
+
+                    match self.pacifica_trading_main
+                        .place_limit_order(
+                            &self.config.symbol,
+                            pacifica_side,
+                            opp.size,
+                            Some(opp.pacifica_price),
+                            0.0,
+                            Some(pac_bid),
+                            Some(pac_ask),
+                        )
+                        .await
+                    {
+                        Ok(order_data) => {
+                            order_placement_rate_limit.record_success();
+
+                            if let Some(client_order_id) = order_data.client_order_id {
+                                let order_id = order_data.order_id.unwrap_or(0);
+                                info!(
+                                    "{} {} Placed {} #{} @ {} | cloid: {}...{}",
+                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                    "✓".green().bold(),
+                                    opp.direction.as_str().bright_yellow(),
+                                    order_id,
+                                    format!("${:.4}", opp.pacifica_price).cyan().bold(),
+                                    &client_order_id[..8],
+                                    &client_order_id[client_order_id.len()-4..]
+                                );
+
+                                let active_order = ActiveOrder {
+                                    client_order_id,
+                                    symbol: self.config.symbol.clone(),
+                                    side: opp.direction,
+                                    price: opp.pacifica_price,
+                                    size: opp.size,
+                                    initial_profit_bps: opp.initial_profit_bps,
+                                    placed_at: Instant::now(),
+                                };
+
+                                state.set_active_order(active_order);
+
+                                sync_atomic_status(&self.atomic_status, &state.status);
+                                update_order_snapshot(
+                                    &self.order_snapshot,
+                                    opp.direction,
+                                    opp.pacifica_price,
+                                    opp.size,
+                                    opp.initial_profit_bps,
+                                );
+                            } else {
+                                info!("{} {} Order placed but no client_order_id returned",
+                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                    "✗".red().bold()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if is_rate_limit_error(&e) {
+                                order_placement_rate_limit.record_error();
+                                let backoff_secs = order_placement_rate_limit.get_backoff_secs();
+                                info!(
+                                    "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
+                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                    "⚠".yellow().bold(),
+                                    backoff_secs,
+                                    order_placement_rate_limit.consecutive_errors()
+                                );
+                            } else {
+                                info!("{} {} Failed to place order: {}",
+                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                    "✗".red().bold(),
+                                    e.to_string().red()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             tokio::select! {
+                _ = market_events.notifier().notified() => {}
+
                 _ = &mut sigint => {
                     info!("{} {} Received SIGINT (Ctrl+C), initiating graceful shutdown...",
                         format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
@@ -512,166 +684,6 @@ impl XemmBot {
                         "⚠".yellow().bold()
                     );
                     break;
-                }
-
-                _ = eval_interval.tick() => {
-                    // Check if we should exit
-                    let state = self.bot_state.read().await;
-                    if state.is_terminal() {
-                        break;
-                    }
-
-                    // Only evaluate if idle
-                    if !state.is_idle() {
-                        continue;
-                    }
-
-                    // Check grace period
-                    if !state.grace_period_elapsed(3) {
-                        continue;
-                    }
-                    drop(state);
-
-                    // Check rate limit backoff
-                    if order_placement_rate_limit.should_skip() {
-                        let remaining = order_placement_rate_limit.remaining_backoff_secs();
-                        if remaining as u64 % 5 == 0 || remaining < 1.0 {
-                            debug!("[MAIN] Skipping order placement (rate limit backoff, {:.1}s remaining)", remaining);
-                        }
-                        continue;
-                    }
-
-                    // Get current prices
-                    let (pac_bid, pac_ask) = *self.pacifica_prices.lock();
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
-
-                    // Validate prices
-                    if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {
-                        continue;
-                    }
-
-                    // Get timestamp once for this evaluation cycle
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64;
-
-                    // Evaluate opportunities
-                    let buy_opp = self.evaluator.evaluate_buy_opportunity(hl_bid, self.config.order_notional_usd, now_ms);
-                    let sell_opp = self.evaluator.evaluate_sell_opportunity(hl_ask, self.config.order_notional_usd, now_ms);
-
-                    let pac_mid = (pac_bid + pac_ask) / 2.0;
-                    let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
-
-                    if let Some(opp) = best_opp {
-                        // Double-check bot is still idle
-                        let mut state = self.bot_state.write().await;
-                        if !state.is_idle() {
-                            continue;
-                        }
-
-                        info!(
-                            "{} {} @ {} → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
-                            format!("[{} OPPORTUNITY]", self.config.symbol).bright_green().bold(),
-                            opp.direction.as_str().bright_yellow().bold(),
-                            format!("${:.6}", opp.pacifica_price).cyan().bold(),
-                            format!("${:.6}", opp.hyperliquid_price).cyan(),
-                            format!("{:.4}", opp.size).bright_white(),
-                            format!("{:.2} bps", opp.initial_profit_bps).green().bold(),
-                            format!("${:.6}", pac_bid).cyan(),
-                            format!("${:.6}", pac_ask).cyan(),
-                            format!("${:.6}", hl_bid).cyan(),
-                            format!("${:.6}", hl_ask).cyan()
-                        );
-
-                        // Place order
-                        info!("{} Placing {} on Pacifica...",
-                            format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                            opp.direction.as_str().bright_yellow().bold()
-                        );
-
-                        let pacifica_side = match opp.direction {
-                            OrderSide::Buy => PacificaOrderSide::Buy,
-                            OrderSide::Sell => PacificaOrderSide::Sell,
-                        };
-
-                        match self.pacifica_trading_main
-                            .place_limit_order(
-                                &self.config.symbol,
-                                pacifica_side,
-                                opp.size,
-                                Some(opp.pacifica_price),
-                                0.0,
-                                Some(pac_bid),
-                                Some(pac_ask),
-                            )
-                            .await
-                        {
-                            Ok(order_data) => {
-                                order_placement_rate_limit.record_success();
-
-                                if let Some(client_order_id) = order_data.client_order_id {
-                                    let order_id = order_data.order_id.unwrap_or(0);
-                                    info!(
-                                        "{} {} Placed {} #{} @ {} | cloid: {}...{}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "✓".green().bold(),
-                                        opp.direction.as_str().bright_yellow(),
-                                        order_id,
-                                        format!("${:.4}", opp.pacifica_price).cyan().bold(),
-                                        &client_order_id[..8],
-                                        &client_order_id[client_order_id.len()-4..]
-                                    );
-
-                                    let active_order = ActiveOrder {
-                                        client_order_id,
-                                        symbol: self.config.symbol.clone(),
-                                        side: opp.direction,
-                                        price: opp.pacifica_price,
-                                        size: opp.size,
-                                        initial_profit_bps: opp.initial_profit_bps,
-                                        placed_at: Instant::now(),
-                                    };
-
-                                    state.set_active_order(active_order);
-
-                                    // Sync atomic status and order snapshot for order monitor
-                                    sync_atomic_status(&self.atomic_status, &state.status);
-                                    update_order_snapshot(
-                                        &self.order_snapshot,
-                                        opp.direction,
-                                        opp.pacifica_price,
-                                        opp.size,
-                                        opp.initial_profit_bps,
-                                    );
-                                } else {
-                                    info!("{} {} Order placed but no client_order_id returned",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "✗".red().bold()
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                if is_rate_limit_error(&e) {
-                                    order_placement_rate_limit.record_error();
-                                    let backoff_secs = order_placement_rate_limit.get_backoff_secs();
-                                    info!(
-                                        "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "⚠".yellow().bold(),
-                                        backoff_secs,
-                                        order_placement_rate_limit.consecutive_errors()
-                                    );
-                                } else {
-                                    info!("{} {} Failed to place order: {}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "✗".red().bold(),
-                                        e.to_string().red()
-                                    );
-                                }
-                            }
-                        }
-                    }
                 }
 
                 _ = shutdown_rx.recv() => {
@@ -726,4 +738,129 @@ impl XemmBot {
             }
         }
     }
+
+    async fn wait_for_ws_ready(&self, market_events: &MarketEventHub) -> Result<()> {
+        const WS_READY_TIMEOUT_SECS: u64 = 10;
+        let deadline = Instant::now() + Duration::from_secs(WS_READY_TIMEOUT_SECS);
+        let mut pacifica_ready = false;
+        let mut hyperliquid_ready = false;
+
+        info!(
+            "{} Waiting for orderbook WebSocket readiness (timeout {}s)...",
+            "[INIT]".cyan().bold(),
+            WS_READY_TIMEOUT_SECS
+        );
+
+        while Instant::now() < deadline {
+            while let Some(event) = market_events.pop() {
+                match event.source {
+                    MarketSource::Pacifica => pacifica_ready = true,
+                    MarketSource::Hyperliquid => hyperliquid_ready = true,
+                }
+                if pacifica_ready && hyperliquid_ready {
+                    info!("{} {} Orderbook WebSockets ready",
+                        "[INIT]".cyan().bold(),
+                        "✓".green().bold()
+                    );
+                    return Ok(());
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = tokio::time::timeout(remaining, market_events.notifier().notified()).await;
+        }
+
+        anyhow::bail!("Orderbook WebSockets did not become ready before timeout");
+    }
+
+    async fn verify_trading_ready(&self) -> Result<()> {
+        self.verify_pacifica_trading().await?;
+        self.verify_hyperliquid_trading().await?;
+        Ok(())
+    }
+
+    async fn verify_pacifica_trading(&self) -> Result<()> {
+        info!("{} Verifying Pacifica trading API access...",
+            "[INIT]".cyan().bold()
+        );
+
+        let open_orders = self
+            .pacifica_trading_main
+            .get_open_orders()
+            .await
+            .context("Pacifica trading API check failed (open orders)")?;
+
+        info!("{} {} Pacifica trading API ready ({} open orders)",
+            "[INIT]".cyan().bold(),
+            "✓".green().bold(),
+            open_orders.len()
+        );
+        Ok(())
+    }
+
+    async fn verify_hyperliquid_trading(&self) -> Result<()> {
+        info!("{} Verifying Hyperliquid trading API access...",
+            "[INIT]".cyan().bold()
+        );
+
+        let derived_wallet = self.hyperliquid_trading.get_wallet_address();
+        if let Ok(expected_wallet) = std::env::var("HL_WALLET") {
+            let expected = normalize_address(&expected_wallet);
+            let derived = normalize_address(&derived_wallet);
+            if expected != derived {
+                anyhow::bail!(
+                    "HL_WALLET mismatch: expected {}, derived {}",
+                    expected_wallet,
+                    derived_wallet
+                );
+            }
+        }
+
+        self.hyperliquid_trading
+            .get_user_state(&derived_wallet)
+            .await
+            .context("Hyperliquid info endpoint unavailable (user state)")?;
+
+        self.hyperliquid_trading
+            .sanity_check_signing()
+            .await
+            .context("Hyperliquid signing sanity check failed")?;
+
+        info!("{} {} Hyperliquid trading API ready",
+            "[INIT]".cyan().bold(),
+            "✓".green().bold()
+        );
+        Ok(())
+    }
+
+    async fn cancel_existing_orders(&self) -> Result<()> {
+        info!("{} Cancelling any existing orders on Pacifica...",
+            "[INIT]".cyan().bold()
+        );
+
+        match self.pacifica_trading_main
+            .cancel_all_orders(false, Some(&self.config.symbol), false)
+            .await
+        {
+            Ok(count) => info!("{} {} Cancelled {} existing order(s)",
+                "[INIT]".cyan().bold(),
+                "✓".green().bold(),
+                count
+            ),
+            Err(e) => info!("{} {} Failed to cancel existing orders: {}",
+                "[INIT]".cyan().bold(),
+                "⚠".yellow().bold(),
+                e
+            ),
+        }
+
+        Ok(())
+    }
+}
+
+fn normalize_address(address: &str) -> String {
+    address.trim().to_lowercase()
 }

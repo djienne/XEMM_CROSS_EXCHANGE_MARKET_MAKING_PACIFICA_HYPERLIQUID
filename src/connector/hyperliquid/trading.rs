@@ -581,6 +581,22 @@ impl HyperliquidTrading {
         Ok(user_state)
     }
 
+    /// Sanity check: ensure signing is functional without sending an order.
+    pub async fn sanity_check_signing(&self) -> Result<()> {
+        let action = Action {
+            type_: "order".to_string(),
+            orders: Vec::new(),
+            grouping: "na".to_string(),
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+
+        let _ = self.sign_action(&action, nonce, None).await?;
+        Ok(())
+    }
+
     /// Get wallet address from the internal wallet
     pub fn get_wallet_address(&self) -> String {
         format!("{:?}", self.wallet.address())

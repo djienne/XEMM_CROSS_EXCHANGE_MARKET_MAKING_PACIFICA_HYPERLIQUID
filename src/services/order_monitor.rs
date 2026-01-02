@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
+use arc_swap::ArcSwapOption;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
@@ -10,8 +10,10 @@ use crate::bot::{BotState, BotStatus};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
+use crate::services::market_event::MarketSource;
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
+use crate::util::atomic_price::AtomicPrice;
 
 // ============================================================================
 // ATOMIC STATUS FOR LOCK-FREE HOT PATH CHECKS
@@ -26,6 +28,7 @@ pub enum AtomicBotStatus {
     Filled = 2,
     Hedging = 3,
     Complete = 4,
+    Error = 5,
 }
 
 impl From<&BotStatus> for AtomicBotStatus {
@@ -36,7 +39,7 @@ impl From<&BotStatus> for AtomicBotStatus {
             BotStatus::Filled => AtomicBotStatus::Filled,
             BotStatus::Hedging => AtomicBotStatus::Hedging,
             BotStatus::Complete => AtomicBotStatus::Complete,
-            BotStatus::Error(_) => AtomicBotStatus::Idle, // Treat errors as idle for monitoring purposes
+            BotStatus::Error(_) => AtomicBotStatus::Error,
         }
     }
 }
@@ -56,26 +59,26 @@ pub struct OrderSnapshot {
 }
 
 /// Shared order snapshot updated atomically by order placer
-/// Uses Option wrapped in Mutex for atomic swap semantics
+/// Uses ArcSwap for lock-free snapshot reads
 pub struct SharedOrderSnapshot {
-    inner: Mutex<Option<OrderSnapshot>>,
+    inner: ArcSwapOption<OrderSnapshot>,
 }
 
 impl SharedOrderSnapshot {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: ArcSwapOption::from(None),
         }
     }
 
     #[inline]
-    pub fn get(&self) -> Option<OrderSnapshot> {
-        *self.inner.lock()
+    pub fn get(&self) -> Option<Arc<OrderSnapshot>> {
+        self.inner.load_full()
     }
 
     #[inline]
     pub fn set(&self, snapshot: Option<OrderSnapshot>) {
-        *self.inner.lock() = snapshot;
+        self.inner.store(snapshot.map(Arc::new));
     }
 }
 
@@ -105,9 +108,9 @@ pub enum CancelRequest {
 ///
 /// Key optimizations:
 /// - Lock-free status check via atomic
-/// - No REST calls in hot loop (delegated to separate task)
-/// - No cloning (uses lightweight snapshot)
-/// - No allocations in hot path
+/// - Event-driven checks (no polling interval)
+/// - No REST calls in hot path (delegated to separate task)
+/// - Snapshot reads are lock-free
 pub struct OrderMonitorService {
     // Shared state (write lock only needed for mutations)
     pub bot_state: Arc<RwLock<BotState>>,
@@ -119,12 +122,14 @@ pub struct OrderMonitorService {
     pub order_snapshot: Arc<SharedOrderSnapshot>,
     
     // Price feeds (lock-free reads via parking_lot)
-    pub pacifica_prices: Arc<Mutex<(f64, f64)>>,
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+    pub pacifica_prices: Arc<AtomicPrice>,
+    pub hyperliquid_prices: Arc<AtomicPrice>,
     
     // Configuration
     pub config: Config,
     pub evaluator: OpportunityEvaluator,
+    pub age_threshold: Duration,
+    pub profit_threshold: f64,
     
     // Trading connectors (only used by cancellation task)
     pub pacifica_trading: Arc<PacificaTrading>,
@@ -140,8 +145,8 @@ impl OrderMonitorService {
         bot_state: Arc<RwLock<BotState>>,
         atomic_status: Arc<AtomicU8>,
         order_snapshot: Arc<SharedOrderSnapshot>,
-        pacifica_prices: Arc<Mutex<(f64, f64)>>,
-        hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+        pacifica_prices: Arc<AtomicPrice>,
+        hyperliquid_prices: Arc<AtomicPrice>,
         config: Config,
         evaluator: OpportunityEvaluator,
         pacifica_trading: Arc<PacificaTrading>,
@@ -150,6 +155,9 @@ impl OrderMonitorService {
         // Bounded channel to prevent unbounded growth, but large enough to not block
         let (cancel_tx, cancel_rx) = mpsc::channel(64);
         
+        let age_threshold = Duration::from_secs(config.order_refresh_interval_secs);
+        let profit_threshold = config.profit_cancel_threshold_bps;
+
         let service = Self {
             bot_state,
             atomic_status,
@@ -158,6 +166,8 @@ impl OrderMonitorService {
             hyperliquid_prices,
             config,
             evaluator,
+            age_threshold,
+            profit_threshold,
             pacifica_trading,
             hyperliquid_trading,
             cancel_tx,
@@ -166,70 +176,63 @@ impl OrderMonitorService {
         (service, cancel_rx)
     }
 
-    /// Main monitoring loop - LATENCY CRITICAL
-    /// 
-    /// This loop runs at 1kHz and must complete each iteration in <1ms.
-    /// All I/O operations are delegated to separate tasks via channels.
-    pub async fn run_monitor_loop(&self) {
-        let mut monitor_interval = interval(Duration::from_millis(1));
-        
-        // Timing thresholds
-        let age_threshold = Duration::from_secs(self.config.order_refresh_interval_secs);
-        let profit_threshold = self.config.profit_cancel_threshold_bps;
+    /// Market-driven monitoring - triggered by incoming price updates.
+    pub fn check_on_market_event(&self, source: MarketSource) {
+        // FAST PATH: Lock-free status check
+        let status = self.atomic_status.load(Ordering::Acquire);
+        if status != AtomicBotStatus::OrderPlaced as u8 {
+            return;
+        }
 
-        loop {
-            monitor_interval.tick().await;
+        // Get order snapshot (single atomic load)
+        let snapshot = match self.order_snapshot.get() {
+            Some(s) => s,
+            None => return,
+        };
 
-            // FAST PATH: Lock-free status check
-            let status = self.atomic_status.load(Ordering::Acquire);
-            if status != AtomicBotStatus::OrderPlaced as u8 {
-                continue;
-            }
+        let age = snapshot.placed_at.elapsed();
 
-            // Get order snapshot (single lock, no clone of complex types)
-            let snapshot = match self.order_snapshot.get() {
-                Some(s) => s,
-                None => continue,
-            };
+        // Check 1: Age threshold
+        if age > self.age_threshold {
+            let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
+                symbol: self.config.symbol.clone(),
+                reason: format!(
+                    "age {}ms > {}s threshold",
+                    age.as_millis(),
+                    self.config.order_refresh_interval_secs
+                ),
+            });
+            return;
+        }
 
-            // Get prices (parking_lot mutex is very fast for uncontended case)
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
-            if hl_bid == 0.0 || hl_ask == 0.0 {
-                continue;
-            }
+        // Profit check only on Hyperliquid updates.
+        if !matches!(source, MarketSource::Hyperliquid) {
+            return;
+        }
 
-            let age = snapshot.placed_at.elapsed();
+        let (hl_bid, hl_ask) = self.hyperliquid_prices.load_bid_ask();
+        if hl_bid == 0.0 || hl_ask == 0.0 {
+            return;
+        }
 
-            // Check 1: Age threshold
-            if age > age_threshold {
-                // Send cancel request (non-blocking)
-                let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
-                    symbol: self.config.symbol.clone(),
-                    reason: format!("age {}ms > {}s threshold", age.as_millis(), self.config.order_refresh_interval_secs),
-                });
-                continue;
-            }
+        // Check 2: Profit deviation (using raw method - no allocation)
+        let current_profit = self.evaluator.recalculate_profit_raw(
+            snapshot.side,
+            snapshot.price,
+            hl_bid,
+            hl_ask,
+        );
 
-            // Check 2: Profit deviation (using raw method - no allocation)
-            let current_profit = self.evaluator.recalculate_profit_raw(
-                snapshot.side,
-                snapshot.price,
-                hl_bid,
-                hl_ask,
-            );
-            
-            // Consistent calculation: positive = profit dropped (bad)
-            let profit_change = snapshot.initial_profit_bps - current_profit;
-            let profit_deviation = profit_change.abs();
+        // Consistent calculation: positive = profit dropped (bad)
+        let profit_change = snapshot.initial_profit_bps - current_profit;
+        let profit_deviation = profit_change.abs();
 
-            if profit_deviation > profit_threshold {
-                // Send cancel request (non-blocking)
-                let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
-                    symbol: self.config.symbol.clone(),
-                    current_profit_bps: current_profit,
-                    deviation_bps: profit_deviation,
-                });
-            }
+        if profit_deviation > self.profit_threshold {
+            let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
+                symbol: self.config.symbol.clone(),
+                current_profit_bps: current_profit,
+                deviation_bps: profit_deviation,
+            });
         }
     }
 
@@ -353,7 +356,7 @@ impl OrderMonitorService {
                 None => continue,
             };
 
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+            let (hl_bid, hl_ask) = self.hyperliquid_prices.load_bid_ask();
             if hl_bid == 0.0 || hl_ask == 0.0 {
                 continue;
             }
@@ -422,12 +425,12 @@ impl OrderMonitorService {
         let (pac_result, hl_result) = tokio::join!(pac_future, hl_future);
 
         if let Ok(Some((bid, ask))) = pac_result {
-            *self.pacifica_prices.lock() = (bid, ask);
+            self.pacifica_prices.store(bid, ask, 0);
             debug!("[REFRESH] Pacifica: bid=${:.6}, ask=${:.6}", bid, ask);
         }
 
         if let Ok(Some((bid, ask))) = hl_result {
-            *self.hyperliquid_prices.lock() = (bid, ask);
+            self.hyperliquid_prices.store(bid, ask, 0);
             debug!("[REFRESH] Hyperliquid: bid=${:.6}, ask=${:.6}", bid, ask);
         }
     }
@@ -476,12 +479,6 @@ pub fn update_order_snapshot(
 
 /// Spawn all monitor tasks
 pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>, cancel_rx: mpsc::Receiver<CancelRequest>) {
-    // Hot path monitor (1kHz)
-    let service_clone = Arc::clone(&service);
-    tokio::spawn(async move {
-        service_clone.run_monitor_loop().await;
-    });
-
     // Cancellation handler (processes cancel requests)
     let service_clone = Arc::clone(&service);
     tokio::spawn(async move {
