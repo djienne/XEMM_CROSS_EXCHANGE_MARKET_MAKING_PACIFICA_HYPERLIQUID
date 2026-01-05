@@ -25,16 +25,6 @@ use crate::strategy::OpportunityEvaluator;
 
 use crate::util::atomic_price::AtomicPrice;
 
-
-
-/// Position snapshot for tracking position deltas
-#[derive(Debug, Clone)]
-pub struct PositionSnapshot {
-    pub amount: f64,
-    pub side: String, // "bid" or "ask"
-    pub last_check: Instant,
-}
-
 /// XemmBot - Main application structure that encapsulates all bot components
 pub struct XemmBot {
     pub config: Config,
@@ -56,9 +46,6 @@ pub struct XemmBot {
 
     // Opportunity evaluator
     pub evaluator: OpportunityEvaluator,
-
-    // Position tracking (for position delta detection)
-    pub last_position_snapshot: Arc<parking_lot::Mutex<Option<PositionSnapshot>>>,
 
     // Order monitor state (lock-free)
     pub atomic_status: Arc<AtomicU8>,
@@ -230,7 +217,6 @@ impl XemmBot {
             pacifica_trading: pacifica_trading_position,
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             symbol: self.config.symbol.clone(),
-            last_position_snapshot: self.last_position_snapshot.clone(),
         };
         tokio::spawn(async move {
             position_monitor_service.run().await;

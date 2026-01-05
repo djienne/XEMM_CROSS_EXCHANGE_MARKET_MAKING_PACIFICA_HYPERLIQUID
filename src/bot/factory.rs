@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
 
-use crate::app::{PositionSnapshot, XemmBot};
+use crate::app::XemmBot;
 use crate::bot::BotState;
 use crate::config::Config;
 use crate::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
@@ -138,7 +138,6 @@ impl BotFactory {
         let bot_state = Arc::new(RwLock::new(BotState::new()));
         let (hedge_tx, hedge_rx) = mpsc::unbounded_channel::<HedgeEvent>();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
 
         // Initialize order monitor state (shared atomics)
         let (atomic_status, last_cancel_ms) = {
@@ -162,7 +161,6 @@ impl BotFactory {
             pacifica_prices,
             hyperliquid_prices,
             evaluator,
-            last_position_snapshot,
             atomic_status,
             last_cancel_ms,
             order_snapshot,

@@ -1,16 +1,23 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info};
 use colored::Colorize;
 use fast_float::parse;
-use parking_lot::Mutex;
 
-use crate::app::PositionSnapshot;
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::services::{FillHandler, FillSource, FillType, HedgeEvent};
 use crate::strategy::OrderSide;
+
+/// Position snapshot for tracking position deltas (local to service)
+#[derive(Debug, Clone)]
+struct PositionSnapshot {
+    amount: f64,
+    side: String,
+    #[allow(dead_code)]
+    last_check: Instant,
+}
 
 /// Position-based fill detection service (4th layer - ground truth)
 ///
@@ -24,7 +31,6 @@ pub struct PositionMonitorService {
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub last_position_snapshot: Arc<Mutex<Option<PositionSnapshot>>>,
 }
 
 impl PositionMonitorService {
@@ -38,6 +44,9 @@ impl PositionMonitorService {
             self.symbol.clone(),
             None,
         );
+
+        // Local position snapshot - no Arc/Mutex needed (single task owns it)
+        let mut last_snapshot: Option<PositionSnapshot> = None;
 
         loop {
             // Adaptive polling: fast when order active, slow when idle
@@ -71,19 +80,18 @@ impl PositionMonitorService {
                 match self.pacifica_trading.get_positions().await {
                     Ok(positions) => {
                         let position = positions.iter().find(|p| p.symbol == self.symbol);
-                        let mut snapshot = self.last_position_snapshot.lock();
 
                         if let Some(pos) = position {
                             let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
-                            *snapshot = Some(PositionSnapshot {
+                            last_snapshot = Some(PositionSnapshot {
                                 amount,
                                 side: pos.side.clone(),
-                                last_check: std::time::Instant::now(),
+                                last_check: Instant::now(),
                             });
                             debug!("[POSITION_MONITOR] Updated baseline: {} {} {}",
                                 self.symbol, pos.side, amount);
                         } else {
-                            *snapshot = None;
+                            last_snapshot = None;
                             debug!("[POSITION_MONITOR] No position for {}", self.symbol);
                         }
                     }
@@ -103,7 +111,7 @@ impl PositionMonitorService {
             match positions_result {
                 Ok(positions) => {
                     let current_position = positions.iter().find(|p| p.symbol == self.symbol);
-                    let last_snapshot = self.last_position_snapshot.lock().clone();
+                    let snapshot_ref = last_snapshot.clone();
 
                     // Calculate position delta
                     let (last_amount, last_side) = if let Some(ref snap) = last_snapshot {
@@ -153,18 +161,17 @@ impl PositionMonitorService {
                         );
 
                         // Skip if this is first position change from None baseline (startup)
-                        if last_snapshot.is_none() && last_signed.abs() < 0.0001 && has_active_order {
+                        if snapshot_ref.is_none() && last_signed.abs() < 0.0001 && has_active_order {
                             info!(
                                 "{} {} Skipping hedge for first position change from baseline (startup initialization)",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
                                 "i".blue().bold()
                             );
 
-                            let mut snapshot = self.last_position_snapshot.lock();
-                            *snapshot = Some(PositionSnapshot {
+                            last_snapshot = Some(PositionSnapshot {
                                 amount: current_amount,
                                 side: current_side,
-                                last_check: std::time::Instant::now(),
+                                last_check: Instant::now(),
                             });
                             continue;
                         }
@@ -188,11 +195,10 @@ impl PositionMonitorService {
                                 current_state
                             );
 
-                            let mut snapshot = self.last_position_snapshot.lock();
-                            *snapshot = Some(PositionSnapshot {
+                            last_snapshot = Some(PositionSnapshot {
                                 amount: current_amount,
                                 side: current_side,
-                                last_check: std::time::Instant::now(),
+                                last_check: Instant::now(),
                             });
                             continue;
                         }
@@ -224,11 +230,10 @@ impl PositionMonitorService {
                         ).await;
 
                         // Update snapshot
-                        let mut snapshot = self.last_position_snapshot.lock();
-                        *snapshot = Some(PositionSnapshot {
+                        last_snapshot = Some(PositionSnapshot {
                             amount: current_amount,
                             side: current_side,
-                            last_check: std::time::Instant::now(),
+                            last_check: Instant::now(),
                         });
                     }
                 }
