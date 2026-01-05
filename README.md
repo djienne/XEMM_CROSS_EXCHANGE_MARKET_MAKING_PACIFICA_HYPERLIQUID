@@ -212,6 +212,7 @@ src/
         ├── mod.rs
         ├── types.rs           # Data structures
         ├── client.rs          # Orderbook WebSocket client
+        ├── client_trait.rs    # HyperliquidTradingClient trait for testability
         └── trading.rs         # REST + WebSocket trading (market orders)
 
 examples/                      # 14 testing utilities
