@@ -173,6 +173,11 @@ impl FillHandler {
         true
     }
 
+    /// Clear the processed fills set (call at end of cycle to prevent memory growth).
+    pub fn clear_processed_fills(&self) {
+        self.processed_fills.lock().clear();
+    }
+
     /// Fast-path check using atomics - no locks needed.
     /// Returns true if fill processing should continue, false to reject early.
     #[inline]
@@ -224,11 +229,13 @@ impl FillHandler {
         let fill_start = Instant::now();
         let prefix = source.log_prefix();
 
-        // 1. Update state to Filled IMMEDIATELY
+        // 1. Update state to Filled IMMEDIATELY (RwLock first, then atomic)
         {
             let mut state = self.bot_state.write().await;
             state.mark_filled(filled_size, side);
         }
+        // Update atomic status AFTER RwLock state is updated (prevents race condition)
+        self.atomic_status.store(STATUS_FILLED, Ordering::Release);
 
         info!(
             "{} {} {:?} FILL DETECTED - State updated to Filled",
@@ -294,6 +301,9 @@ impl FillHandler {
                 "✗".red().bold(),
                 e
             );
+            // CRITICAL: If hedge channel is closed, we have a filled position that cannot be hedged.
+            // Panic to force restart rather than leaving position unhedged.
+            panic!("CRITICAL: Hedge channel closed - cannot hedge filled position: {}", e);
         }
 
         fill_start
@@ -359,10 +369,7 @@ impl FillHandler {
             }
         };
 
-        // Update atomic status immediately (lock-free)
-        self.atomic_status.store(STATUS_FILLED, Ordering::Release);
-
-        // Process the fill (async state update + hedge trigger)
+        // Process the fill (updates RwLock state, then atomic status, then triggers hedge)
         self.process_fill(source, fill_type, side, filled_size, fill_price, Some(side_str))
             .await;
 

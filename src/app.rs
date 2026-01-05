@@ -307,43 +307,32 @@ impl XemmBot {
         );
         info!("");
 
+        let opportunity_loop = crate::services::opportunity_loop::OpportunityLoopService::new(
+            self.config.clone(),
+            self.bot_state.clone(),
+            self.pacifica_trading_main.clone(),
+            self.pacifica_prices.clone(),
+            self.hyperliquid_prices.clone(),
+            self.evaluator.clone(),
+            self.atomic_status.clone(),
+            self.last_cancel_ms.clone(),
+            self.order_snapshot.clone(),
+            order_monitor_service.clone(),
+            self.expected_cloid.clone(),
+        );
 
-
-            let opportunity_loop = crate::services::opportunity_loop::OpportunityLoopService::new(
-                self.config.clone(),
-                self.bot_state.clone(),
-                self.pacifica_trading_main.clone(),
-                self.pacifica_prices.clone(),
-                self.hyperliquid_prices.clone(),
-                self.evaluator.clone(),
-                self.atomic_status.clone(),
-                self.last_cancel_ms.clone(),
-                self.order_snapshot.clone(),
-                order_monitor_service.clone(),
-                self.expected_cloid.clone(),
-            );
-
-            // Run the opportunity loop (blocking until shutdown)
-            let shutdown_rx = self.shutdown_rx.take().unwrap();
-            if let Err(e) = opportunity_loop.run(&market_events, shutdown_rx).await {
-                match e.downcast_ref::<std::io::Error>() {
-                    Some(io_err) if io_err.kind() == std::io::ErrorKind::Interrupted => {
-                         // Ignore IO interruption (shutdown)
-                    }
-                    _ => {
-                        error!("Opportunity loop error: {}", e);
-                    }
+        // Run the opportunity loop (blocking until shutdown)
+        let shutdown_rx = self.shutdown_rx.take().unwrap();
+        if let Err(e) = opportunity_loop.run(&market_events, shutdown_rx).await {
+            match e.downcast_ref::<std::io::Error>() {
+                Some(io_err) if io_err.kind() == std::io::ErrorKind::Interrupted => {
+                    // Ignore IO interruption (shutdown)
+                }
+                _ => {
+                    error!("Opportunity loop error: {}", e);
                 }
             }
-            // Re-assign shutdown_rx to satisfy the compiler/struct if needed,
-            // or just break since we are shutting down.
-            // The `break` here is not strictly necessary as the function will return
-            // after this block, but it matches the original loop's exit logic.
-        // The original `main: loop` is replaced by the `opportunity_loop.run` call.
-        // The `break; }` from the instruction closes the implicit loop structure
-        // that the `opportunity_loop.run` call effectively replaces.
-        // Since `opportunity_loop.run` is blocking until shutdown,
-        // the code will proceed to cleanup after it returns.
+        }
 
         // ═══════════════════════════════════════════════════
         // SHUTDOWN CLEANUP
