@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -23,7 +22,6 @@ pub struct RestFillDetectionService {
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub min_hedge_notional: f64,
     pub poll_interval_ms: u64,
 }
@@ -37,7 +35,6 @@ impl RestFillDetectionService {
             self.pacifica_trading.clone(),
             self.pacifica_ws_trading.clone(),
             self.symbol.clone(),
-            self.processed_fills.clone(),
             None, // No baseline updater for REST detection
         );
 
@@ -124,12 +121,6 @@ impl RestFillDetectionService {
                                 let fill_type = if is_full_fill { FillType::Full } else { FillType::Partial };
                                 let cloid = &order.client_order_id;
 
-                                // Check if already processed using FillHandler
-                                if !fill_handler.try_mark_processed(fill_type, cloid) {
-                                    debug!("[REST_FILL_DETECTION] Fill already processed by WebSocket, skipping");
-                                    continue;
-                                }
-
                                 // Determine order side
                                 let order_side = if let Some(side) = order_side_opt {
                                     side
@@ -162,7 +153,7 @@ impl RestFillDetectionService {
                                     "(REST API)".bright_black()
                                 );
 
-                                // Process using unified handler
+                                // Process using unified handler (dedup handled by hedge service)
                                 let side_str = order.side.clone();
                                 fill_handler.process_fill(
                                     FillSource::RestApi,
@@ -170,6 +161,7 @@ impl RestFillDetectionService {
                                     order_side,
                                     filled_amount,
                                     price,
+                                    cloid,
                                     Some(&side_str),
                                 ).await;
                             } else {

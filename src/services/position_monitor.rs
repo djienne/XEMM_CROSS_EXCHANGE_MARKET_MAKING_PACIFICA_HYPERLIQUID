@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -25,7 +24,6 @@ pub struct PositionMonitorService {
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<Mutex<HashSet<String>>>,
     pub last_position_snapshot: Arc<Mutex<Option<PositionSnapshot>>>,
 }
 
@@ -38,7 +36,6 @@ impl PositionMonitorService {
             self.pacifica_trading.clone(),
             self.pacifica_ws_trading.clone(),
             self.symbol.clone(),
-            self.processed_fills.clone(),
             None,
         );
 
@@ -200,18 +197,6 @@ impl PositionMonitorService {
                             continue;
                         }
 
-                        // Check if already processed using unified handler
-                        if !fill_handler.try_mark_processed(FillType::Full, &client_order_id) {
-                            debug!("[POSITION_MONITOR] Fill already processed by another detection method");
-                            let mut snapshot = self.last_position_snapshot.lock();
-                            *snapshot = Some(PositionSnapshot {
-                                amount: current_amount,
-                                side: current_side,
-                                last_check: std::time::Instant::now(),
-                            });
-                            continue;
-                        }
-
                         info!(
                             "{} {} FILL DETECTED via position change!",
                             "[POSITION_MONITOR]".bright_cyan().bold(),
@@ -223,7 +208,7 @@ impl PositionMonitorService {
                             .and_then(|p| p.entry_price.parse::<f64>().ok())
                             .unwrap_or(0.0);
 
-                        // Process using unified handler
+                        // Process using unified handler (dedup handled by hedge service)
                         let side_str = match order_side {
                             OrderSide::Buy => "buy",
                             OrderSide::Sell => "sell",
@@ -234,6 +219,7 @@ impl PositionMonitorService {
                             order_side,
                             fill_size,
                             estimated_price,
+                            &client_order_id,
                             Some(side_str),
                         ).await;
 

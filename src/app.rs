@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicU8};
 use std::time::{Duration, Instant};
@@ -58,8 +57,7 @@ pub struct XemmBot {
     // Opportunity evaluator
     pub evaluator: OpportunityEvaluator,
 
-    // Fill tracking state
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    // Position tracking (for position delta detection)
     pub last_position_snapshot: Arc<parking_lot::Mutex<Option<PositionSnapshot>>>,
 
     // Order monitor state (lock-free)
@@ -173,7 +171,6 @@ impl XemmBot {
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             fill_config,
             symbol: self.config.symbol.clone(),
-            processed_fills: self.processed_fills.clone(),
             baseline_updater,
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
@@ -214,7 +211,6 @@ impl XemmBot {
             pacifica_trading: self.pacifica_trading_rest_fill.clone(),
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             symbol: self.config.symbol.clone(),
-            processed_fills: self.processed_fills.clone(),
             min_hedge_notional: self.config.min_hedge_notional_usd,
             poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
         };
@@ -234,7 +230,6 @@ impl XemmBot {
             pacifica_trading: pacifica_trading_position,
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             symbol: self.config.symbol.clone(),
-            processed_fills: self.processed_fills.clone(),
             last_position_snapshot: self.last_position_snapshot.clone(),
         };
         tokio::spawn(async move {

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -8,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 use fast_float::parse;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 use crate::bot::BotState;
 use crate::config::Config;
@@ -77,6 +78,9 @@ impl HedgeService {
         let mut ws_read: Option<WsRead> = None;
         let mut ws_request_id: u64 = 0;
 
+        // Local dedup set - no Arc, no Mutex needed (single consumer)
+        let mut processed_orders: HashSet<String> = HashSet::new();
+
         // Pre-connect WebSocket if enabled
         if use_ws_for_hedge {
             if let Ok((write, read)) = self.connect_hyperliquid_ws().await {
@@ -104,13 +108,21 @@ impl HedgeService {
                     }
                 }
 
-                Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv() => {
-                    let reception_latency = fill_timestamp.elapsed();
+                Some(event) = self.hedge_rx.recv() => {
+                    // Dedup: skip if already processed (multiple fill detectors may send same fill)
+                    if processed_orders.contains(&event.client_order_id) {
+                        debug!("{} Duplicate hedge event for {}, skipping",
+                            self.log_prefix(), event.client_order_id);
+                        continue;
+                    }
+                    processed_orders.insert(event.client_order_id.clone());
+
+                    let reception_latency = event.fill_timestamp.elapsed();
                     info!("{} HEDGE RECEIVED: {} {} @ {} | Latency: {:.1}ms",
                         self.log_prefix(),
-                        side.as_str().bright_yellow(),
-                        size,
-                        format!("${:.4}", avg_price).cyan(),
+                        event.side.as_str().bright_yellow(),
+                        event.size,
+                        format!("${:.4}", event.avg_price).cyan(),
                         reception_latency.as_secs_f64() * 1000.0
                     );
 
@@ -133,24 +145,24 @@ impl HedgeService {
                     };
 
                     // Determine hedge direction (opposite of fill)
-                    let is_buy = matches!(side, OrderSide::Sell);
+                    let is_buy = matches!(event.side, OrderSide::Sell);
 
                     info!("{} Executing {} {} on Hyperliquid",
                         self.log_prefix(),
                         if is_buy { "BUY".green().bold() } else { "SELL".red().bold() },
-                        size
+                        event.size
                     );
 
                     // Execute hedge order
                     let hedge_result = self.execute_hedge_order(
                         &mut ws_write, &mut ws_read, &mut ws_request_id,
-                        use_ws_for_hedge, is_buy, size, hl_bid, hl_ask
+                        use_ws_for_hedge, is_buy, event.size, hl_bid, hl_ask
                     ).await;
 
                     match hedge_result {
                         Ok(response) => {
                             self.handle_successful_hedge(
-                                response, fill_timestamp, side, size, avg_price, is_buy
+                                response, event.fill_timestamp, event.side, event.size, event.avg_price, is_buy
                             ).await;
                         }
                         Err(e) => {

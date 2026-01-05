@@ -2,8 +2,10 @@
 //!
 //! This module provides a single `FillHandler` that encapsulates the common
 //! fill processing logic used by WebSocket, REST, and position-based detection.
+//!
+//! Deduplication is handled by the hedge service (single consumer), not here.
+//! This keeps the fill handler lock-free for maximum hot-path performance.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -68,13 +70,13 @@ pub enum FillType {
 }
 
 
-/// Shared fill handler that provides unified fill processing logic.
+/// Fill handler that provides unified fill processing logic.
 ///
 /// All fill detection services should use this handler to:
-/// 1. Deduplicate fills (prevent double hedging)
+/// 1. Check ownership (is this fill for our order?)
 /// 2. Update bot state
 /// 3. Trigger background cancellation
-/// 4. Send hedge event
+/// 4. Send hedge event (dedup handled by hedge service)
 #[derive(Clone)]
 pub struct FillHandler {
     bot_state: Arc<RwLock<BotState>>,
@@ -82,7 +84,6 @@ pub struct FillHandler {
     pacifica_trading: Arc<PacificaTrading>,
     pacifica_ws_trading: Arc<PacificaWsTrading>,
     symbol: String,
-    processed_fills: Arc<Mutex<HashSet<String>>>,
     baseline_updater: Option<PositionBaselineUpdater>,
     /// Atomic status for lock-free fast-path rejection
     atomic_status: Arc<AtomicU8>,
@@ -97,7 +98,6 @@ impl FillHandler {
         pacifica_trading: Arc<PacificaTrading>,
         pacifica_ws_trading: Arc<PacificaWsTrading>,
         symbol: String,
-        processed_fills: Arc<Mutex<HashSet<String>>>,
         baseline_updater: Option<PositionBaselineUpdater>,
     ) -> Self {
         Self {
@@ -106,7 +106,6 @@ impl FillHandler {
             pacifica_trading,
             pacifica_ws_trading,
             symbol,
-            processed_fills,
             baseline_updater,
             atomic_status: Arc::new(AtomicU8::new(STATUS_IDLE)),
             expected_cloid: Arc::new(Mutex::new(None)),
@@ -120,7 +119,6 @@ impl FillHandler {
         pacifica_trading: Arc<PacificaTrading>,
         pacifica_ws_trading: Arc<PacificaWsTrading>,
         symbol: String,
-        processed_fills: Arc<Mutex<HashSet<String>>>,
         baseline_updater: Option<PositionBaselineUpdater>,
         atomic_status: Arc<AtomicU8>,
         expected_cloid: Arc<Mutex<Option<String>>>,
@@ -131,7 +129,6 @@ impl FillHandler {
             pacifica_trading,
             pacifica_ws_trading,
             symbol,
-            processed_fills,
             baseline_updater,
             atomic_status,
             expected_cloid,
@@ -155,27 +152,6 @@ impl FillHandler {
             "sell" | "ask" => Some(OrderSide::Sell),
             _ => None,
         }
-    }
-
-    /// Check if a fill has already been processed (thread-safe).
-    ///
-    /// Returns `true` if the fill should be processed, `false` if already handled.
-    /// Uses client_order_id directly as the dedup key (avoids allocations).
-    pub fn try_mark_processed(&self, _fill_type: FillType, client_order_id: &str) -> bool {
-        let mut processed = self.processed_fills.lock();
-
-        // Use client_order_id directly - it's already unique per order
-        if processed.contains(client_order_id) {
-            return false;
-        }
-
-        processed.insert(client_order_id.to_string());
-        true
-    }
-
-    /// Clear the processed fills set (call at end of cycle to prevent memory growth).
-    pub fn clear_processed_fills(&self) {
-        self.processed_fills.lock().clear();
     }
 
     /// Fast-path check using atomics - no locks needed.
@@ -205,7 +181,7 @@ impl FillHandler {
     /// 1. Updates bot state to Filled
     /// 2. Spawns background dual cancellation
     /// 3. Updates position baseline (if available)
-    /// 4. Triggers hedge immediately
+    /// 4. Triggers hedge immediately (dedup handled by hedge service)
     ///
     /// # Arguments
     /// * `source` - Where the fill was detected (for logging)
@@ -213,6 +189,7 @@ impl FillHandler {
     /// * `side` - Order side (Buy/Sell)
     /// * `filled_size` - Amount filled
     /// * `fill_price` - Average fill price
+    /// * `client_order_id` - Order ID for hedge service deduplication
     /// * `side_str` - Original side string (for baseline updater)
     ///
     /// # Returns
@@ -224,6 +201,7 @@ impl FillHandler {
         side: OrderSide,
         filled_size: f64,
         fill_price: f64,
+        client_order_id: &str,
         side_str: Option<&str>,
     ) -> Instant {
         let fill_start = Instant::now();
@@ -285,7 +263,7 @@ impl FillHandler {
             updater.update_baseline(&self.symbol, side_s, filled_size, fill_price);
         }
 
-        // 4. Trigger hedge immediately
+        // 4. Trigger hedge immediately (hedge service handles dedup)
         let latency_ms = fill_start.elapsed().as_secs_f64() * 1000.0;
         info!(
             "{} {} Hedge triggered in {:.1}ms (cancellation running async)",
@@ -294,7 +272,15 @@ impl FillHandler {
             latency_ms
         );
 
-        if let Err(e) = self.hedge_tx.send((side, filled_size, fill_price, fill_start)) {
+        let hedge_event = HedgeEvent {
+            side,
+            size: filled_size,
+            avg_price: fill_price,
+            fill_timestamp: fill_start,
+            client_order_id: client_order_id.to_string(),
+        };
+
+        if let Err(e) = self.hedge_tx.send(hedge_event) {
             // Channel closed - likely during shutdown. Log but don't panic.
             error!(
                 "{} {} Hedge channel closed (expected during shutdown): {}",
@@ -322,7 +308,7 @@ impl FillHandler {
 
     /// Convenience method for the full fill handling flow (async).
     ///
-    /// Optimized with atomic fast-path rejection and batched lock acquisitions.
+    /// Optimized with atomic fast-path rejection. Dedup is handled by hedge service.
     pub async fn handle_fill(
         &self,
         source: FillSource,
@@ -343,23 +329,14 @@ impl FillHandler {
             return false;
         }
 
-        // FAST PATH 3: Client order ID required for deduplication
+        // FAST PATH 3: Client order ID required for hedge service dedup
         let cloid = match client_order_id {
             Some(id) => id,
             None => {
-                debug!("{} No client_order_id, cannot deduplicate", source.log_prefix());
+                debug!("{} No client_order_id, cannot process", source.log_prefix());
                 return false;
             }
         };
-
-        // FAST PATH 4: Deduplication check (parking_lot Mutex - fast)
-        if !self.try_mark_processed(fill_type, cloid) {
-            debug!(
-                "{} {:?} fill already processed (duplicate), skipping",
-                source.log_prefix(), fill_type
-            );
-            return false;
-        }
 
         // Parse side (no locks)
         let side = match Self::parse_side(side_str) {
@@ -370,8 +347,8 @@ impl FillHandler {
             }
         };
 
-        // Process the fill (updates RwLock state, then atomic status, then triggers hedge)
-        self.process_fill(source, fill_type, side, filled_size, fill_price, Some(side_str))
+        // Process the fill (updates state, triggers hedge - dedup handled by hedge service)
+        self.process_fill(source, fill_type, side, filled_size, fill_price, cloid, Some(side_str))
             .await;
 
         true

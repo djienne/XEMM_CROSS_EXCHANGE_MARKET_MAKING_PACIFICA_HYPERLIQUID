@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
@@ -139,7 +138,6 @@ impl BotFactory {
         let bot_state = Arc::new(RwLock::new(BotState::new()));
         let (hedge_tx, hedge_rx) = mpsc::unbounded_channel::<HedgeEvent>();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        let processed_fills = Arc::new(parking_lot::Mutex::new(HashSet::<String>::new()));
         let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
 
         // Initialize order monitor state (shared atomics)
@@ -164,7 +162,6 @@ impl BotFactory {
             pacifica_prices,
             hyperliquid_prices,
             evaluator,
-            processed_fills,
             last_position_snapshot,
             atomic_status,
             last_cancel_ms,

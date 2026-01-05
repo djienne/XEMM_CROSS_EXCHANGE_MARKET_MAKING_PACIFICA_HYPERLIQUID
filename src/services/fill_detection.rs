@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, error};
@@ -20,7 +19,6 @@ pub struct FillDetectionService {
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub fill_config: FillDetectionConfig,
     pub symbol: String,
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub baseline_updater: PositionBaselineUpdater,
     pub atomic_status: Arc<std::sync::atomic::AtomicU8>,
     pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
@@ -53,7 +51,6 @@ impl FillDetectionService {
             self.pacifica_trading.clone(),
             self.pacifica_ws_trading.clone(),
             self.symbol.clone(),
-            self.processed_fills.clone(),
             Some(self.baseline_updater.clone()),
             self.atomic_status.clone(),
             self.expected_cloid.clone(),
