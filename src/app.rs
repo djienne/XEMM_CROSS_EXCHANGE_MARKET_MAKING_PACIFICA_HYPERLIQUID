@@ -293,6 +293,7 @@ impl XemmBot {
             shutdown_tx: self.shutdown_tx.clone(),
             cached_asset_meta,
             log_prefix_cached: format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold().to_string(),
+            atomic_status: self.atomic_status.clone(),
         };
         tokio::spawn(async move {
             hedge_service.run().await;

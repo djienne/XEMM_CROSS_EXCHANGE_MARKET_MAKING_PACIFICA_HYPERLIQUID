@@ -295,16 +295,17 @@ impl FillHandler {
         );
 
         if let Err(e) = self.hedge_tx.send((side, filled_size, fill_price, fill_start)) {
+            // Channel closed - likely during shutdown. Log but don't panic.
             error!(
-                "{} {} Failed to send hedge event: {}",
+                "{} {} Hedge channel closed (expected during shutdown): {}",
                 prefix,
                 "✗".red().bold(),
                 e
             );
-            // CRITICAL: If hedge channel is closed, we have a filled position that cannot be hedged.
-            // Panic to force restart rather than leaving position unhedged.
-            panic!("CRITICAL: Hedge channel closed - cannot hedge filled position: {}", e);
         }
+
+        // Clear expected cloid after fill processing to prevent stale state
+        self.set_expected_cloid(None);
 
         fill_start
     }

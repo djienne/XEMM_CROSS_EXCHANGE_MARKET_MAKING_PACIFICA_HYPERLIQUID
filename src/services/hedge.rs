@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
@@ -50,6 +51,9 @@ pub struct CachedAssetMeta {
 /// 4. Fetch trade history and calculate actual profit
 /// 5. Display trade summary and verify positions
 /// 6. Mark cycle complete and signal shutdown
+/// Status value for Complete state
+const STATUS_COMPLETE: u8 = 4;
+
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_rx: mpsc::UnboundedReceiver<HedgeEvent>,
@@ -62,6 +66,8 @@ pub struct HedgeService {
     pub cached_asset_meta: Option<CachedAssetMeta>,
     /// Pre-cached log prefix (avoid allocation in hot path)
     pub log_prefix_cached: String,
+    /// Atomic status for fast-path state checks
+    pub atomic_status: Arc<AtomicU8>,
 }
 
 impl HedgeService {
@@ -333,6 +339,8 @@ impl HedgeService {
             let mut state = self.bot_state.write().await;
             state.mark_complete();
         }
+        // Sync atomic status after RwLock state update
+        self.atomic_status.store(STATUS_COMPLETE, Ordering::Release);
         self.shutdown_tx.send(()).await.ok();
     }
 
