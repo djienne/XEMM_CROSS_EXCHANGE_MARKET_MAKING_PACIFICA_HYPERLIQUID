@@ -8,6 +8,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 use async_trait::async_trait;
 use super::PacificaTradingClient;
+use crate::strategy::OrderSide;
 
 const MAINNET_REST_URL: &str = "https://api.pacifica.fi";
 
@@ -47,29 +48,11 @@ pub struct MarketInfo {
     pub lot_size: String,   // Minimum size increment (e.g., "0.001")
 }
 
-/// Order side
-#[derive(Debug, Clone, Copy)]
-pub enum OrderSide {
-    Buy,
-    Sell,
-}
-
-impl OrderSide {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            OrderSide::Buy => "bid",
-            OrderSide::Sell => "ask",
-        }
-    }
-}
-
-impl From<crate::strategy::OrderSide> for OrderSide {
-    fn from(side: crate::strategy::OrderSide) -> Self {
-        match side {
-            crate::strategy::OrderSide::Buy => OrderSide::Buy,
-            crate::strategy::OrderSide::Sell => OrderSide::Sell,
-        }
-    }
+/// Cached symbol info for hot path
+#[derive(Debug, Clone)]
+pub struct CachedSymbolInfo {
+    pub tick_size: f64,
+    pub lot_size: f64,
 }
 
 /// Order response from API
@@ -224,6 +207,7 @@ pub struct PacificaTrading {
     rest_url: String,
     client: reqwest::Client,
     market_info_cache: Arc<Mutex<Option<HashMap<String, MarketInfo>>>>,
+    cached_symbol_info: Arc<parking_lot::RwLock<Option<CachedSymbolInfo>>>,
 }
 
 impl PacificaTrading {
@@ -240,7 +224,17 @@ impl PacificaTrading {
             rest_url: MAINNET_REST_URL.to_string(),
             client,
             market_info_cache: Arc::new(Mutex::new(None)),
+            cached_symbol_info: Arc::new(parking_lot::RwLock::new(None)),
         })
+    }
+
+    /// Set cached symbol info for hot path
+    pub fn set_cached_symbol_info(&self, tick_size: f64, lot_size: f64) {
+        let mut cache = self.cached_symbol_info.write();
+        *cache = Some(CachedSymbolInfo {
+            tick_size,
+            lot_size,
+        });
     }
 
     /// Fetch market info for all symbols
@@ -498,7 +492,7 @@ impl PacificaTrading {
         let payload = json!({
             "symbol": symbol,
             "amount": rounded_size.to_string(),
-            "side": side.as_str(),
+            "side": side.as_api_str(),
             "slippage_percent": slippage_percent.to_string(),
             "reduce_only": reduce_only,
             "client_order_id": client_order_id
@@ -513,7 +507,7 @@ impl PacificaTrading {
             "expiry_window": expiry_window,
             "symbol": symbol,
             "amount": rounded_size.to_string(),
-            "side": side.as_str(),
+            "side": side.as_api_str(),
             "slippage_percent": slippage_percent.to_string(),
             "reduce_only": reduce_only,
             "client_order_id": client_order_id,
@@ -917,14 +911,26 @@ impl PacificaTradingClient for PacificaTrading {
         current_bid: Option<f64>,
         current_ask: Option<f64>,
     ) -> Result<OrderData> {
-        // Get market info and clone the strings we need
-        let market_info = self.get_market_info().await?;
-        let symbol_info = market_info
-            .get(symbol)
-            .context(format!("Market info not found for {}", symbol))?;
+        // Try to get info from hot path cache first (check then release lock before await)
+        let cached = {
+            let cache = self.cached_symbol_info.read();
+            cache.clone()
+        };
 
-        let tick_size = symbol_info.tick_size.clone();
-        let lot_size = symbol_info.lot_size.clone();
+        let (tick_size_f, lot_size_f) = if let Some(info) = cached {
+            (info.tick_size, info.lot_size)
+        } else {
+            // Fallback to fetching market info (lock already released)
+            let market_info = self.get_market_info().await?;
+            let symbol_info = market_info
+                .get(symbol)
+                .context(format!("Market info not found for {}", symbol))?;
+
+            (
+                symbol_info.tick_size.parse::<f64>()?,
+                symbol_info.lot_size.parse::<f64>()?
+            )
+        };
 
         // Calculate price
         let order_price = if let Some(p) = price {
@@ -941,9 +947,19 @@ impl PacificaTradingClient for PacificaTrading {
             }
         };
 
-        // Round to tick and lot size
-        let rounded_price = self.round_to_tick_size(order_price, tick_size.clone())?;
-        let rounded_size = self.round_to_lot_size(size, lot_size.clone())?;
+        // Round to tick and lot size (using f64 math directly)
+        let rounded_price = (order_price / tick_size_f).round() * tick_size_f;
+        let rounded_size = (size / lot_size_f).round() * lot_size_f;
+
+        // Fix precision issues
+        let price_decimals = (-tick_size_f.log10()).ceil() as i32;
+        let size_decimals = (-lot_size_f.log10()).ceil() as i32;
+        
+        let price_factor = 10_f64.powi(price_decimals);
+        let size_factor = 10_f64.powi(size_decimals);
+        
+        let rounded_price = (rounded_price * price_factor).round() / price_factor;
+        let rounded_size = (rounded_size * size_factor).round() / size_factor;
 
         info!(
             "[PACIFICA] Placing {} order: {} {} @ ${} (tick: {}, lot: {})",
@@ -951,8 +967,8 @@ impl PacificaTradingClient for PacificaTrading {
             rounded_size,
             symbol,
             rounded_price,
-            tick_size,
-            lot_size
+            tick_size_f,
+            lot_size_f
         );
 
         // Generate client order ID
@@ -972,7 +988,7 @@ impl PacificaTradingClient for PacificaTrading {
             "symbol": symbol,
             "price": rounded_price.to_string(),
             "amount": rounded_size.to_string(),
-            "side": side.as_str(),
+            "side": side.as_api_str(),
             "tif": "ALO",  // Add Liquidity Only (post-only)
             "reduce_only": false,
             "client_order_id": client_order_id
@@ -989,7 +1005,7 @@ impl PacificaTradingClient for PacificaTrading {
             "symbol": symbol,
             "price": rounded_price.to_string(),
             "amount": rounded_size.to_string(),
-            "side": side.as_str(),
+            "side": side.as_api_str(),
             "tif": "ALO",
             "reduce_only": false,
             "client_order_id": client_order_id,

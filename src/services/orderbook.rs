@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use anyhow::{Context, Result};
 use colored::Colorize;
-use fast_float::parse;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -47,9 +46,7 @@ impl PacificaOrderbookService {
             let market_events = self.market_events.clone();
             let ws_health = self.ws_health.clone();
 
-            let start_fut = pacifica_ob_client.start(move |bid, ask, _symbol, _ts| {
-                let bid_price: f64 = parse(&bid).unwrap_or(0.0);
-                let ask_price: f64 = parse(&ask).unwrap_or(0.0);
+            let start_fut = pacifica_ob_client.start(move |bid_price, ask_price, _symbol, _ts| {
                 if bid_price > 0.0 && ask_price > 0.0 {
                     pac_prices_clone.store(bid_price, ask_price, _ts);
                     ws_health.record_update(MarketSource::Pacifica, WsHealth::now_ms());
@@ -111,9 +108,7 @@ impl HyperliquidOrderbookService {
             let market_events = self.market_events.clone();
             let ws_health = self.ws_health.clone();
 
-            let start_fut = hyperliquid_ob_client.start(move |bid, ask, _coin, _ts| {
-                let bid_price: f64 = parse(&bid).unwrap_or(0.0);
-                let ask_price: f64 = parse(&ask).unwrap_or(0.0);
+            let start_fut = hyperliquid_ob_client.start(move |bid_price, ask_price, _coin, _ts| {
                 if bid_price > 0.0 && ask_price > 0.0 {
                     hl_prices_clone.store(bid_price, ask_price, _ts);
                     ws_health.record_update(MarketSource::Hyperliquid, WsHealth::now_ms());

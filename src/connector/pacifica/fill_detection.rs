@@ -334,8 +334,8 @@ impl FillDetectionClient {
     where
         F: FnMut(FillEvent) + Send + 'static,
     {
-        // Single-pass parsing using unified FillDetectionWsMessage enum
-        let msg: FillDetectionWsMessage = match serde_json::from_str(text) {
+        // Single-pass parsing using fast channel-first parsing
+        let msg = match FillDetectionWsMessage::parse_fast(text) {
             Ok(m) => m,
             Err(_) => return Ok(()), // Silently ignore unparseable messages in hot path
         };

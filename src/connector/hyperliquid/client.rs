@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use fast_float::parse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::{interval, sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -52,7 +53,7 @@ impl OrderbookClient {
     /// * `callback` - Function called on each update with (best_bid, best_ask, coin, timestamp)
     pub async fn start<F>(&mut self, mut callback: F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64) + Send + 'static,
+        F: FnMut(f64, f64, &str, u64) + Send + 'static,
     {
         let mut reconnect_count = 0;
 
@@ -95,7 +96,7 @@ impl OrderbookClient {
     /// Connect to WebSocket and run the main loop
     async fn connect_and_run<F>(&mut self, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64) + Send + 'static,
+        F: FnMut(f64, f64, &str, u64) + Send + 'static,
     {
         info!("[HYPERLIQUID] Connecting to {}", self.ws_url);
 
@@ -130,8 +131,9 @@ impl OrderbookClient {
                 Some(msg) = read.next() => {
                     match msg {
                         Ok(Message::Text(text)) => {
-                            // Errors are already handled gracefully in handle_message
-                            self.handle_message(&text, callback).await.ok();
+                            if let Err(e) = self.handle_message(&text, callback) {
+                                debug!("[HYPERLIQUID] Message handling error: {}", e);
+                            }
                         }
                         Ok(Message::Ping(data)) => {
                             debug!("[HYPERLIQUID] Received ping, sending pong");
@@ -164,12 +166,12 @@ impl OrderbookClient {
 
     /// Handle incoming WebSocket message (single-pass parsing for low latency)
     #[inline]
-    async fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
+    fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64) + Send + 'static,
+        F: FnMut(f64, f64, &str, u64) + Send + 'static,
     {
         // Single-pass parsing using unified HlWsMessage enum
-        let msg: HlWsMessage = match serde_json::from_str(text) {
+        let msg = match HlWsMessage::parse_fast(text) {
             Ok(m) => m,
             Err(_) => return Ok(()), // Silently ignore unparseable messages in hot path
         };
@@ -181,12 +183,17 @@ impl OrderbookClient {
                     let bids = &data.levels[0];
                     let asks = &data.levels[1];
                     if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
-                        callback(
-                            best_bid.px.clone(),
-                            best_ask.px.clone(),
-                            data.coin,
-                            data.time,
-                        );
+                        // Parse prices in hot path for lowest latency
+                        let bid_price: f64 = parse(&best_bid.px).unwrap_or(0.0);
+                        let ask_price: f64 = parse(&best_ask.px).unwrap_or(0.0);
+                        if bid_price > 0.0 && ask_price > 0.0 {
+                            callback(
+                                bid_price,
+                                ask_price,
+                                &data.coin,
+                                data.time,
+                            );
+                        }
                     }
                 }
             }

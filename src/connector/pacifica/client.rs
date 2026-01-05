@@ -1,5 +1,6 @@
 use crate::connector::pacifica::types::{PingMessage, SubscribeMessage, WsMessage};
 use anyhow::{anyhow, Result};
+use fast_float::parse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::{sleep, Duration, interval};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -55,7 +56,7 @@ impl OrderbookClient {
     /// * `callback` - Function called with (best_bid_price, best_ask_price, symbol, timestamp)
     pub async fn start<F>(&mut self, mut callback: F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64) + Send + 'static,
+        F: FnMut(f64, f64, &str, u64) + Send + 'static,
     {
         let mut reconnect_count = 0;
 
@@ -97,7 +98,7 @@ impl OrderbookClient {
     /// Internal method to connect and run the WebSocket client
     async fn connect_and_run<F>(&self, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64),
+        F: FnMut(f64, f64, &str, u64),
     {
         info!("[PACIFICA] Connecting to {}", self.ws_url);
 
@@ -175,22 +176,30 @@ impl OrderbookClient {
     #[inline]
     fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64),
+        F: FnMut(f64, f64, &str, u64),
     {
         // Single-pass parsing using unified WsMessage enum
-        let msg: WsMessage = serde_json::from_str(text)?;
+        let msg = match WsMessage::parse_fast(text) {
+            Ok(m) => m,
+            Err(_) => return Ok(()), // Silently ignore unknown/unparseable messages
+        };
 
         match msg {
             WsMessage::Book { channel, data } if channel == "book" => {
                 // Extract top of book directly without extra allocation
                 if let (Some(bids), Some(asks)) = (data.levels.get(0), data.levels.get(1)) {
                     if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
-                        callback(
-                            best_bid.price.clone(),
-                            best_ask.price.clone(),
-                            data.symbol,
-                            data.timestamp,
-                        );
+                        // Parse prices in hot path for lowest latency
+                        let bid_price: f64 = parse(&best_bid.price).unwrap_or(0.0);
+                        let ask_price: f64 = parse(&best_ask.price).unwrap_or(0.0);
+                        if bid_price > 0.0 && ask_price > 0.0 {
+                            callback(
+                                bid_price,
+                                ask_price,
+                                &data.symbol,
+                                data.timestamp,
+                            );
+                        }
                     }
                 }
             }

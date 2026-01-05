@@ -41,15 +41,15 @@ This bot is Inspired by Hummingbot's XEMM Strategy.
 
 ### Fill Detection (5 Layers)
 
-The bot uses a multi-layered fill detection system for maximum reliability:
+The bot uses a multi-layered fill detection system for maximum reliability, unified through the `FillHandler` abstraction:
 
 1. **WebSocket Fill Detection** (primary, real-time) - Monitors Pacifica's `account_order_updates` channel
 2. **WebSocket Position Detection** (redundancy, real-time) - Monitors Pacifica's `account_positions` channel for position deltas
-3. **REST API Order Polling** (backup, 500ms) - Polls order status via REST API
-4. **Position Monitor** (ground truth, 500ms) - Detects fills by monitoring position changes via REST
+3. **REST API Order Polling** (backup, 250ms when active) - Polls order status via REST API
+4. **Position Monitor** (ground truth, adaptive) - Detects fills by monitoring position changes via REST
 5. **Monitor Safety Check** (defensive) - Pre-cancellation verification in monitoring task
 
-All methods deduplicate via shared HashSet to ensure only one hedge executes per fill.
+All methods deduplicate via shared `HashSet` to ensure only one hedge executes per fill. The `FillHandler` provides unified fill processing across all 3 detection services.
 
 ### Exchange Connectivity
 
@@ -96,6 +96,10 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
     - `false` → use REST-only hedging (original behavior).
 
 ### Performance & Reliability
+- ✅ **Single-threaded Tokio Runtime** - Deterministic execution with `#[tokio::main(flavor = "current_thread")]`
+- ✅ **Lock-free Hot Paths** - `AtomicPrice` (seqlock), `AtomicU8` status checks, spin hints for CPU-efficient waiting
+- ✅ **Single-pass JSON Parsing** - Unified `WsMessage` enum for optimal parsing performance
+- ✅ **Precomputed Fee Factors** - Avoid repeated calculations in hot path
 - ✅ **Multi-source Orderbook** - WebSocket primary, REST API fallback
 - ✅ **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
 - ✅ **Auto-reconnect** - Exponential backoff on connection failures
@@ -172,20 +176,35 @@ cargo run --release
 src/
 ├── main.rs             # Main trading bot binary
 ├── lib.rs              # Library exports
+├── app.rs              # XemmBot main orchestrator (spawns services, runs main loop)
 ├── config.rs           # Config management (loads config.json)
 ├── csv_logger.rs       # CSV logging for trade history
 ├── trade_fetcher.rs    # Post-hedge trade fetching and profit calculation
 ├── bot/
 │   ├── mod.rs
-│   └── state.rs        # Bot state machine (Idle/OrderPlaced/Filled/Hedging/Complete/Error)
+│   ├── state.rs        # Bot state machine (Idle/OrderPlaced/Filled/Hedging/Complete/Error)
+│   └── factory.rs      # BotFactory - creates and wires all bot components
 ├── strategy/
 │   ├── mod.rs
-│   └── opportunity.rs  # Opportunity evaluation and profit calculation
+│   └── opportunity.rs  # OpportunityEvaluator - profit calculation with fee margins
+├── services/           # 11 concurrent async services
+│   ├── orderbook.rs         # Pacifica & Hyperliquid orderbook WebSocket
+│   ├── fill_detection.rs    # Primary fill detection via account_order_updates
+│   ├── rest_fill_detection.rs # Backup REST polling (250ms when order active)
+│   ├── position_monitor.rs  # Ground truth fill detection via position deltas
+│   ├── fill_handler.rs      # FillHandler - unified fill processing across services
+│   ├── order_monitor.rs     # Profit tracking, age-based refresh, cancellation
+│   ├── hedge.rs             # HedgeService - consumes HedgeEvent queue
+│   ├── opportunity_loop.rs  # Main trading logic, places orders
+│   ├── rest_poll.rs         # Fallback REST polling for orderbooks
+│   ├── ws_health.rs         # WebSocket health monitor, staleness detection
+│   └── market_event.rs      # MarketEventHub - pub/sub for price changes
 └── connector/
     ├── pacifica/
     │   ├── mod.rs
     │   ├── types.rs           # WebSocket/REST message types
     │   ├── client.rs          # Orderbook WebSocket client
+    │   ├── client_trait.rs    # PacificaTradingClient trait for testability
     │   ├── trading.rs         # REST API trading (place/cancel orders)
     │   ├── ws_trading.rs      # WebSocket trading (ultra-fast cancel_all)
     │   └── fill_detection.rs  # WebSocket fill monitoring client
@@ -193,24 +212,23 @@ src/
         ├── mod.rs
         ├── types.rs           # Data structures
         ├── client.rs          # Orderbook WebSocket client
-        └── trading.rs         # REST API trading (market orders)
+        └── trading.rs         # REST + WebSocket trading (market orders)
 
-examples/
-├── pacifica_orderbook.rs                      # View Pacifica orderbook (live)
-├── pacifica_orderbook_rest_test.rs            # Test REST API orderbook
-├── fill_detection_test.rs                     # Test fill detection
-├── test_aggressive_fill_detection.rs          # Test all 5 fill detection methods
-├── hyperliquid_market_test.rs                 # Test Hyperliquid trading
-├── hyperliquid_orderbook.rs                   # View Hyperliquid orderbook
-├── xemm_calculator.rs                         # Price calculator (no trading)
-├── test_pacifica_positions.rs                 # View Pacifica positions
-├── check_positions_debug.rs                   # Debug Hyperliquid positions
-├── test_hyperliquid_trade_history.rs          # Test trade history API
-├── rebalancer.rs                              # Position rebalancer (single exchange)
-├── rebalancer_cross_exchange.rs               # Cross-exchange rebalancer
-├── cancel_all_test.rs                         # Test REST cancel all
-├── ws_cancel_all_test.rs                      # Test WebSocket cancel all
-└── ... (30+ more examples for testing)
+examples/                      # 14 testing utilities
+├── hyperliquid_orderbook.rs        # View Hyperliquid orderbook (live)
+├── test_hl_l2_snapshot.rs          # Test Hyperliquid L2 snapshot
+├── test_hyperliquid_trade_history.rs # Test trade history API
+├── check_hyperliquid_symbols.rs    # Check available Hyperliquid symbols
+├── check_positions_debug.rs        # Debug Hyperliquid positions
+├── test_pacifica_positions.rs      # View Pacifica positions
+├── close_ena_position.rs           # Close ENA position helper
+├── verify_wallet.rs                # Verify wallet/credentials
+├── debug_msgpack.rs                # Debug MessagePack serialization
+├── test_meta.rs                    # Test metadata parsing
+├── test_meta_parse.rs              # Test metadata parsing
+├── test_price_rounding.rs          # Test price rounding logic
+├── low_latency.rs                  # Low-latency mode example
+└── advanced_usage.rs               # Advanced usage patterns
 ```
 
 ### Bot State Machine
@@ -254,12 +272,18 @@ The XEMM bot orchestrates 11 async tasks running in parallel:
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
 | `profit_rate_bps` | 15.0 | Target profit in basis points (0.15%), should overcome fees, slippage, and latency |
 | `order_notional_usd` | 20.0 | Order size in USD |
+| `min_hedge_notional_usd` | 10.0 | Minimum notional value (USD) to trigger a hedge on partial fills |
 | `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates ±3 bps |
 | `order_refresh_interval_secs` | 60 | Auto-cancel orders older than 60s |
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
 | `hyperliquid_use_ws_for_hedge` | true | Use WebSocket for hedge execution (faster) vs REST |
 | `pacifica_rest_poll_interval_secs` | 2 | REST API fallback polling interval in seconds |
+| `hyperliquid_rest_poll_interval_secs` | 2 | Hyperliquid REST API fallback polling interval |
 | `pacifica_active_order_rest_poll_interval_ms` | 250 | REST fill detection polling interval when an order is active |
+| `cancel_grace_period_ms` | 3000 | Grace period (ms) before re-evaluating orders after cancellation |
+| `post_cancel_wait_secs` | 3.0 | Wait time (seconds) after cancel before placing new order |
+| `trade_propagation_wait_secs` | 20 | Wait time (seconds) for trades to propagate to exchange APIs |
+| `position_verification_wait_secs` | 8 | Wait time (seconds) for position verification loop |
 
 ## Trading Workflow
 
@@ -297,80 +321,26 @@ Prices are rounded to tick_size (buy rounds down, sell rounds up).
 
 ## Examples & Testing
 
-### Core Examples
-
-Essential examples for understanding and testing the system:
+The repository includes 14 example programs for testing and debugging:
 
 ```bash
-# View Pacifica orderbook (WebSocket live stream)
-cargo run --example pacifica_orderbook --release
-
-# Test Pacifica orderbook REST API
-cargo run --example pacifica_orderbook_rest_test --release
-
-# Test fill detection WebSocket
-cargo run --example fill_detection_test --release
-
-# Test REST API fill detection
-cargo run --example test_rest_fill_detection --release
-
-# Test Hyperliquid market orders
-cargo run --example hyperliquid_market_test --release
-
-# View Hyperliquid orderbook
+# View Hyperliquid orderbook (WebSocket live stream)
 cargo run --example hyperliquid_orderbook --release
 
 # Test Hyperliquid L2 snapshot
 cargo run --example test_hl_l2_snapshot --release
 
-# Calculate opportunities without trading
-cargo run --example xemm_calculator --release
-```
-
-### Fill Detection Testing
-
-Comprehensive test for the 5-layer fill detection system:
-
-```bash
-# Test all 5 fill detection methods with aggressive limit order
-# Places order at 0.05% spread to ensure quick fill
-# Verifies deduplication and position verification on both exchanges
-cargo run --example test_aggressive_fill_detection --release
-```
-
-This test:
-- Places an aggressive post-only limit order (5 bps spread)
-- Monitors all 5 detection methods simultaneously:
-  1. WebSocket order updates (primary)
-  2. WebSocket position delta (redundancy)
-  3. REST order polling (backup)
-  4. REST position monitor (ground truth)
-  5. Monitor pre-cancel check (defensive)
-- Tracks which method detects first with timing analysis
-- Shows cross-validation status for position-based detection
-- Verifies only one hedge executes (deduplication works)
-- Checks positions on both Pacifica and Hyperliquid after hedge
-- Shows comprehensive detection method summary with timestamps
-
-### Utility Examples
-
-Helper tools and utilities:
-
-```bash
-# Cancel all open orders (REST API)
-cargo run --example cancel_all_test --release
-
-# Test WebSocket cancel all orders
-cargo run --example ws_cancel_all_test --release
+# Test Hyperliquid trade history API
+cargo run --example test_hyperliquid_trade_history --release
 
 # Check available Hyperliquid symbols
 cargo run --example check_hyperliquid_symbols --release
 
-# View current positions on Pacifica
-cargo run --example test_pacifica_positions --release
-
 # Debug Hyperliquid positions (raw API response)
 cargo run --example check_positions_debug --release
+
+# View current positions on Pacifica
+cargo run --example test_pacifica_positions --release
 
 # Close ENA position helper
 cargo run --example close_ena_position --release
@@ -388,28 +358,11 @@ cargo run --example test_meta_parse --release
 # Test price rounding logic
 cargo run --example test_price_rounding --release
 
-# Fetch and analyze recent trade history
-cargo run --example fetch_recent_trades --release
-cargo run --example fetch_pump_trades --release
-cargo run --example test_hyperliquid_trade_history --release
-cargo run --example test_pacifica_trade_history --release
+# Low-latency mode example
+cargo run --example low_latency --release
 
-# Cross-exchange position rebalancer
-cargo run --example rebalancer --release
-cargo run --example rebalancer_cross_exchange --release
-```
-
-### Symbol-Specific Test Examples
-
-Order placement tests for specific coins:
-
-```bash
-# Test orders for different symbols
-cargo run --example test_btc_orders --release
-cargo run --example test_eth_orders --release
-cargo run --example test_pengu_orders --release
-cargo run --example test_pump_orders --release
-cargo run --example test_xpl_orders --release
+# Advanced usage patterns
+cargo run --example advanced_usage --release
 ```
 
 ## Standalone Utilities

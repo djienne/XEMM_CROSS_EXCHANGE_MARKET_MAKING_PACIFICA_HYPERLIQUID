@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use anyhow::Result;
-use crate::connector::pacifica::trading::{OrderData, OrderSide};
+use crate::connector::pacifica::trading::OrderData;
+use crate::strategy::OrderSide;
 
 #[async_trait]
 pub trait PacificaTradingClient: Send + Sync {

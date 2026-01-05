@@ -318,6 +318,15 @@ impl OrderSide {
         }
     }
 
+    /// Convert to API string representation ("bid" or "ask")
+    #[inline(always)]
+    pub const fn as_api_str(&self) -> &'static str {
+        match self {
+            OrderSide::Buy => "bid",
+            OrderSide::Sell => "ask",
+        }
+    }
+
     /// Get opposite side (for hedging)
     #[inline(always)]
     pub const fn opposite(&self) -> OrderSide {

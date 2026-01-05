@@ -45,7 +45,6 @@ pub struct OrderbookResponse {
 
 /// Unified WebSocket message for single-pass parsing (hot path optimization)
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
 pub enum WsMessage {
     /// Orderbook update message
     Book {
@@ -56,8 +55,51 @@ pub enum WsMessage {
     Pong {
         channel: String,
     },
-    /// Unknown/ignored message
-    Unknown(serde_json::Value),
+}
+
+impl WsMessage {
+    /// Fast parsing method that checks channel first to avoid trying multiple variants
+    pub fn parse_fast(text: &str) -> Result<Self, serde_json::Error> {
+        // Helper to check channel
+        #[derive(Deserialize)]
+        struct ChannelHelper<'a> {
+            channel: &'a str,
+        }
+
+        // Helper for Book message
+        #[derive(Deserialize)]
+        struct BookMsg {
+            channel: String,
+            data: OrderbookData,
+        }
+
+        // Helper for Pong message
+        #[derive(Deserialize)]
+        struct PongMsg {
+            channel: String,
+        }
+
+        // Fast check of channel
+        match serde_json::from_str::<ChannelHelper>(text) {
+            Ok(helper) => match helper.channel {
+                "book" => {
+                    let msg: BookMsg = serde_json::from_str(text)?;
+                    Ok(WsMessage::Book {
+                        channel: msg.channel,
+                        data: msg.data,
+                    })
+                }
+                "pong" => {
+                    let msg: PongMsg = serde_json::from_str(text)?;
+                    Ok(WsMessage::Pong {
+                        channel: msg.channel,
+                    })
+                }
+                _ => Err(serde::de::Error::custom("Unknown channel")),
+            },
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Orderbook data structure
@@ -483,7 +525,6 @@ pub struct AccountPositionsResponse {
 
 /// Unified WebSocket message for fill detection (single-pass parsing optimization)
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
 pub enum FillDetectionWsMessage {
     /// Account order updates (fills, cancellations)
     OrderUpdates {
@@ -499,6 +540,63 @@ pub enum FillDetectionWsMessage {
     Pong {
         channel: String,
     },
-    /// Unknown/ignored message
-    Unknown(serde_json::Value),
+}
+
+impl FillDetectionWsMessage {
+    /// Fast parsing method that checks channel first to avoid trying multiple variants
+    pub fn parse_fast(text: &str) -> Result<Self, serde_json::Error> {
+        // Helper to check channel
+        #[derive(Deserialize)]
+        struct ChannelHelper<'a> {
+            channel: &'a str,
+        }
+
+        // Helper for OrderUpdates message
+        #[derive(Deserialize)]
+        struct OrderUpdatesMsg {
+            channel: String,
+            data: Vec<OrderUpdate>,
+        }
+
+        // Helper for Positions message
+        #[derive(Deserialize)]
+        struct PositionsMsg {
+            channel: String,
+            data: Vec<PositionData>,
+        }
+
+        // Helper for Pong message
+        #[derive(Deserialize)]
+        struct PongMsg {
+            channel: String,
+        }
+
+        // Fast check of channel
+        match serde_json::from_str::<ChannelHelper>(text) {
+            Ok(helper) => match helper.channel {
+                "account_order_updates" => {
+                    let msg: OrderUpdatesMsg = serde_json::from_str(text)?;
+                    Ok(FillDetectionWsMessage::OrderUpdates {
+                        channel: msg.channel,
+                        data: msg.data,
+                    })
+                }
+                "account_positions" => {
+                    let msg: PositionsMsg = serde_json::from_str(text)?;
+                    Ok(FillDetectionWsMessage::Positions {
+                        channel: msg.channel,
+                        data: msg.data,
+                    })
+                }
+                "pong" => {
+                    let msg: PongMsg = serde_json::from_str(text)?;
+                    Ok(FillDetectionWsMessage::Pong {
+                        channel: msg.channel,
+                    })
+                }
+                _ => Err(serde::de::Error::custom("Unknown channel")),
+            },
+            Err(e) => Err(e),
+        }
+    }
 }

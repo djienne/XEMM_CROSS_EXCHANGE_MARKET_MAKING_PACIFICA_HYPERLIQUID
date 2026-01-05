@@ -4427,6 +4427,7 @@ dependencies = [
  "fast-float",
  "futures-util",
  "hex",
+ "once_cell",
  "parking_lot",
  "reqwest",
  "rmp-serde",

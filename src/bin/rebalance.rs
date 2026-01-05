@@ -14,7 +14,7 @@ use xemm_rust::connector::hyperliquid::{
 };
 use xemm_rust::connector::pacifica::{
     OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
-    trading::{PacificaCredentials, PacificaTrading, OrderSide},
+    trading::{PacificaCredentials, PacificaTrading}, OrderSide,
 };
 
 #[derive(Debug, Deserialize)]
@@ -69,10 +69,8 @@ async fn main() -> Result<()> {
     // Spawn orderbook tasks
     tokio::spawn(async move {
         if let Err(e) = hl_ob_client.start(move |bid, ask, _, _| {
-            let bid_f: f64 = bid.parse().unwrap_or(0.0);
-            let ask_f: f64 = ask.parse().unwrap_or(0.0);
-            if bid_f > 0.0 && ask_f > 0.0 {
-                let mid = (bid_f + ask_f) / 2.0;
+            if bid > 0.0 && ask > 0.0 {
+                let mid = (bid + ask) / 2.0;
                 if let Ok(mut lock) = hl_price_clone.lock() {
                     *lock = Some(mid);
                 }
@@ -84,10 +82,8 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         if let Err(e) = pac_ob_client.start(move |bid, ask, _, _| {
-            let bid_f: f64 = bid.parse().unwrap_or(0.0);
-            let ask_f: f64 = ask.parse().unwrap_or(0.0);
-            if bid_f > 0.0 && ask_f > 0.0 {
-                let mid = (bid_f + ask_f) / 2.0;
+            if bid > 0.0 && ask > 0.0 {
+                let mid = (bid + ask) / 2.0;
                 if let Ok(mut lock) = pac_price_clone.lock() {
                     *lock = Some(mid);
                 }

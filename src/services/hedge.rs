@@ -60,6 +60,8 @@ pub struct HedgeService {
     pub shutdown_tx: mpsc::Sender<()>,
     /// Pre-cached asset metadata (asset_id, sz_decimals) for low-latency hedge
     pub cached_asset_meta: Option<CachedAssetMeta>,
+    /// Pre-cached log prefix (avoid allocation in hot path)
+    pub log_prefix_cached: String,
 }
 
 impl HedgeService {
@@ -154,14 +156,14 @@ impl HedgeService {
         }
     }
 
-    fn log_prefix(&self) -> String {
-        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold().to_string()
+    fn log_prefix(&self) -> &str {
+        &self.log_prefix_cached
     }
 
     fn spawn_pre_hedge_cancellation(&self) {
         let pacifica_trading = self.pacifica_trading.clone();
         let symbol = self.config.symbol.clone();
-        let prefix = self.log_prefix();
+        let prefix = self.log_prefix_cached.clone();
 
         tokio::spawn(async move {
             info!("{} {} Pre-hedge: Cancelling all Pacifica orders...",

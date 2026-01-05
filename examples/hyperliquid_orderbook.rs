@@ -37,11 +37,11 @@ async fn main() -> anyhow::Result<()> {
     // Start client with callback for top of book updates
     client.start(|best_bid, best_ask, coin, timestamp| {
         info!(
-            "[HYPERLIQUID] {} | Bid: {} | Ask: {} | Spread: {:.4} | TS: {}",
+            "[HYPERLIQUID] {} | Bid: {:.4} | Ask: {:.4} | Spread: {:.4} | TS: {}",
             coin,
             best_bid,
             best_ask,
-            best_ask.parse::<f64>().unwrap_or(0.0) - best_bid.parse::<f64>().unwrap_or(0.0),
+            best_ask - best_bid,
             timestamp
         );
     }).await?;

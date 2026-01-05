@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use colored::Colorize;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
@@ -18,6 +19,12 @@ use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading, PositionBas
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
+
+// Pre-computed colored log prefixes (avoid allocation in hot path)
+static PREFIX_WEBSOCKET: Lazy<String> = Lazy::new(|| "[FILL_DETECTION]".magenta().bold().to_string());
+static PREFIX_REST_API: Lazy<String> = Lazy::new(|| "[REST_FILL_DETECTION]".bright_cyan().bold().to_string());
+static PREFIX_POSITION_DELTA: Lazy<String> = Lazy::new(|| "[POSITION_MONITOR]".bright_cyan().bold().to_string());
+static PREFIX_FILL_HANDLER: Lazy<String> = Lazy::new(|| "[FILL_HANDLER]".bright_blue().bold().to_string());
 
 /// Status values for atomic fast-path checks (must match BotStatus encoding)
 const STATUS_IDLE: u8 = 0;
@@ -34,11 +41,11 @@ pub enum FillSource {
 }
 
 impl FillSource {
-    fn log_prefix(&self) -> String {
+    fn log_prefix(&self) -> &'static str {
         match self {
-            FillSource::WebSocket => "[FILL_DETECTION]".magenta().bold().to_string(),
-            FillSource::RestApi => "[REST_FILL_DETECTION]".bright_cyan().bold().to_string(),
-            FillSource::PositionDelta => "[POSITION_MONITOR]".bright_cyan().bold().to_string(),
+            FillSource::WebSocket => &PREFIX_WEBSOCKET,
+            FillSource::RestApi => &PREFIX_REST_API,
+            FillSource::PositionDelta => &PREFIX_POSITION_DELTA,
         }
     }
 
@@ -258,7 +265,7 @@ impl FillHandler {
                 Ok((rest_count, ws_count)) => {
                     info!(
                         "{} {} Background dual cancellation complete (REST: {}, WS: {}) [{}]",
-                        "[FILL_HANDLER]".bright_blue().bold(),
+                        &*PREFIX_FILL_HANDLER,
                         "✓✓".green().bold(),
                         rest_count,
                         ws_count,
@@ -268,7 +275,7 @@ impl FillHandler {
                 Err(e) => {
                     error!(
                         "{} {} Background dual cancellation failed: {} [{}]",
-                        "[FILL_HANDLER]".bright_blue().bold(),
+                        &*PREFIX_FILL_HANDLER,
                         "✗".red().bold(),
                         e,
                         source_name

@@ -49,7 +49,6 @@ pub struct WebSocketResponse {
 
 /// Unified WebSocket message for single-pass parsing (hot path optimization)
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
 pub enum HlWsMessage {
     /// L2 Book subscription update
     L2Book {
@@ -61,8 +60,53 @@ pub enum HlWsMessage {
         channel: String,
         data: serde_json::Value,
     },
-    /// Unknown/ignored message
-    Unknown(serde_json::Value),
+}
+
+impl HlWsMessage {
+    /// Fast parsing method that checks channel first
+    pub fn parse_fast(text: &str) -> Result<Self, serde_json::Error> {
+        // Helper to check channel
+        #[derive(Deserialize)]
+        struct ChannelHelper<'a> {
+            channel: &'a str,
+        }
+
+        // Helper for L2Book message
+        #[derive(Deserialize)]
+        struct L2BookMsg {
+            channel: String,
+            data: L2BookData,
+        }
+
+        // Helper for SubscriptionResponse message
+        #[derive(Deserialize)]
+        struct SubResponseMsg {
+            channel: String,
+            data: serde_json::Value,
+        }
+
+        // Fast check of channel
+        match serde_json::from_str::<ChannelHelper>(text) {
+            Ok(helper) => match helper.channel {
+                "l2Book" => {
+                    let msg: L2BookMsg = serde_json::from_str(text)?;
+                    Ok(HlWsMessage::L2Book {
+                        channel: msg.channel,
+                        data: msg.data,
+                    })
+                }
+                "subscriptionResponse" => {
+                    let msg: SubResponseMsg = serde_json::from_str(text)?;
+                    Ok(HlWsMessage::SubscriptionResponse {
+                        channel: msg.channel,
+                        data: msg.data,
+                    })
+                }
+                _ => Err(serde::de::Error::custom("Unknown channel")),
+            },
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Generic WebSocket POST request wrapper (info or action)
