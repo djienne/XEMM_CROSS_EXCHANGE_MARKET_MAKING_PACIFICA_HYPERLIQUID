@@ -12,7 +12,7 @@ pub mod rest_poll;
 pub mod ws_health;
 pub mod opportunity_loop;
 
-pub use fill_handler::{FillHandler, FillSource, FillType};
+pub use fill_handler::{FillHandler, FillSource, FillType, hash_cloid};
 
 use crate::strategy::OrderSide;
 

@@ -6,13 +6,12 @@
 //! Deduplication is handled by the hedge service (single consumer), not here.
 //! This keeps the fill handler lock-free for maximum hot-path performance.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use colored::Colorize;
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
 
@@ -21,6 +20,21 @@ use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading, PositionBas
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
+
+/// Fast FNV-1a hash for client_order_id comparison (lock-free).
+/// Uses 64-bit FNV-1a which has good distribution for short strings like UUIDs.
+#[inline]
+pub fn hash_cloid(s: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in s.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
 
 // Pre-computed colored log prefixes (avoid allocation in hot path)
 static PREFIX_WEBSOCKET: Lazy<String> = Lazy::new(|| "[FILL_DETECTION]".magenta().bold().to_string());
@@ -87,8 +101,9 @@ pub struct FillHandler {
     baseline_updater: Option<PositionBaselineUpdater>,
     /// Atomic status for lock-free fast-path rejection
     atomic_status: Arc<AtomicU8>,
-    /// Expected client_order_id for fast ownership check (avoids RwLock)
-    expected_cloid: Arc<Mutex<Option<String>>>,
+    /// Hash of expected client_order_id for lock-free ownership check
+    /// 0 means no expected order
+    expected_cloid_hash: Arc<AtomicU64>,
 }
 
 impl FillHandler {
@@ -108,7 +123,7 @@ impl FillHandler {
             symbol,
             baseline_updater,
             atomic_status: Arc::new(AtomicU8::new(STATUS_IDLE)),
-            expected_cloid: Arc::new(Mutex::new(None)),
+            expected_cloid_hash: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -121,7 +136,7 @@ impl FillHandler {
         symbol: String,
         baseline_updater: Option<PositionBaselineUpdater>,
         atomic_status: Arc<AtomicU8>,
-        expected_cloid: Arc<Mutex<Option<String>>>,
+        expected_cloid_hash: Arc<AtomicU64>,
     ) -> Self {
         Self {
             bot_state,
@@ -131,18 +146,24 @@ impl FillHandler {
             symbol,
             baseline_updater,
             atomic_status,
-            expected_cloid,
+            expected_cloid_hash,
         }
     }
 
-    /// Update expected client_order_id when placing an order
-    pub fn set_expected_cloid(&self, cloid: Option<String>) {
-        *self.expected_cloid.lock() = cloid;
+    /// Update expected client_order_id when placing an order (lock-free)
+    pub fn set_expected_cloid(&self, cloid: Option<&str>) {
+        let hash = cloid.map(hash_cloid).unwrap_or(0);
+        self.expected_cloid_hash.store(hash, Ordering::Release);
     }
 
     /// Get the atomic status handle for external updates
     pub fn atomic_status(&self) -> &Arc<AtomicU8> {
         &self.atomic_status
+    }
+
+    /// Get the expected cloid hash handle for external updates
+    pub fn expected_cloid_hash(&self) -> &Arc<AtomicU64> {
+        &self.expected_cloid_hash
     }
 
     /// Parse order side from string (handles both "buy"/"sell" and "bid"/"ask").
@@ -163,13 +184,14 @@ impl FillHandler {
         status == STATUS_ORDER_PLACED
     }
 
-    /// Fast ownership check using cached cloid - uses parking_lot Mutex (no async)
+    /// Fast ownership check using atomic hash comparison (completely lock-free)
     #[inline]
     fn fast_is_our_order(&self, client_order_id: Option<&str>) -> bool {
         match client_order_id {
             Some(cloid) => {
-                let expected = self.expected_cloid.lock();
-                expected.as_ref().map(|e| e == cloid).unwrap_or(false)
+                let expected_hash = self.expected_cloid_hash.load(Ordering::Acquire);
+                // 0 means no expected order
+                expected_hash != 0 && hash_cloid(cloid) == expected_hash
             }
             None => false,
         }

@@ -24,8 +24,8 @@ pub struct FillDetectionService {
     pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
     /// Minimum notional value (USD) to trigger hedge on partial fills
     pub min_hedge_notional: f64,
-    /// Expected client_order_id for fast ownership check (shared with FillHandler)
-    pub expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Expected client_order_id hash for lock-free ownership check (shared with FillHandler)
+    pub expected_cloid_hash: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FillDetectionService {
@@ -53,7 +53,7 @@ impl FillDetectionService {
             self.symbol.clone(),
             Some(self.baseline_updater.clone()),
             self.atomic_status.clone(),
-            self.expected_cloid.clone(),
+            self.expected_cloid_hash.clone(),
         );
 
         // Clone dependencies for the callback closure

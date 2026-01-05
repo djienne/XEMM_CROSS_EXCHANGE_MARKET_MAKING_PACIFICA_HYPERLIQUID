@@ -146,7 +146,7 @@ impl BotFactory {
             (state.status_atomic.clone(), state.last_cancel_ms.clone())
         };
         let order_snapshot = Arc::new(SharedOrderSnapshot::new());
-        let expected_cloid = Arc::new(parking_lot::Mutex::new(None));
+        let expected_cloid_hash = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         Ok(XemmBot {
             config,
@@ -166,7 +166,7 @@ impl BotFactory {
             atomic_status,
             last_cancel_ms,
             order_snapshot,
-            expected_cloid,
+            expected_cloid_hash,
             hedge_tx,
             hedge_rx: Some(hedge_rx),
             shutdown_tx,

@@ -10,6 +10,7 @@ use crate::bot::{ActiveOrder, BotState};
 use crate::config::Config;
 use crate::connector::pacifica::{PacificaTradingClient, OrderSide as PacificaOrderSide};
 use crate::services::{
+    hash_cloid,
     market_event::MarketEventHub,
     order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, sync_atomic_status, update_order_snapshot},
 };
@@ -29,8 +30,8 @@ pub struct OpportunityLoopService {
     last_cancel_ms: Arc<AtomicU64>,
     order_snapshot: Arc<SharedOrderSnapshot>,
     order_monitor: Arc<OrderMonitorService>,
-    /// Expected client_order_id for fast fill ownership check
-    expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Expected client_order_id hash for lock-free fill ownership check
+    expected_cloid_hash: Arc<AtomicU64>,
 }
 
 impl OpportunityLoopService {
@@ -46,7 +47,7 @@ impl OpportunityLoopService {
         last_cancel_ms: Arc<AtomicU64>,
         order_snapshot: Arc<SharedOrderSnapshot>,
         order_monitor: Arc<OrderMonitorService>,
-        expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
+        expected_cloid_hash: Arc<AtomicU64>,
     ) -> Self {
         Self {
             config,
@@ -59,7 +60,7 @@ impl OpportunityLoopService {
             last_cancel_ms,
             order_snapshot,
             order_monitor,
-            expected_cloid,
+            expected_cloid_hash,
         }
     }
 
@@ -259,8 +260,8 @@ impl OpportunityLoopService {
                             &client_order_id[client_order_id.len()-4..]
                         );
 
-                        // Update expected cloid for fast fill ownership check (before state lock)
-                        *self.expected_cloid.lock() = Some(client_order_id.clone());
+                        // Update expected cloid hash for lock-free fill ownership check
+                        self.expected_cloid_hash.store(hash_cloid(&client_order_id), Ordering::Release);
 
                         let active_order = ActiveOrder {
                             client_order_id,

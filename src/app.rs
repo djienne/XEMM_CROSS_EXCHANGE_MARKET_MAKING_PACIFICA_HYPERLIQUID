@@ -64,8 +64,8 @@ pub struct XemmBot {
     pub atomic_status: Arc<AtomicU8>,
     pub last_cancel_ms: Arc<AtomicU64>,
     pub order_snapshot: Arc<SharedOrderSnapshot>,
-    /// Expected client_order_id for fast fill ownership check
-    pub expected_cloid: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Expected client_order_id hash for lock-free fill ownership check
+    pub expected_cloid_hash: Arc<AtomicU64>,
 
     // Channels
     pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
@@ -175,7 +175,7 @@ impl XemmBot {
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
             min_hedge_notional: self.config.min_hedge_notional_usd,
-            expected_cloid: self.expected_cloid.clone(),
+            expected_cloid_hash: self.expected_cloid_hash.clone(),
         };
         tokio::spawn(async move {
             fill_service.run().await;
@@ -314,7 +314,7 @@ impl XemmBot {
             self.last_cancel_ms.clone(),
             self.order_snapshot.clone(),
             order_monitor_service.clone(),
-            self.expected_cloid.clone(),
+            self.expected_cloid_hash.clone(),
         );
 
         // Run the opportunity loop (blocking until shutdown)
