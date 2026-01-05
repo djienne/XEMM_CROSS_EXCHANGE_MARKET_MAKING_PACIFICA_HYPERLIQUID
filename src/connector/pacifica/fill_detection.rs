@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -97,8 +97,8 @@ pub struct FillDetectionClient {
     ws_url: String,
     /// Position snapshots per symbol for delta detection
     position_snapshots: Arc<Mutex<HashMap<String, PositionSnapshot>>>,
-    /// Track last order fill time for cross-validation (symbol -> timestamp)
-    last_order_fill_time: Arc<Mutex<Instant>>,
+    /// Track last order fill time (epoch ms) for cross-validation (lock-free)
+    last_order_fill_time_ms: AtomicU64,
     /// Track which symbols have received their first position update (for baseline initialization)
     position_initialized: Arc<Mutex<HashSet<String>>>,
 }
@@ -120,7 +120,7 @@ impl FillDetectionClient {
             config,
             ws_url,
             position_snapshots: Arc::new(Mutex::new(HashMap::new())),
-            last_order_fill_time: Arc::new(Mutex::new(Instant::now())),
+            last_order_fill_time_ms: AtomicU64::new(now_epoch_ms()),
             position_initialized: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -348,8 +348,8 @@ impl FillDetectionClient {
             FillDetectionWsMessage::OrderUpdates { channel, data } if channel == "account_order_updates" => {
                 debug!("Received {} order update(s)", data.len());
 
-                // Update last order fill time for cross-validation
-                *self.last_order_fill_time.lock() = Instant::now();
+                // Update last order fill time for cross-validation (lock-free)
+                self.last_order_fill_time_ms.store(now_epoch_ms(), Ordering::Release);
 
                 // Process each order update
                 for update in data {
@@ -549,16 +549,16 @@ impl FillDetectionClient {
             },
         );
 
-        // Release position locks before acquiring last_order_fill_time lock
-        // to avoid potential deadlock and reduce lock hold time
+        // Release position locks to reduce lock hold time
         drop(snapshots);
         drop(initialized);
 
-        // Cross-validate: check if we received order fills recently (for logging purposes only)
+        // Cross-validate: check if we received order fills recently (lock-free)
         let (cross_validated, seconds_since_last_fill) = {
-            let last_time = self.last_order_fill_time.lock();
-            let elapsed = last_time.elapsed().as_secs();
-            (elapsed < 60, elapsed)
+            let last_fill_ms = self.last_order_fill_time_ms.load(Ordering::Acquire);
+            let now_ms = now_epoch_ms();
+            let elapsed_secs = now_ms.saturating_sub(last_fill_ms) / 1000;
+            (elapsed_secs < 60, elapsed_secs)
         };
 
         // Log fill detection with cross-validation status (informational only)
@@ -598,4 +598,13 @@ impl FillDetectionClient {
             cross_validated,
         })
     }
+}
+
+/// Get current time as milliseconds since Unix epoch
+#[inline]
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
