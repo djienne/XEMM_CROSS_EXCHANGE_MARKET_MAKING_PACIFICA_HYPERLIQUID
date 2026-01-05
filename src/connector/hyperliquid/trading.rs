@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::transaction::eip712::TypedData;
 use ethers::types::H256;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+use super::client_trait::HyperliquidTradingClient;
 use super::types::*;
 
 const MAINNET_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -620,5 +622,82 @@ impl HyperliquidTrading {
     /// Get wallet address from the internal wallet
     pub fn get_wallet_address(&self) -> String {
         format!("{:?}", self.wallet.address())
+    }
+}
+
+/// Implementation of HyperliquidTradingClient trait for HyperliquidTrading.
+///
+/// This enables dependency injection and mock testing.
+#[async_trait]
+impl HyperliquidTradingClient for HyperliquidTrading {
+    async fn get_l2_snapshot(&self, coin: &str) -> Result<Option<(f64, f64)>> {
+        HyperliquidTrading::get_l2_snapshot(self, coin).await
+    }
+
+    async fn place_market_order(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        size: f64,
+        slippage: f64,
+        reduce_only: bool,
+        bid: Option<f64>,
+        ask: Option<f64>,
+    ) -> Result<OrderResponse> {
+        HyperliquidTrading::place_market_order(self, coin, is_buy, size, slippage, reduce_only, bid, ask).await
+    }
+
+    async fn build_market_order_request(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        size: f64,
+        slippage: f64,
+        reduce_only: bool,
+        bid: Option<f64>,
+        ask: Option<f64>,
+    ) -> Result<OrderRequest> {
+        HyperliquidTrading::build_market_order_request(self, coin, is_buy, size, slippage, reduce_only, bid, ask).await
+    }
+
+    async fn build_market_order_request_with_meta(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        size: f64,
+        slippage: f64,
+        reduce_only: bool,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        asset_id: u32,
+        sz_decimals: i32,
+    ) -> Result<OrderRequest> {
+        HyperliquidTrading::build_market_order_request_with_meta(
+            self, coin, is_buy, size, slippage, reduce_only, bid, ask, asset_id, sz_decimals
+        ).await
+    }
+
+    async fn get_user_fills(&self, user: &str, aggregate_by_time: bool) -> Result<Vec<UserFill>> {
+        HyperliquidTrading::get_user_fills(self, user, aggregate_by_time).await
+    }
+
+    async fn get_user_state(&self, user: &str) -> Result<UserState> {
+        HyperliquidTrading::get_user_state(self, user).await
+    }
+
+    async fn get_asset_info(&self, coin: &str) -> Result<AssetMeta> {
+        HyperliquidTrading::get_asset_info(self, coin).await
+    }
+
+    async fn get_asset_id(&self, coin: &str) -> Result<u32> {
+        HyperliquidTrading::get_asset_id(self, coin).await
+    }
+
+    fn is_testnet(&self) -> bool {
+        HyperliquidTrading::is_testnet(self)
+    }
+
+    fn get_wallet_address(&self) -> String {
+        HyperliquidTrading::get_wallet_address(self)
     }
 }

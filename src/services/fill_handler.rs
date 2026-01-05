@@ -376,3 +376,469 @@ impl FillHandler {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ============== hash_cloid tests ==============
+
+    #[test]
+    fn test_hash_cloid_deterministic() {
+        let cloid = "550e8400-e29b-41d4-a716-446655440000";
+        let hash1 = hash_cloid(cloid);
+        let hash2 = hash_cloid(cloid);
+        assert_eq!(hash1, hash2, "Same input should produce same hash");
+    }
+
+    #[test]
+    fn test_hash_cloid_different_inputs() {
+        let hash1 = hash_cloid("cloid-1");
+        let hash2 = hash_cloid("cloid-2");
+        assert_ne!(hash1, hash2, "Different inputs should produce different hashes");
+    }
+
+    #[test]
+    fn test_hash_cloid_empty_string() {
+        let hash = hash_cloid("");
+        // FNV-1a hash of empty string should be the offset basis
+        assert_eq!(hash, 0xcbf29ce484222325);
+    }
+
+    // ============== parse_side tests ==============
+
+    #[test]
+    fn test_parse_side_buy() {
+        assert_eq!(FillHandler::parse_side("buy"), Some(OrderSide::Buy));
+        assert_eq!(FillHandler::parse_side("bid"), Some(OrderSide::Buy));
+    }
+
+    #[test]
+    fn test_parse_side_sell() {
+        assert_eq!(FillHandler::parse_side("sell"), Some(OrderSide::Sell));
+        assert_eq!(FillHandler::parse_side("ask"), Some(OrderSide::Sell));
+    }
+
+    #[test]
+    fn test_parse_side_invalid() {
+        assert_eq!(FillHandler::parse_side("long"), None);
+        assert_eq!(FillHandler::parse_side("short"), None);
+        assert_eq!(FillHandler::parse_side(""), None);
+        assert_eq!(FillHandler::parse_side("BUY"), None); // Case sensitive
+    }
+
+    // ============== FillSource tests ==============
+
+    #[test]
+    fn test_fill_source_names() {
+        assert_eq!(FillSource::WebSocket.name(), "WebSocket");
+        assert_eq!(FillSource::RestApi.name(), "REST");
+        assert_eq!(FillSource::PositionDelta.name(), "Position");
+    }
+
+    // ============== Atomic status tests ==============
+
+    #[test]
+    fn test_atomic_status_order_placed_allows_fill() {
+        let status = AtomicU8::new(STATUS_ORDER_PLACED);
+        assert_eq!(status.load(Ordering::Acquire), STATUS_ORDER_PLACED);
+    }
+
+    #[test]
+    fn test_atomic_status_idle_rejects_fill() {
+        let status = AtomicU8::new(STATUS_IDLE);
+        assert_ne!(status.load(Ordering::Acquire), STATUS_ORDER_PLACED);
+    }
+
+    #[test]
+    fn test_atomic_status_filled_rejects_fill() {
+        let status = AtomicU8::new(STATUS_FILLED);
+        assert_ne!(status.load(Ordering::Acquire), STATUS_ORDER_PLACED);
+    }
+
+    // ============== Expected cloid hash tests ==============
+
+    #[test]
+    fn test_expected_cloid_hash_matching() {
+        let expected_cloid = Arc::new(AtomicU64::new(0));
+        let cloid = "test-cloid-123";
+
+        // Set expected cloid
+        expected_cloid.store(hash_cloid(cloid), Ordering::Release);
+
+        // Check matching
+        let stored_hash = expected_cloid.load(Ordering::Acquire);
+        assert_eq!(stored_hash, hash_cloid(cloid));
+    }
+
+    #[test]
+    fn test_expected_cloid_hash_not_matching() {
+        let expected_cloid = Arc::new(AtomicU64::new(0));
+        let cloid1 = "test-cloid-123";
+        let cloid2 = "different-cloid";
+
+        // Set expected cloid
+        expected_cloid.store(hash_cloid(cloid1), Ordering::Release);
+
+        // Check not matching
+        let stored_hash = expected_cloid.load(Ordering::Acquire);
+        assert_ne!(stored_hash, hash_cloid(cloid2));
+    }
+
+    #[test]
+    fn test_expected_cloid_hash_zero_means_no_order() {
+        let expected_cloid = Arc::new(AtomicU64::new(0));
+
+        // Zero means no expected order
+        let stored_hash = expected_cloid.load(Ordering::Acquire);
+        assert_eq!(stored_hash, 0);
+    }
+
+    // ============== Integration-like tests with FillHandler ==============
+
+    /// Helper to create a minimal FillHandler for testing atomic operations
+    fn create_test_fill_handler() -> (FillHandler, mpsc::UnboundedReceiver<HedgeEvent>) {
+        use crate::bot::BotState;
+
+        let bot_state = Arc::new(RwLock::new(BotState::new()));
+        let (hedge_tx, hedge_rx) = mpsc::unbounded_channel();
+
+        // For these tests we need real PacificaTrading instances
+        // but we won't call any methods that use them
+        // Instead, we'll test the atomic fast-path directly
+
+        // Create a minimal fill handler
+        let handler = FillHandler {
+            bot_state,
+            hedge_tx,
+            // These will be unused in fast-path tests
+            pacifica_trading: create_dummy_pacifica_trading(),
+            pacifica_ws_trading: create_dummy_pacifica_ws_trading(),
+            symbol: "SOL".to_string(),
+            baseline_updater: None,
+            atomic_status: Arc::new(AtomicU8::new(STATUS_IDLE)),
+            expected_cloid_hash: Arc::new(AtomicU64::new(0)),
+        };
+
+        (handler, hedge_rx)
+    }
+
+    /// Create a dummy PacificaTrading - only used for struct creation, never called
+    fn create_dummy_pacifica_trading() -> Arc<PacificaTrading> {
+        use crate::connector::pacifica::PacificaCredentials;
+
+        // This will fail if methods are called, but we won't call them in these tests
+        let creds = PacificaCredentials {
+            account: "dummy".to_string(),
+            agent_wallet: "dummy".to_string(),
+            private_key: "dummy".to_string(),
+        };
+        // Note: This will succeed as it's just constructing the client
+        Arc::new(PacificaTrading::new(creds).expect("Dummy client creation"))
+    }
+
+    /// Create a dummy PacificaWsTrading
+    fn create_dummy_pacifica_ws_trading() -> Arc<PacificaWsTrading> {
+        use crate::connector::pacifica::PacificaCredentials;
+
+        let creds = PacificaCredentials {
+            account: "dummy".to_string(),
+            agent_wallet: "dummy".to_string(),
+            private_key: "dummy".to_string(),
+        };
+        Arc::new(PacificaWsTrading::new(creds, false))
+    }
+
+    #[test]
+    fn test_fill_handler_set_expected_cloid() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        // Initially no expected cloid
+        assert_eq!(handler.expected_cloid_hash.load(Ordering::Acquire), 0);
+
+        // Set expected cloid
+        let cloid = "test-order-123";
+        handler.set_expected_cloid(Some(cloid));
+        assert_eq!(
+            handler.expected_cloid_hash.load(Ordering::Acquire),
+            hash_cloid(cloid)
+        );
+
+        // Clear expected cloid
+        handler.set_expected_cloid(None);
+        assert_eq!(handler.expected_cloid_hash.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_fill_handler_atomic_fast_path_check_idle() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        // Status is IDLE by default
+        assert!(!handler.atomic_fast_path_check(), "Should reject when IDLE");
+    }
+
+    #[test]
+    fn test_fill_handler_atomic_fast_path_check_order_placed() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        // Set status to ORDER_PLACED
+        handler.atomic_status.store(STATUS_ORDER_PLACED, Ordering::Release);
+        assert!(
+            handler.atomic_fast_path_check(),
+            "Should accept when ORDER_PLACED"
+        );
+    }
+
+    #[test]
+    fn test_fill_handler_atomic_fast_path_check_filled() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        // Set status to FILLED
+        handler.atomic_status.store(STATUS_FILLED, Ordering::Release);
+        assert!(
+            !handler.atomic_fast_path_check(),
+            "Should reject when FILLED"
+        );
+    }
+
+    #[test]
+    fn test_fill_handler_fast_is_our_order_matching() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        let cloid = "my-order-id";
+        handler.set_expected_cloid(Some(cloid));
+
+        assert!(
+            handler.fast_is_our_order(Some(cloid)),
+            "Should match when cloid equals expected"
+        );
+    }
+
+    #[test]
+    fn test_fill_handler_fast_is_our_order_not_matching() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        handler.set_expected_cloid(Some("my-order-id"));
+
+        assert!(
+            !handler.fast_is_our_order(Some("other-order-id")),
+            "Should not match when cloid differs"
+        );
+    }
+
+    #[test]
+    fn test_fill_handler_fast_is_our_order_none_cloid() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        handler.set_expected_cloid(Some("my-order-id"));
+
+        assert!(
+            !handler.fast_is_our_order(None),
+            "Should reject when cloid is None"
+        );
+    }
+
+    #[test]
+    fn test_fill_handler_fast_is_our_order_no_expected() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        // No expected cloid set (default is 0)
+        assert!(
+            !handler.fast_is_our_order(Some("any-order-id")),
+            "Should reject when no expected cloid"
+        );
+    }
+
+    // ============== Async tests ==============
+
+    #[tokio::test]
+    async fn test_handle_fill_rejects_when_idle() {
+        let (handler, mut rx) = create_test_fill_handler();
+
+        // Status is IDLE by default
+        let cloid = "test-order-123";
+        handler.set_expected_cloid(Some(cloid));
+
+        let result = handler
+            .handle_fill(
+                FillSource::WebSocket,
+                FillType::Full,
+                Some(cloid),
+                "buy",
+                1.0,
+                100.0,
+            )
+            .await;
+
+        assert!(!result, "Should reject fill when status is IDLE");
+
+        // No hedge event should be sent
+        assert!(rx.try_recv().is_err(), "No hedge event should be sent");
+    }
+
+    #[tokio::test]
+    async fn test_handle_fill_rejects_wrong_cloid() {
+        let (handler, mut rx) = create_test_fill_handler();
+
+        // Set status to ORDER_PLACED
+        handler.atomic_status.store(STATUS_ORDER_PLACED, Ordering::Release);
+        handler.set_expected_cloid(Some("expected-order"));
+
+        let result = handler
+            .handle_fill(
+                FillSource::WebSocket,
+                FillType::Full,
+                Some("wrong-order"), // Different cloid
+                "buy",
+                1.0,
+                100.0,
+            )
+            .await;
+
+        assert!(!result, "Should reject fill with wrong cloid");
+        assert!(rx.try_recv().is_err(), "No hedge event should be sent");
+    }
+
+    #[tokio::test]
+    async fn test_handle_fill_rejects_missing_cloid() {
+        let (handler, mut rx) = create_test_fill_handler();
+
+        // Set status to ORDER_PLACED
+        handler.atomic_status.store(STATUS_ORDER_PLACED, Ordering::Release);
+        handler.set_expected_cloid(Some("expected-order"));
+
+        let result = handler
+            .handle_fill(
+                FillSource::WebSocket,
+                FillType::Full,
+                None, // No cloid
+                "buy",
+                1.0,
+                100.0,
+            )
+            .await;
+
+        assert!(!result, "Should reject fill with no cloid");
+        assert!(rx.try_recv().is_err(), "No hedge event should be sent");
+    }
+
+    #[tokio::test]
+    async fn test_handle_fill_success_sends_hedge_event() {
+        let (handler, mut rx) = create_test_fill_handler();
+
+        // Set status to ORDER_PLACED
+        handler.atomic_status.store(STATUS_ORDER_PLACED, Ordering::Release);
+
+        let cloid = "my-order-123";
+        handler.set_expected_cloid(Some(cloid));
+
+        let result = handler
+            .handle_fill(
+                FillSource::WebSocket,
+                FillType::Full,
+                Some(cloid),
+                "buy",
+                1.5,
+                99.50,
+            )
+            .await;
+
+        assert!(result, "Should accept valid fill");
+
+        // Check hedge event was sent
+        let event = rx.try_recv().expect("Hedge event should be sent");
+        assert_eq!(event.client_order_id, cloid);
+        assert_eq!(event.size, 1.5);
+        assert_eq!(event.avg_price, 99.50);
+        assert!(matches!(event.side, OrderSide::Buy));
+    }
+
+    #[tokio::test]
+    async fn test_handle_fill_updates_status_to_filled() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        // Set status to ORDER_PLACED
+        handler.atomic_status.store(STATUS_ORDER_PLACED, Ordering::Release);
+
+        let cloid = "my-order-123";
+        handler.set_expected_cloid(Some(cloid));
+
+        handler
+            .handle_fill(
+                FillSource::WebSocket,
+                FillType::Full,
+                Some(cloid),
+                "sell",
+                2.0,
+                101.0,
+            )
+            .await;
+
+        // Status should be updated to FILLED
+        assert_eq!(
+            handler.atomic_status.load(Ordering::Acquire),
+            STATUS_FILLED,
+            "Status should be FILLED after processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_fill_clears_expected_cloid() {
+        let (handler, _rx) = create_test_fill_handler();
+
+        // Set status to ORDER_PLACED
+        handler.atomic_status.store(STATUS_ORDER_PLACED, Ordering::Release);
+
+        let cloid = "my-order-123";
+        handler.set_expected_cloid(Some(cloid));
+
+        handler
+            .handle_fill(
+                FillSource::RestApi,
+                FillType::Full,
+                Some(cloid),
+                "buy",
+                1.0,
+                100.0,
+            )
+            .await;
+
+        // Expected cloid should be cleared after processing
+        assert_eq!(
+            handler.expected_cloid_hash.load(Ordering::Acquire),
+            0,
+            "Expected cloid should be cleared after fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_fill_updates_bot_state() {
+        use crate::bot::BotStatus;
+
+        let (handler, _rx) = create_test_fill_handler();
+
+        // Set status to ORDER_PLACED
+        handler.atomic_status.store(STATUS_ORDER_PLACED, Ordering::Release);
+
+        let cloid = "my-order-123";
+        handler.set_expected_cloid(Some(cloid));
+
+        handler
+            .handle_fill(
+                FillSource::WebSocket,
+                FillType::Full,
+                Some(cloid),
+                "buy",
+                3.0,
+                50.0,
+            )
+            .await;
+
+        // Check bot state was updated to Filled
+        let state = handler.bot_state.read().await;
+        assert!(
+            matches!(state.status, BotStatus::Filled),
+            "Bot state should be Filled"
+        );
+    }
+}

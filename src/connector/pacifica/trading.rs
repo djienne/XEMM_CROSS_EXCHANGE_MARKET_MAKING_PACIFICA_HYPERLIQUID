@@ -62,7 +62,7 @@ pub struct OrderResponse {
     pub data: Option<OrderData>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OrderData {
     pub order_id: Option<u64>,
     #[serde(rename = "i")]
@@ -916,6 +916,9 @@ fn canonicalize_json_to_buf(value: &serde_json::Value, out: &mut String) {
     }
 }
 
+/// Implementation of PacificaTradingClient trait for PacificaTrading.
+///
+/// This enables dependency injection and mock testing.
 #[async_trait]
 impl PacificaTradingClient for PacificaTrading {
     async fn place_limit_order(
@@ -1060,5 +1063,26 @@ impl PacificaTradingClient for PacificaTrading {
             client_order_id: Some(client_order_id),
             symbol: Some(symbol.to_string()),
         })
+    }
+
+    async fn cancel_all_orders(
+        &self,
+        all_symbols: bool,
+        symbol: Option<&str>,
+        exclude_reduce_only: bool,
+    ) -> Result<u32> {
+        PacificaTrading::cancel_all_orders(self, all_symbols, symbol, exclude_reduce_only).await
+    }
+
+    async fn get_open_orders(&self) -> Result<Vec<OpenOrderItem>> {
+        PacificaTrading::get_open_orders(self).await
+    }
+
+    async fn get_positions(&self) -> Result<Vec<PositionItem>> {
+        PacificaTrading::get_positions(self).await
+    }
+
+    async fn cancel_order(&self, symbol: &str, client_order_id: &str) -> Result<()> {
+        PacificaTrading::cancel_order(self, symbol, client_order_id).await
     }
 }

@@ -321,3 +321,417 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bot::BotState;
+    use crate::config::Config;
+    use crate::connector::mocks::MockPacificaTradingClient;
+    use crate::services::order_monitor::SharedOrderSnapshot;
+    use crate::strategy::OpportunityEvaluator;
+    use crate::util::atomic_price::AtomicPrice;
+    use crate::util::rate_limit::RateLimitTracker;
+    use std::sync::atomic::Ordering;
+
+    /// Create a test config with reasonable defaults
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.symbol = "SOL".to_string();
+        config.pacifica_maker_fee_bps = 2.0;
+        config.hyperliquid_taker_fee_bps = 3.0;
+        config.profit_rate_bps = 5.0;
+        config.order_notional_usd = 100.0;
+        config.profit_cancel_threshold_bps = 2.0;
+        config.cancel_grace_period_ms = 1000;
+        config.hyperliquid_slippage = 0.05;
+        config.hyperliquid_use_ws_for_hedge = false;
+        config.min_hedge_notional_usd = 10.0;
+        config
+    }
+
+    /// Create test evaluator
+    fn test_evaluator(config: &Config) -> OpportunityEvaluator {
+        OpportunityEvaluator::new(
+            config.pacifica_maker_fee_bps,
+            config.hyperliquid_taker_fee_bps,
+            config.profit_rate_bps,
+            0.01, // pacifica_tick_size
+        )
+    }
+
+    /// Create a minimal OrderMonitorService for testing
+    /// This creates a stub that won't panic but doesn't need real implementations
+    fn create_stub_order_monitor(
+        bot_state: Arc<RwLock<BotState>>,
+        atomic_status: Arc<AtomicU8>,
+        order_snapshot: Arc<SharedOrderSnapshot>,
+        pacifica_prices: Arc<AtomicPrice>,
+        hyperliquid_prices: Arc<AtomicPrice>,
+        config: Config,
+        evaluator: OpportunityEvaluator,
+    ) -> Arc<OrderMonitorService> {
+        use crate::connector::pacifica::{PacificaTrading, PacificaCredentials};
+        use crate::connector::hyperliquid::{HyperliquidTrading, HyperliquidCredentials};
+
+        // Create dummy trading clients (won't be called in tests)
+        let pac_creds = PacificaCredentials {
+            account: "dummy".to_string(),
+            agent_wallet: "dummy".to_string(),
+            private_key: "dummy".to_string(),
+        };
+        let pac_trading = Arc::new(PacificaTrading::new(pac_creds).expect("Dummy pac client"));
+
+        let hl_creds = HyperliquidCredentials {
+            private_key: "0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        };
+        let hl_trading = Arc::new(HyperliquidTrading::new(hl_creds, false).expect("Dummy hl client"));
+
+        let (service, _cancel_rx) = OrderMonitorService::new(
+            bot_state,
+            atomic_status,
+            order_snapshot,
+            pacifica_prices,
+            hyperliquid_prices,
+            config,
+            evaluator,
+            pac_trading,
+            hl_trading,
+        );
+
+        Arc::new(service)
+    }
+
+    /// Create the OpportunityLoopService for testing
+    fn create_test_service(
+        mock_pacifica: Arc<MockPacificaTradingClient>,
+    ) -> (OpportunityLoopService, Arc<AtomicU8>, Arc<AtomicU64>, Arc<RwLock<BotState>>, Arc<AtomicPrice>, Arc<AtomicPrice>) {
+        let config = test_config();
+        let bot_state = Arc::new(RwLock::new(BotState::new()));
+        let pacifica_prices = Arc::new(AtomicPrice::new());
+        let hyperliquid_prices = Arc::new(AtomicPrice::new());
+        let evaluator = test_evaluator(&config);
+        let atomic_status = Arc::new(AtomicU8::new(0)); // Idle
+        let last_cancel_ms = Arc::new(AtomicU64::new(0));
+        let order_snapshot = Arc::new(SharedOrderSnapshot::new());
+        let expected_cloid_hash = Arc::new(AtomicU64::new(0));
+
+        // Create order monitor (with stub implementations)
+        let order_monitor = create_stub_order_monitor(
+            bot_state.clone(),
+            atomic_status.clone(),
+            order_snapshot.clone(),
+            pacifica_prices.clone(),
+            hyperliquid_prices.clone(),
+            config.clone(),
+            evaluator.clone(),
+        );
+
+        let service = OpportunityLoopService::new(
+            config,
+            bot_state.clone(),
+            mock_pacifica,
+            pacifica_prices.clone(),
+            hyperliquid_prices.clone(),
+            evaluator,
+            atomic_status.clone(),
+            last_cancel_ms.clone(),
+            order_snapshot,
+            order_monitor,
+            expected_cloid_hash,
+        );
+
+        (service, atomic_status, last_cancel_ms, bot_state, pacifica_prices, hyperliquid_prices)
+    }
+
+    // ============== evaluate_and_place_orders tests ==============
+
+    #[tokio::test]
+    async fn test_places_buy_order_when_profitable() {
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+        let (service, _atomic_status, _last_cancel_ms, _bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        let mut rate_limiter = RateLimitTracker::new();
+
+        // Create a BUY opportunity: HL bid is high relative to Pacifica
+        // HL bid at $101, we can buy on Pacifica and sell on HL for profit
+        service.evaluate_and_place_orders(
+            100.0,   // pac_bid
+            100.1,   // pac_ask
+            101.0,   // hl_bid - HIGH enough for buy opportunity
+            101.1,   // hl_ask
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        // Order should be placed
+        assert_eq!(
+            mock_pacifica.place_limit_order_calls.load(Ordering::SeqCst),
+            1,
+            "One order should be placed for buy opportunity"
+        );
+
+        // Check it was a BUY order
+        let side = mock_pacifica.last_order_side.lock().unwrap();
+        assert!(
+            matches!(*side, Some(crate::strategy::OrderSide::Buy)),
+            "Should be a BUY order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_places_sell_order_when_profitable() {
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+        let (service, _atomic_status, _last_cancel_ms, _bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        let mut rate_limiter = RateLimitTracker::new();
+
+        // Create a SELL opportunity: HL ask is low relative to Pacifica
+        // HL ask at $99, we can sell on Pacifica and buy on HL for profit
+        service.evaluate_and_place_orders(
+            100.0,   // pac_bid
+            100.1,   // pac_ask
+            98.9,    // hl_bid
+            99.0,    // hl_ask - LOW enough for sell opportunity
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        // Order should be placed
+        assert_eq!(
+            mock_pacifica.place_limit_order_calls.load(Ordering::SeqCst),
+            1,
+            "One order should be placed for sell opportunity"
+        );
+
+        // Check it was a SELL order
+        let side = mock_pacifica.last_order_side.lock().unwrap();
+        assert!(
+            matches!(*side, Some(crate::strategy::OrderSide::Sell)),
+            "Should be a SELL order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_order_when_status_not_idle() {
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+        let (service, atomic_status, _last_cancel_ms, _bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        // Set status to OrderPlaced (1)
+        atomic_status.store(1, Ordering::Release);
+
+        let mut rate_limiter = RateLimitTracker::new();
+
+        // Even with profitable opportunity, should not place order
+        service.evaluate_and_place_orders(
+            100.0,
+            100.1,
+            101.0,  // High HL bid (buy opportunity)
+            101.1,
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        assert_eq!(
+            mock_pacifica.place_limit_order_calls.load(Ordering::SeqCst),
+            0,
+            "No order when status is not Idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_order_when_bot_state_not_idle() {
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+        let (service, _atomic_status, _last_cancel_ms, bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        // Set bot state to non-idle by setting an active order
+        {
+            let mut state = bot_state.write().await;
+            state.set_active_order(ActiveOrder {
+                client_order_id: "existing-order".to_string(),
+                symbol: "SOL".to_string(),
+                side: crate::strategy::OrderSide::Buy,
+                price: 100.0,
+                size: 1.0,
+                initial_profit_bps: 10.0,
+                placed_at: Instant::now(),
+            });
+        }
+
+        let mut rate_limiter = RateLimitTracker::new();
+
+        // Even with profitable opportunity, should not place order
+        service.evaluate_and_place_orders(
+            100.0,
+            100.1,
+            101.0,  // High HL bid (buy opportunity)
+            101.1,
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        assert_eq!(
+            mock_pacifica.place_limit_order_calls.load(Ordering::SeqCst),
+            0,
+            "No order when bot state is not Idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_order_updates_state() {
+        use crate::bot::BotStatus;
+
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+        let (service, atomic_status, _last_cancel_ms, bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        let mut rate_limiter = RateLimitTracker::new();
+
+        // Place a profitable order
+        service.evaluate_and_place_orders(
+            100.0,
+            100.1,
+            101.0,  // High HL bid (buy opportunity)
+            101.1,
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        // Check atomic status was updated to OrderPlaced (1)
+        assert_eq!(
+            atomic_status.load(Ordering::Acquire),
+            1,
+            "Atomic status should be OrderPlaced after successful order"
+        );
+
+        // Check bot state was updated
+        let state = bot_state.read().await;
+        assert!(
+            matches!(state.status, BotStatus::OrderPlaced),
+            "Bot status should be OrderPlaced"
+        );
+        assert!(state.active_order.is_some(), "Active order should be set");
+    }
+
+    #[tokio::test]
+    async fn test_successful_order_sets_expected_cloid() {
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+        let (service, _atomic_status, _last_cancel_ms, _bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        let mut rate_limiter = RateLimitTracker::new();
+
+        // Place a profitable order
+        service.evaluate_and_place_orders(
+            100.0,
+            100.1,
+            101.0,
+            101.1,
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        // Expected cloid hash should be set (non-zero)
+        assert_ne!(
+            service.expected_cloid_hash.load(Ordering::Acquire),
+            0,
+            "Expected cloid hash should be set after order placement"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_error_triggers_backoff() {
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+
+        // Configure mock to return rate limit error
+        *mock_pacifica.place_limit_order_result.lock().unwrap() =
+            Err(anyhow::anyhow!("Rate limit exceeded"));
+
+        let (service, _atomic_status, _last_cancel_ms, _bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        let mut rate_limiter = RateLimitTracker::new();
+        assert_eq!(rate_limiter.consecutive_errors(), 0);
+
+        // Try to place order (will fail with rate limit)
+        service.evaluate_and_place_orders(
+            100.0,
+            100.1,
+            101.0,
+            101.1,
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        // Rate limiter should record the error
+        assert_eq!(
+            rate_limiter.consecutive_errors(),
+            1,
+            "Rate limiter should track the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_order_resets_rate_limit() {
+        let mock_pacifica = Arc::new(MockPacificaTradingClient::new());
+        let (service, _atomic_status, _last_cancel_ms, _bot_state, _pac_prices, _hl_prices) =
+            create_test_service(mock_pacifica.clone());
+
+        let mut rate_limiter = RateLimitTracker::new();
+
+        // Simulate previous errors
+        rate_limiter.record_error();
+        rate_limiter.record_error();
+        assert_eq!(rate_limiter.consecutive_errors(), 2);
+
+        // Place a successful order
+        service.evaluate_and_place_orders(
+            100.0,
+            100.1,
+            101.0,
+            101.1,
+            now_epoch_ms(),
+            &mut rate_limiter,
+        ).await;
+
+        // Rate limiter should be reset
+        assert_eq!(
+            rate_limiter.consecutive_errors(),
+            0,
+            "Rate limiter should reset after successful order"
+        );
+    }
+
+    // ============== OpportunityEvaluator tests (testing real evaluation logic) ==============
+
+    #[test]
+    fn test_evaluator_buy_opportunity_calculation() {
+        let config = test_config();
+        let evaluator = test_evaluator(&config);
+
+        // High HL bid should create buy opportunity
+        let opp = evaluator.evaluate_buy_opportunity(101.0, 100.0, now_epoch_ms());
+
+        assert!(opp.is_some(), "Should have buy opportunity with high HL bid");
+        let opp = opp.unwrap();
+        assert!(opp.initial_profit_bps > 0.0, "Profit should be positive");
+    }
+
+    #[test]
+    fn test_evaluator_sell_opportunity_calculation() {
+        let config = test_config();
+        let evaluator = test_evaluator(&config);
+
+        // Low HL ask should create sell opportunity
+        let opp = evaluator.evaluate_sell_opportunity(99.0, 100.0, now_epoch_ms());
+
+        assert!(opp.is_some(), "Should have sell opportunity with low HL ask");
+        let opp = opp.unwrap();
+        assert!(opp.initial_profit_bps > 0.0, "Profit should be positive");
+    }
+
+}
