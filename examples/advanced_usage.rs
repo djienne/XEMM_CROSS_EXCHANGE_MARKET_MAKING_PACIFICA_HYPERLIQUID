@@ -44,8 +44,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Start client with callback
     client.start(move |best_bid, best_ask, symbol, timestamp| {
-        let bid_price: f64 = best_bid.parse().unwrap_or(0.0);
-        let ask_price: f64 = best_ask.parse().unwrap_or(0.0);
+        let bid_price = best_bid;
+        let ask_price = best_ask;
         let mid_price = (bid_price + ask_price) / 2.0;
         let spread = ask_price - bid_price;
         let spread_bps = if bid_price > 0.0 {

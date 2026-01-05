@@ -604,3 +604,400 @@ impl FillDetectionWsMessage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORDERBOOK_JSON: &str = r#"{
+        "channel": "book",
+        "data": {
+            "l": [
+                [{"p": "100.50", "a": "10.5", "n": 3}],
+                [{"p": "100.55", "a": "8.2", "n": 2}]
+            ],
+            "s": "SOL",
+            "t": 1704067200000
+        }
+    }"#;
+
+    const PONG_JSON: &str = r#"{"channel": "pong"}"#;
+
+    const ORDER_UPDATE_FILLED_JSON: &str = r#"{
+        "channel": "account_order_updates",
+        "data": [{
+            "i": 12345,
+            "I": "test-order-123",
+            "u": "account123",
+            "s": "SOL",
+            "d": "bid",
+            "p": "100.50",
+            "ip": "100.50",
+            "a": "1.0",
+            "f": "1.0",
+            "oe": "fulfill_limit",
+            "os": "filled",
+            "ot": "limit",
+            "r": false,
+            "ut": 1704067200000,
+            "ct": 1704067190000
+        }]
+    }"#;
+
+    const ORDER_UPDATE_PARTIAL_JSON: &str = r#"{
+        "channel": "account_order_updates",
+        "data": [{
+            "i": 12346,
+            "I": "test-order-456",
+            "u": "account123",
+            "s": "SOL",
+            "d": "ask",
+            "p": "100.55",
+            "ip": "100.55",
+            "a": "2.0",
+            "f": "0.5",
+            "oe": "fulfill_limit",
+            "os": "partially_filled",
+            "ot": "limit",
+            "r": false,
+            "ut": 1704067200000,
+            "ct": 1704067190000
+        }]
+    }"#;
+
+    const ORDER_UPDATE_CANCELLED_JSON: &str = r#"{
+        "channel": "account_order_updates",
+        "data": [{
+            "i": 12347,
+            "I": "test-order-789",
+            "u": "account123",
+            "s": "SOL",
+            "d": "bid",
+            "p": "100.45",
+            "ip": "100.45",
+            "a": "1.0",
+            "f": "0.0",
+            "oe": "cancel",
+            "os": "cancelled",
+            "ot": "limit",
+            "r": false,
+            "ut": 1704067200000,
+            "ct": 1704067190000
+        }]
+    }"#;
+
+    #[test]
+    fn test_orderbook_parsing() {
+        let response: OrderbookResponse = serde_json::from_str(ORDERBOOK_JSON).unwrap();
+
+        assert_eq!(response.channel, "book");
+        assert_eq!(response.data.symbol, "SOL");
+        assert_eq!(response.data.timestamp, 1704067200000);
+        assert_eq!(response.data.levels.len(), 2);
+
+        // Check bids (first level array)
+        let bids = &response.data.levels[0];
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].price, "100.50");
+        assert_eq!(bids[0].amount, "10.5");
+        assert_eq!(bids[0].num_orders, 3);
+
+        // Check asks (second level array)
+        let asks = &response.data.levels[1];
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].price, "100.55");
+        assert_eq!(asks[0].amount, "8.2");
+        assert_eq!(asks[0].num_orders, 2);
+    }
+
+    #[test]
+    fn test_top_of_book_extraction() {
+        let response: OrderbookResponse = serde_json::from_str(ORDERBOOK_JSON).unwrap();
+        let top = response.data.get_top_of_book();
+
+        assert_eq!(top.symbol, "SOL");
+        assert_eq!(top.timestamp, 1704067200000);
+
+        let best_bid = top.best_bid.unwrap();
+        assert_eq!(best_bid.price, "100.50");
+        assert_eq!(best_bid.amount, "10.5");
+
+        let best_ask = top.best_ask.unwrap();
+        assert_eq!(best_ask.price, "100.55");
+        assert_eq!(best_ask.amount, "8.2");
+    }
+
+    #[test]
+    fn test_top_of_book_empty_levels() {
+        let data = OrderbookData {
+            levels: vec![vec![], vec![]],
+            symbol: "SOL".to_string(),
+            timestamp: 1704067200000,
+        };
+        let top = data.get_top_of_book();
+
+        assert!(top.best_bid.is_none());
+        assert!(top.best_ask.is_none());
+    }
+
+    #[test]
+    fn test_ws_message_parse_fast_book() {
+        let msg = WsMessage::parse_fast(ORDERBOOK_JSON).unwrap();
+
+        match msg {
+            WsMessage::Book { channel, data } => {
+                assert_eq!(channel, "book");
+                assert_eq!(data.symbol, "SOL");
+                assert_eq!(data.timestamp, 1704067200000);
+            }
+            _ => panic!("Expected Book message"),
+        }
+    }
+
+    #[test]
+    fn test_ws_message_parse_fast_pong() {
+        let msg = WsMessage::parse_fast(PONG_JSON).unwrap();
+
+        match msg {
+            WsMessage::Pong { channel } => {
+                assert_eq!(channel, "pong");
+            }
+            _ => panic!("Expected Pong message"),
+        }
+    }
+
+    #[test]
+    fn test_ws_message_parse_fast_unknown_channel() {
+        let unknown_json = r#"{"channel": "unknown_channel"}"#;
+        let result = WsMessage::parse_fast(unknown_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_order_update_to_fill_event_full() {
+        let response: AccountOrderUpdatesResponse =
+            serde_json::from_str(ORDER_UPDATE_FILLED_JSON).unwrap();
+
+        assert_eq!(response.data.len(), 1);
+        let order_update = &response.data[0];
+
+        assert_eq!(order_update.order_id, 12345);
+        assert_eq!(order_update.client_order_id, Some("test-order-123".to_string()));
+        assert_eq!(order_update.symbol, "SOL");
+        assert_eq!(order_update.side, "bid");
+        assert_eq!(order_update.order_status, OrderStatus::Filled);
+
+        let fill_event = order_update.to_fill_event().unwrap();
+        match fill_event {
+            FillEvent::FullFill {
+                order_id,
+                client_order_id,
+                symbol,
+                side,
+                filled_amount,
+                avg_price,
+                ..
+            } => {
+                assert_eq!(order_id, 12345);
+                assert_eq!(client_order_id, Some("test-order-123".to_string()));
+                assert_eq!(symbol, "SOL");
+                assert_eq!(side, "bid");
+                assert_eq!(filled_amount, "1.0");
+                assert_eq!(avg_price, "100.50");
+            }
+            _ => panic!("Expected FullFill event"),
+        }
+    }
+
+    #[test]
+    fn test_order_update_to_fill_event_partial() {
+        let response: AccountOrderUpdatesResponse =
+            serde_json::from_str(ORDER_UPDATE_PARTIAL_JSON).unwrap();
+
+        let order_update = &response.data[0];
+        assert_eq!(order_update.order_status, OrderStatus::PartiallyFilled);
+
+        let fill_event = order_update.to_fill_event().unwrap();
+        match fill_event {
+            FillEvent::PartialFill {
+                order_id,
+                filled_amount,
+                original_amount,
+                ..
+            } => {
+                assert_eq!(order_id, 12346);
+                assert_eq!(filled_amount, "0.5");
+                assert_eq!(original_amount, "2.0");
+            }
+            _ => panic!("Expected PartialFill event"),
+        }
+    }
+
+    #[test]
+    fn test_order_update_to_fill_event_cancelled() {
+        let response: AccountOrderUpdatesResponse =
+            serde_json::from_str(ORDER_UPDATE_CANCELLED_JSON).unwrap();
+
+        let order_update = &response.data[0];
+        assert_eq!(order_update.order_status, OrderStatus::Cancelled);
+        assert_eq!(order_update.order_event, OrderEvent::Cancel);
+
+        let fill_event = order_update.to_fill_event().unwrap();
+        match fill_event {
+            FillEvent::Cancelled { reason, .. } => {
+                assert_eq!(reason, "user_cancelled");
+            }
+            _ => panic!("Expected Cancelled event"),
+        }
+    }
+
+    #[test]
+    fn test_order_update_cancelled_reasons() {
+        // Test various cancel reasons
+        let reasons = [
+            (OrderEvent::Cancel, "user_cancelled"),
+            (OrderEvent::ForceCancel, "force_cancelled"),
+            (OrderEvent::Expired, "expired"),
+            (OrderEvent::PostOnlyRejected, "post_only_rejected"),
+            (OrderEvent::SelfTradePrevented, "self_trade_prevented"),
+        ];
+
+        for (event, expected_reason) in reasons {
+            let order_update = OrderUpdate {
+                order_id: 1,
+                client_order_id: None,
+                account: "acc".to_string(),
+                symbol: "SOL".to_string(),
+                side: "bid".to_string(),
+                avg_filled_price: "0".to_string(),
+                initial_price: "100".to_string(),
+                original_amount: "1".to_string(),
+                filled_amount: "0".to_string(),
+                order_event: event,
+                order_status: OrderStatus::Cancelled,
+                order_type: "limit".to_string(),
+                stop_price: None,
+                stop_parent_order_id: None,
+                reduce_only: false,
+                updated_at: 0,
+                created_at: 0,
+            };
+
+            if let Some(FillEvent::Cancelled { reason, .. }) = order_update.to_fill_event() {
+                assert_eq!(reason, expected_reason);
+            } else {
+                panic!("Expected Cancelled event");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fill_detection_ws_message_parse_order_updates() {
+        let msg = FillDetectionWsMessage::parse_fast(ORDER_UPDATE_FILLED_JSON).unwrap();
+
+        match msg {
+            FillDetectionWsMessage::OrderUpdates { channel, data } => {
+                assert_eq!(channel, "account_order_updates");
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0].order_id, 12345);
+            }
+            _ => panic!("Expected OrderUpdates message"),
+        }
+    }
+
+    #[test]
+    fn test_fill_detection_ws_message_parse_pong() {
+        let msg = FillDetectionWsMessage::parse_fast(PONG_JSON).unwrap();
+
+        match msg {
+            FillDetectionWsMessage::Pong { channel } => {
+                assert_eq!(channel, "pong");
+            }
+            _ => panic!("Expected Pong message"),
+        }
+    }
+
+    #[test]
+    fn test_subscribe_message_creation() {
+        let msg = SubscribeMessage::new("SOL".to_string(), 1);
+
+        assert_eq!(msg.method, "subscribe");
+        assert_eq!(msg.params.source, "book");
+        assert_eq!(msg.params.symbol, "SOL");
+        assert_eq!(msg.params.agg_level, 1);
+    }
+
+    #[test]
+    fn test_unsubscribe_message_creation() {
+        let msg = UnsubscribeMessage::new("SOL".to_string(), 1);
+
+        assert_eq!(msg.method, "unsubscribe");
+        assert_eq!(msg.params.source, "book");
+        assert_eq!(msg.params.symbol, "SOL");
+    }
+
+    #[test]
+    fn test_ping_message_creation() {
+        let msg = PingMessage::new();
+        assert_eq!(msg.method, "ping");
+
+        let default_msg = PingMessage::default();
+        assert_eq!(default_msg.method, "ping");
+    }
+
+    #[test]
+    fn test_account_order_updates_subscribe() {
+        let msg = AccountOrderUpdatesSubscribe::new("account123".to_string());
+
+        assert_eq!(msg.method, "subscribe");
+        assert_eq!(msg.params.source, "account_order_updates");
+        assert_eq!(msg.params.account, "account123");
+    }
+
+    #[test]
+    fn test_account_positions_subscribe() {
+        let msg = AccountPositionsSubscribe::new("account123".to_string());
+
+        assert_eq!(msg.method, "subscribe");
+        assert_eq!(msg.params.source, "account_positions");
+        assert_eq!(msg.params.account, "account123");
+    }
+
+    #[test]
+    fn test_order_event_enum_values() {
+        // Verify all order events deserialize correctly
+        let events = [
+            ("make", OrderEvent::Make),
+            ("fulfill_market", OrderEvent::FulfillMarket),
+            ("fulfill_limit", OrderEvent::FulfillLimit),
+            ("cancel", OrderEvent::Cancel),
+            ("force_cancel", OrderEvent::ForceCancel),
+            ("expired", OrderEvent::Expired),
+            ("post_only_rejected", OrderEvent::PostOnlyRejected),
+            ("self_trade_prevented", OrderEvent::SelfTradePrevented),
+        ];
+
+        for (json_val, expected) in events {
+            let json = format!("\"{}\"", json_val);
+            let parsed: OrderEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn test_order_status_enum_values() {
+        let statuses = [
+            ("open", OrderStatus::Open),
+            ("partially_filled", OrderStatus::PartiallyFilled),
+            ("filled", OrderStatus::Filled),
+            ("cancelled", OrderStatus::Cancelled),
+            ("rejected", OrderStatus::Rejected),
+        ];
+
+        for (json_val, expected) in statuses {
+            let json = format!("\"{}\"", json_val);
+            let parsed: OrderStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+}

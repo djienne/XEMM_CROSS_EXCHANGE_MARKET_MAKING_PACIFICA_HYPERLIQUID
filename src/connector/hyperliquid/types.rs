@@ -479,3 +479,430 @@ pub struct CrossMarginSummary {
     #[serde(rename = "totalMarginUsed")]
     pub total_margin_used: String,    // Total margin used
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const L2_BOOK_JSON: &str = r#"{
+        "channel": "l2Book",
+        "data": {
+            "coin": "SOL",
+            "time": 1704067200000,
+            "levels": [
+                [{"px": "100.50", "sz": "10.5", "n": 3}],
+                [{"px": "100.55", "sz": "8.2", "n": 2}]
+            ]
+        }
+    }"#;
+
+    const SUBSCRIPTION_RESPONSE_JSON: &str = r#"{
+        "channel": "subscriptionResponse",
+        "data": {"method": "subscribe", "subscription": {"type": "l2Book", "coin": "SOL"}}
+    }"#;
+
+    const ORDER_RESPONSE_SUCCESS_JSON: &str = r#"{
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {
+                "statuses": [
+                    {"filled": {"totalSz": "1.0", "avgPx": "100.50", "oid": 12345}}
+                ]
+            }
+        }
+    }"#;
+
+    const ORDER_RESPONSE_RESTING_JSON: &str = r#"{
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {
+                "statuses": [
+                    {"resting": {"oid": 12346}}
+                ]
+            }
+        }
+    }"#;
+
+    const ORDER_RESPONSE_ERROR_JSON: &str = r#"{
+        "status": "err",
+        "response": "Insufficient margin"
+    }"#;
+
+    const USER_FILL_JSON: &str = r#"{
+        "coin": "SOL",
+        "px": "100.50",
+        "sz": "1.0",
+        "side": "B",
+        "time": 1704067200000,
+        "dir": "Open Long",
+        "fee": "0.025",
+        "feeToken": "USDC",
+        "oid": 12345,
+        "tid": 67890,
+        "hash": "0xabc123",
+        "crossed": true,
+        "closedPnl": "0",
+        "startPosition": "0"
+    }"#;
+
+    const USER_STATE_JSON: &str = r#"{
+        "assetPositions": [{
+            "type": "oneWay",
+            "position": {
+                "coin": "SOL",
+                "szi": "1.5",
+                "entryPx": "100.50",
+                "positionValue": "150.75",
+                "unrealizedPnl": "2.25",
+                "returnOnEquity": "0.015",
+                "leverage": {"type": "cross", "value": 5},
+                "marginUsed": "30.15",
+                "maxLeverage": 20,
+                "cumFunding": {"allTime": "0.5", "sinceOpen": "0.1", "sinceChange": "0.05"}
+            }
+        }],
+        "crossMarginSummary": {
+            "accountValue": "1000.00",
+            "totalNtlPos": "150.75",
+            "totalRawUsd": "1000.00",
+            "totalMarginUsed": "30.15"
+        },
+        "marginSummary": {
+            "accountValue": "1000.00",
+            "totalNtlPos": "150.75",
+            "totalRawUsd": "1000.00",
+            "totalMarginUsed": "30.15"
+        },
+        "withdrawable": "969.85",
+        "time": 1704067200000
+    }"#;
+
+    #[test]
+    fn test_l2_book_parsing() {
+        let response: L2BookSubscriptionResponse = serde_json::from_str(L2_BOOK_JSON).unwrap();
+
+        assert_eq!(response.channel, "l2Book");
+        assert_eq!(response.data.coin, "SOL");
+        assert_eq!(response.data.time, 1704067200000);
+        assert_eq!(response.data.levels.len(), 2);
+
+        // Check bids (first level array)
+        let bids = &response.data.levels[0];
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].px, "100.50");
+        assert_eq!(bids[0].sz, "10.5");
+        assert_eq!(bids[0].n, 3);
+
+        // Check asks (second level array)
+        let asks = &response.data.levels[1];
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].px, "100.55");
+        assert_eq!(asks[0].sz, "8.2");
+        assert_eq!(asks[0].n, 2);
+    }
+
+    #[test]
+    fn test_top_of_book_extraction() {
+        let response: L2BookSubscriptionResponse = serde_json::from_str(L2_BOOK_JSON).unwrap();
+        let top = response.data.get_top_of_book().unwrap();
+
+        assert_eq!(top.coin, "SOL");
+        assert_eq!(top.timestamp, 1704067200000);
+        assert_eq!(top.best_bid, "100.50");
+        assert_eq!(top.best_ask, "100.55");
+    }
+
+    #[test]
+    fn test_top_of_book_empty_levels() {
+        let data = L2BookData {
+            coin: "SOL".to_string(),
+            time: 1704067200000,
+            levels: vec![vec![], vec![]],
+        };
+        let top = data.get_top_of_book();
+        assert!(top.is_none());
+    }
+
+    #[test]
+    fn test_top_of_book_missing_levels() {
+        let data = L2BookData {
+            coin: "SOL".to_string(),
+            time: 1704067200000,
+            levels: vec![],
+        };
+        let top = data.get_top_of_book();
+        assert!(top.is_none());
+    }
+
+    #[test]
+    fn test_hl_ws_message_parse_fast_l2book() {
+        let msg = HlWsMessage::parse_fast(L2_BOOK_JSON).unwrap();
+
+        match msg {
+            HlWsMessage::L2Book { channel, data } => {
+                assert_eq!(channel, "l2Book");
+                assert_eq!(data.coin, "SOL");
+                assert_eq!(data.time, 1704067200000);
+            }
+            _ => panic!("Expected L2Book message"),
+        }
+    }
+
+    #[test]
+    fn test_hl_ws_message_parse_fast_subscription() {
+        let msg = HlWsMessage::parse_fast(SUBSCRIPTION_RESPONSE_JSON).unwrap();
+
+        match msg {
+            HlWsMessage::SubscriptionResponse { channel, .. } => {
+                assert_eq!(channel, "subscriptionResponse");
+            }
+            _ => panic!("Expected SubscriptionResponse message"),
+        }
+    }
+
+    #[test]
+    fn test_hl_ws_message_parse_fast_unknown_channel() {
+        let unknown_json = r#"{"channel": "unknown_channel", "data": {}}"#;
+        let result = HlWsMessage::parse_fast(unknown_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_order_response_success_filled() {
+        let response: OrderResponse = serde_json::from_str(ORDER_RESPONSE_SUCCESS_JSON).unwrap();
+
+        assert_eq!(response.status, "ok");
+        match response.response {
+            OrderResponseContent::Success(data) => {
+                assert_eq!(data.data.statuses.len(), 1);
+                match &data.data.statuses[0] {
+                    OrderStatus::Filled { filled } => {
+                        assert_eq!(filled.totalSz, "1.0");
+                        assert_eq!(filled.avgPx, "100.50");
+                        assert_eq!(filled.oid, 12345);
+                    }
+                    _ => panic!("Expected Filled status"),
+                }
+            }
+            _ => panic!("Expected Success response"),
+        }
+    }
+
+    #[test]
+    fn test_order_response_success_resting() {
+        let response: OrderResponse = serde_json::from_str(ORDER_RESPONSE_RESTING_JSON).unwrap();
+
+        assert_eq!(response.status, "ok");
+        match response.response {
+            OrderResponseContent::Success(data) => {
+                match &data.data.statuses[0] {
+                    OrderStatus::Resting { resting } => {
+                        assert_eq!(resting.oid, 12346);
+                    }
+                    _ => panic!("Expected Resting status"),
+                }
+            }
+            _ => panic!("Expected Success response"),
+        }
+    }
+
+    #[test]
+    fn test_order_response_error() {
+        let response: OrderResponse = serde_json::from_str(ORDER_RESPONSE_ERROR_JSON).unwrap();
+
+        assert_eq!(response.status, "err");
+        match response.response {
+            OrderResponseContent::Error(msg) => {
+                assert_eq!(msg, "Insufficient margin");
+            }
+            _ => panic!("Expected Error response"),
+        }
+    }
+
+    #[test]
+    fn test_user_fill_parsing() {
+        let fill: UserFill = serde_json::from_str(USER_FILL_JSON).unwrap();
+
+        assert_eq!(fill.coin, "SOL");
+        assert_eq!(fill.px, "100.50");
+        assert_eq!(fill.sz, "1.0");
+        assert_eq!(fill.side, "B");
+        assert_eq!(fill.time, 1704067200000);
+        assert_eq!(fill.dir, "Open Long");
+        assert_eq!(fill.fee, "0.025");
+        assert_eq!(fill.fee_token, "USDC");
+        assert_eq!(fill.oid, 12345);
+        assert_eq!(fill.tid, 67890);
+        assert_eq!(fill.hash, "0xabc123");
+        assert!(fill.crossed);
+        assert_eq!(fill.closed_pnl, "0");
+        assert_eq!(fill.start_position, "0");
+    }
+
+    #[test]
+    fn test_user_state_parsing() {
+        let state: UserState = serde_json::from_str(USER_STATE_JSON).unwrap();
+
+        assert_eq!(state.withdrawable, "969.85");
+        assert_eq!(state.time, 1704067200000);
+
+        // Check position
+        assert_eq!(state.asset_positions.len(), 1);
+        let pos = &state.asset_positions[0];
+        assert_eq!(pos.type_, "oneWay");
+        assert_eq!(pos.position.coin, "SOL");
+        assert_eq!(pos.position.szi, "1.5");
+        assert_eq!(pos.position.entry_px, Some("100.50".to_string()));
+        assert_eq!(pos.position.position_value, "150.75");
+        assert_eq!(pos.position.unrealized_pnl, "2.25");
+        assert_eq!(pos.position.leverage.type_, "cross");
+        assert_eq!(pos.position.leverage.value, 5);
+        assert_eq!(pos.position.max_leverage, 20);
+
+        // Check margin summary
+        assert_eq!(state.margin_summary.account_value, "1000.00");
+        assert_eq!(state.margin_summary.total_ntl_pos, "150.75");
+        assert_eq!(state.margin_summary.total_margin_used, "30.15");
+
+        // Check cross margin summary
+        assert_eq!(state.cross_margin_summary.account_value, "1000.00");
+    }
+
+    #[test]
+    fn test_subscription_message_creation() {
+        let msg = SubscriptionMessage {
+            method: "subscribe".to_string(),
+            subscription: SubscriptionParams {
+                type_: "l2Book".to_string(),
+                coin: "SOL".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"method\":\"subscribe\""));
+        assert!(json.contains("\"type\":\"l2Book\""));
+        assert!(json.contains("\"coin\":\"SOL\""));
+    }
+
+    #[test]
+    fn test_time_in_force_serialization() {
+        let tifs = [
+            (TimeInForce::Gtc, "Gtc"),
+            (TimeInForce::Ioc, "Ioc"),
+            (TimeInForce::Alo, "Alo"),
+        ];
+
+        for (tif, expected) in tifs {
+            let json = serde_json::to_string(&tif).unwrap();
+            assert_eq!(json, format!("\"{}\"", expected));
+        }
+    }
+
+    #[test]
+    fn test_order_creation() {
+        let order = Order {
+            a: 5,  // Asset ID
+            b: true,  // Is buy
+            p: "100.50".to_string(),
+            s: "1.0".to_string(),
+            r: false,  // Not reduce only
+            t: OrderType {
+                limit: LimitOrderType {
+                    tif: TimeInForce::Ioc,
+                },
+            },
+            c: Some("client-123".to_string()),
+        };
+
+        let json = serde_json::to_string(&order).unwrap();
+        assert!(json.contains("\"a\":5"));
+        assert!(json.contains("\"b\":true"));
+        assert!(json.contains("\"p\":\"100.50\""));
+        assert!(json.contains("\"s\":\"1.0\""));
+        assert!(json.contains("\"r\":false"));
+        assert!(json.contains("\"c\":\"client-123\""));
+    }
+
+    #[test]
+    fn test_action_creation() {
+        let action = Action {
+            type_: "order".to_string(),
+            orders: vec![Order {
+                a: 5,
+                b: true,
+                p: "100.50".to_string(),
+                s: "1.0".to_string(),
+                r: false,
+                t: OrderType {
+                    limit: LimitOrderType {
+                        tif: TimeInForce::Ioc,
+                    },
+                },
+                c: None,
+            }],
+            grouping: "na".to_string(),
+        };
+
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"type\":\"order\""));
+        assert!(json.contains("\"grouping\":\"na\""));
+    }
+
+    #[test]
+    fn test_meta_response_parsing() {
+        let meta_json = r#"{
+            "universe": [
+                {"name": "SOL", "szDecimals": 2, "maxLeverage": 20},
+                {"name": "BTC", "szDecimals": 5, "maxLeverage": 50}
+            ]
+        }"#;
+
+        let meta: MetaResponse = serde_json::from_str(meta_json).unwrap();
+
+        assert_eq!(meta.universe.len(), 2);
+        assert_eq!(meta.universe[0].name, "SOL");
+        assert_eq!(meta.universe[0].sz_decimals, 2);
+        assert_eq!(meta.universe[0].max_leverage, Some(20));
+        assert_eq!(meta.universe[1].name, "BTC");
+        assert_eq!(meta.universe[1].sz_decimals, 5);
+    }
+
+    #[test]
+    fn test_book_level_parsing() {
+        let level_json = r#"{"px": "100.50", "sz": "10.5", "n": 3}"#;
+        let level: BookLevel = serde_json::from_str(level_json).unwrap();
+
+        assert_eq!(level.px, "100.50");
+        assert_eq!(level.sz, "10.5");
+        assert_eq!(level.n, 3);
+    }
+
+    #[test]
+    fn test_cumulative_funding_parsing() {
+        let funding_json = r#"{"allTime": "1.5", "sinceOpen": "0.5", "sinceChange": "0.1"}"#;
+        let funding: CumFunding = serde_json::from_str(funding_json).unwrap();
+
+        assert_eq!(funding.all_time, "1.5");
+        assert_eq!(funding.since_open, "0.5");
+        assert_eq!(funding.since_change, "0.1");
+    }
+
+    #[test]
+    fn test_leverage_parsing() {
+        // Cross leverage
+        let cross_json = r#"{"type": "cross", "value": 10}"#;
+        let cross: Leverage = serde_json::from_str(cross_json).unwrap();
+        assert_eq!(cross.type_, "cross");
+        assert_eq!(cross.value, 10);
+        assert!(cross.raw_usd.is_none());
+
+        // Isolated leverage
+        let isolated_json = r#"{"type": "isolated", "value": 5, "rawUsd": "100.00"}"#;
+        let isolated: Leverage = serde_json::from_str(isolated_json).unwrap();
+        assert_eq!(isolated.type_, "isolated");
+        assert_eq!(isolated.value, 5);
+        assert_eq!(isolated.raw_usd, Some("100.00".to_string()));
+    }
+}

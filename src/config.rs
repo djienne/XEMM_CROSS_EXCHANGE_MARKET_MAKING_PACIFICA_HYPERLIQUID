@@ -94,6 +94,10 @@ pub struct Config {
     /// Minimum notional value (USD) to trigger a hedge on partial fills
     #[serde(default = "default_min_hedge_notional")]
     pub min_hedge_notional_usd: f64,
+
+    /// Enable integration tests requiring API credentials (default: false)
+    #[serde(default)]
+    pub run_integration_tests: bool,
 }
 
 // Default values
@@ -206,6 +210,7 @@ impl Default for Config {
             trade_propagation_wait_secs: default_trade_propagation_wait_secs(),
             position_verification_wait_secs: default_position_verification_wait_secs(),
             min_hedge_notional_usd: default_min_hedge_notional(),
+            run_integration_tests: false,
         }
     }
 }
@@ -278,6 +283,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_default_config() {
@@ -286,6 +293,40 @@ mod tests {
         assert_eq!(config.agg_level, 1);
         assert_eq!(config.reconnect_attempts, 5);
         assert_eq!(config.ping_interval_secs, 15);
+    }
+
+    #[test]
+    fn test_default_config_all_fields() {
+        let config = Config::default();
+
+        // Trading parameters
+        assert_eq!(config.pacifica_maker_fee_bps, 1.5);
+        assert_eq!(config.hyperliquid_taker_fee_bps, 4.0);
+        assert_eq!(config.profit_rate_bps, 15.0);
+        assert_eq!(config.order_notional_usd, 20.0);
+        assert_eq!(config.min_hedge_notional_usd, 10.0);
+        assert_eq!(config.profit_cancel_threshold_bps, 3.0);
+        assert_eq!(config.order_refresh_interval_secs, 60);
+
+        // WebSocket parameters
+        assert_eq!(config.ws_stale_threshold_ms, 20000);
+        assert!(!config.low_latency_mode);
+        assert_eq!(config.hyperliquid_slippage, 0.05);
+        assert!(config.hyperliquid_use_ws_for_hedge);
+
+        // Polling intervals
+        assert_eq!(config.pacifica_rest_poll_interval_secs, 2);
+        assert_eq!(config.pacifica_active_order_rest_poll_interval_ms, 250);
+        assert_eq!(config.hyperliquid_rest_poll_interval_secs, 2);
+
+        // Grace periods
+        assert_eq!(config.cancel_grace_period_ms, 3000);
+        assert_eq!(config.post_cancel_wait_secs, 3.0);
+        assert_eq!(config.trade_propagation_wait_secs, 20);
+        assert_eq!(config.position_verification_wait_secs, 8);
+
+        // Test flag
+        assert!(!config.run_integration_tests);
     }
 
     #[test]
@@ -304,5 +345,189 @@ mod tests {
 
         config.ping_interval_secs = 60;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_valid_agg_levels() {
+        let valid_levels = [1, 2, 5, 10, 100, 1000];
+
+        for level in valid_levels {
+            let mut config = Config::default();
+            config.agg_level = level;
+            assert!(
+                config.validate().is_ok(),
+                "Aggregation level {} should be valid",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_validation_invalid_agg_levels() {
+        let invalid_levels = [0, 3, 4, 6, 7, 8, 9, 50, 500, 2000];
+
+        for level in invalid_levels {
+            let mut config = Config::default();
+            config.agg_level = level;
+            assert!(
+                config.validate().is_err(),
+                "Aggregation level {} should be invalid",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_validation_ping_interval() {
+        // Valid ping intervals: 1-30
+        for interval in 1..=30 {
+            let mut config = Config::default();
+            config.ping_interval_secs = interval;
+            assert!(
+                config.validate().is_ok(),
+                "Ping interval {} should be valid",
+                interval
+            );
+        }
+
+        // Invalid: 0 and > 30
+        let mut config = Config::default();
+        config.ping_interval_secs = 0;
+        assert!(config.validate().is_err());
+
+        config.ping_interval_secs = 31;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_symbol() {
+        let mut config = Config::default();
+        config.symbol = "".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_ws_stale_threshold() {
+        let mut config = Config::default();
+
+        // Valid: > 0
+        config.ws_stale_threshold_ms = 1;
+        assert!(config.validate().is_ok());
+
+        // Invalid: 0
+        config.ws_stale_threshold_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_reconnect_attempts() {
+        let mut config = Config::default();
+
+        // Valid: > 0
+        config.reconnect_attempts = 1;
+        assert!(config.validate().is_ok());
+
+        // Invalid: 0
+        config.reconnect_attempts = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_from_json_string() {
+        let json = r#"{
+            "symbol": "BTC",
+            "agg_level": 10,
+            "profit_rate_bps": 20.0
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.symbol, "BTC");
+        assert_eq!(config.agg_level, 10);
+        assert_eq!(config.profit_rate_bps, 20.0);
+
+        // Other fields should use defaults
+        assert_eq!(config.ping_interval_secs, 15);
+        assert_eq!(config.order_notional_usd, 20.0);
+    }
+
+    #[test]
+    fn test_config_all_defaults_applied() {
+        // Minimal JSON with just required field
+        let json = r#"{"symbol": "ETH"}"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.symbol, "ETH");
+        // All other fields should have defaults
+        assert_eq!(config.agg_level, 1);
+        assert_eq!(config.reconnect_attempts, 5);
+        assert_eq!(config.ping_interval_secs, 15);
+        assert_eq!(config.pacifica_maker_fee_bps, 1.5);
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let config = Config::default();
+
+        let json = serde_json::to_string(&config).unwrap();
+
+        // Verify it contains expected fields
+        assert!(json.contains("\"symbol\":\"SOL\""));
+        assert!(json.contains("\"agg_level\":1"));
+        assert!(json.contains("\"profit_rate_bps\":15"));
+    }
+
+    #[test]
+    fn test_config_from_file() {
+        // Create a temporary config file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "symbol": "AVAX",
+            "agg_level": 5,
+            "order_notional_usd": 50.0
+        }"#;
+        temp_file.write_all(json.as_bytes()).unwrap();
+
+        let config = Config::from_file(temp_file.path()).unwrap();
+
+        assert_eq!(config.symbol, "AVAX");
+        assert_eq!(config.agg_level, 5);
+        assert_eq!(config.order_notional_usd, 50.0);
+    }
+
+    #[test]
+    fn test_config_from_file_not_found() {
+        let result = Config::from_file("/nonexistent/path/config.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_save_and_reload() {
+        let mut original = Config::default();
+        original.symbol = "TEST".to_string();
+        original.profit_rate_bps = 25.0;
+        original.order_notional_usd = 100.0;
+
+        // Save to temp file
+        let temp_file = NamedTempFile::new().unwrap();
+        original.save_to_file(temp_file.path()).unwrap();
+
+        // Reload
+        let reloaded = Config::from_file(temp_file.path()).unwrap();
+
+        assert_eq!(reloaded.symbol, "TEST");
+        assert_eq!(reloaded.profit_rate_bps, 25.0);
+        assert_eq!(reloaded.order_notional_usd, 100.0);
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let original = Config::default();
+        let cloned = original.clone();
+
+        assert_eq!(cloned.symbol, original.symbol);
+        assert_eq!(cloned.agg_level, original.agg_level);
+        assert_eq!(cloned.profit_rate_bps, original.profit_rate_bps);
     }
 }

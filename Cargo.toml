@@ -8,6 +8,11 @@ default-run = "xemm_rust"
 name = "xemm_rust"
 path = "src/lib.rs"
 
+[features]
+default = []
+integration-tests = []  # Enable API credential tests (requires .env)
+websocket-tests = []    # Enable WebSocket connectivity tests (no credentials, but needs network)
+
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
@@ -37,3 +42,7 @@ fast-float = "0.2"
 arc-swap = "1.6"
 crossbeam-queue = "0.3"
 once_cell = "1.19"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.10"

@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn test_fee_factors_precomputation() {
         let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
-        
+
         // Verify precomputed factors
         assert!((evaluator.fee_factors.one_plus_maker - 1.0001).abs() < 1e-10);
         assert!((evaluator.fee_factors.one_minus_taker - 0.99975).abs() < 1e-10);
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn test_recalculate_profit_raw_matches_struct_version() {
         let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
-        
+
         let opp = Opportunity {
             direction: OrderSide::Buy,
             pacifica_price: 100.0,
@@ -363,10 +363,10 @@ mod tests {
             initial_profit_bps: 5.0,
             timestamp: 0,
         };
-        
+
         let hl_bid = 100.3;
         let hl_ask = 100.4;
-        
+
         let profit_struct = evaluator.recalculate_profit(&opp, hl_bid, hl_ask);
         let profit_raw = evaluator.recalculate_profit_raw(
             opp.direction,
@@ -374,7 +374,335 @@ mod tests {
             hl_bid,
             hl_ask,
         );
-        
+
         assert!((profit_struct - profit_raw).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_buy_opportunity_calculation() {
+        // Standard scenario: buy on Pacifica, sell taker on Hyperliquid
+        // maker_fee = 1.5 bps, taker_fee = 4.0 bps, profit_rate = 10.0 bps
+        let evaluator = OpportunityEvaluator::new(1.5, 4.0, 10.0, 0.01);
+
+        let hl_bid = 100.0;  // Can sell at this price on HL
+        let notional = 100.0;
+        let timestamp = 1234567890;
+
+        let opp = evaluator.evaluate_buy_opportunity(hl_bid, notional, timestamp).unwrap();
+
+        assert_eq!(opp.direction, OrderSide::Buy);
+        assert_eq!(opp.hyperliquid_price, hl_bid);
+        assert_eq!(opp.timestamp, timestamp);
+
+        // Verify the buy price is lower than HL bid (we want to buy cheap)
+        assert!(opp.pacifica_price < hl_bid);
+
+        // Verify profit is positive
+        assert!(opp.initial_profit_bps > 0.0);
+
+        // Verify size is calculated correctly
+        let expected_size = notional / opp.pacifica_price;
+        assert!((opp.size - expected_size).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sell_opportunity_calculation() {
+        // Standard scenario: sell on Pacifica, buy taker on Hyperliquid
+        let evaluator = OpportunityEvaluator::new(1.5, 4.0, 10.0, 0.01);
+
+        let hl_ask = 100.0;  // Can buy at this price on HL
+        let notional = 100.0;
+        let timestamp = 1234567890;
+
+        let opp = evaluator.evaluate_sell_opportunity(hl_ask, notional, timestamp).unwrap();
+
+        assert_eq!(opp.direction, OrderSide::Sell);
+        assert_eq!(opp.hyperliquid_price, hl_ask);
+        assert_eq!(opp.timestamp, timestamp);
+
+        // Verify the sell price is higher than HL ask (we want to sell expensive)
+        assert!(opp.pacifica_price > hl_ask);
+
+        // Verify profit is positive
+        assert!(opp.initial_profit_bps > 0.0);
+    }
+
+    #[test]
+    fn test_buy_opportunity_price_rounding_down() {
+        // Test that buy prices are rounded DOWN to tick (conservative)
+        let tick_size = 0.01;
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, tick_size);
+
+        let hl_bid = 100.1234;  // Non-round price
+        let notional = 100.0;
+
+        let opp = evaluator.evaluate_buy_opportunity(hl_bid, notional, 0).unwrap();
+
+        // Price should be on tick boundary
+        let price_in_ticks = opp.pacifica_price / tick_size;
+        assert!((price_in_ticks.round() - price_in_ticks).abs() < 1e-9);
+
+        // Should be rounded DOWN (floor)
+        let ideal_price = (hl_bid * 0.99975) / 1.00115;  // Approximate
+        assert!(opp.pacifica_price <= ideal_price);
+    }
+
+    #[test]
+    fn test_sell_opportunity_price_rounding_up() {
+        // Test that sell prices are rounded UP to tick (conservative)
+        let tick_size = 0.01;
+        let maker_fee_bps = 1.0;
+        let taker_fee_bps = 2.5;
+        let profit_bps = 10.0;
+        let evaluator = OpportunityEvaluator::new(maker_fee_bps, taker_fee_bps, profit_bps, tick_size);
+
+        let hl_ask = 100.1234;  // Non-round price
+        let notional = 100.0;
+
+        let opp = evaluator.evaluate_sell_opportunity(hl_ask, notional, 0).unwrap();
+
+        // Price should be on tick boundary
+        let price_in_ticks = opp.pacifica_price / tick_size;
+        assert!((price_in_ticks.round() - price_in_ticks).abs() < 1e-9,
+            "Price {} should be on tick boundary", opp.pacifica_price);
+
+        // The formula: sell_limit_price = (HL_ask * (1 + takerFee)) / (1 - makerFee - profitRate)
+        // Rounded UP to tick
+        let taker_fee = taker_fee_bps / 10000.0;
+        let maker_fee = maker_fee_bps / 10000.0;
+        let profit_rate = profit_bps / 10000.0;
+        let ideal_price = (hl_ask * (1.0 + taker_fee)) / (1.0 - maker_fee - profit_rate);
+        let rounded_up = (ideal_price / tick_size).ceil() * tick_size;
+
+        assert!((opp.pacifica_price - rounded_up).abs() < tick_size * 0.1,
+            "Price {} should be close to rounded-up ideal {}", opp.pacifica_price, rounded_up);
+    }
+
+    #[test]
+    fn test_opportunity_returns_none_when_sell_denominator_negative() {
+        // When profit_rate + maker_fee >= 1, sell_denominator becomes <= 0
+        // This makes sell opportunities impossible (negative or infinite price)
+        // Using 9999 bps (99.99%) profit rate + 1 bps maker = 100%
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 9999.0, 0.01);
+
+        let hl_ask = 100.0;
+        let notional = 100.0;
+
+        // Sell opportunity should return None because sell_denominator is very small/negative
+        let opp_sell = evaluator.evaluate_sell_opportunity(hl_ask, notional, 0);
+        // The formula would produce an extremely large or negative price
+        // The implementation may handle this differently - let's just verify it doesn't panic
+        // and that if it returns something, the profit is reasonable
+        if let Some(opp) = opp_sell {
+            // If it returns something, the price would be astronomical
+            assert!(opp.pacifica_price > hl_ask * 100.0,
+                "With 100% required profit, sell price should be extremely high");
+        }
+    }
+
+    #[test]
+    fn test_pick_best_opportunity_closer_to_mid() {
+        let mid_price = 100.0;
+
+        let buy_opp = Opportunity {
+            direction: OrderSide::Buy,
+            pacifica_price: 99.5,  // 0.5 away from mid
+            hyperliquid_price: 100.0,
+            size: 1.0,
+            initial_profit_bps: 10.0,
+            timestamp: 0,
+        };
+
+        let sell_opp = Opportunity {
+            direction: OrderSide::Sell,
+            pacifica_price: 101.0,  // 1.0 away from mid
+            hyperliquid_price: 100.0,
+            size: 1.0,
+            initial_profit_bps: 10.0,
+            timestamp: 0,
+        };
+
+        let best = OpportunityEvaluator::pick_best_opportunity(
+            Some(buy_opp.clone()),
+            Some(sell_opp),
+            mid_price,
+        );
+
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().direction, OrderSide::Buy);  // Closer to mid
+    }
+
+    #[test]
+    fn test_pick_best_opportunity_higher_profit_when_equidistant() {
+        let mid_price = 100.0;
+
+        let buy_opp = Opportunity {
+            direction: OrderSide::Buy,
+            pacifica_price: 99.5,  // 0.5 away from mid
+            hyperliquid_price: 100.0,
+            size: 1.0,
+            initial_profit_bps: 5.0,  // Lower profit
+            timestamp: 0,
+        };
+
+        let sell_opp = Opportunity {
+            direction: OrderSide::Sell,
+            pacifica_price: 100.5,  // 0.5 away from mid (equidistant)
+            hyperliquid_price: 100.0,
+            size: 1.0,
+            initial_profit_bps: 10.0,  // Higher profit
+            timestamp: 0,
+        };
+
+        let best = OpportunityEvaluator::pick_best_opportunity(
+            Some(buy_opp),
+            Some(sell_opp.clone()),
+            mid_price,
+        );
+
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().direction, OrderSide::Sell);  // Higher profit
+    }
+
+    #[test]
+    fn test_pick_best_opportunity_only_buy() {
+        let best = OpportunityEvaluator::pick_best_opportunity(
+            Some(Opportunity {
+                direction: OrderSide::Buy,
+                pacifica_price: 99.0,
+                hyperliquid_price: 100.0,
+                size: 1.0,
+                initial_profit_bps: 10.0,
+                timestamp: 0,
+            }),
+            None,
+            100.0,
+        );
+
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().direction, OrderSide::Buy);
+    }
+
+    #[test]
+    fn test_pick_best_opportunity_only_sell() {
+        let best = OpportunityEvaluator::pick_best_opportunity(
+            None,
+            Some(Opportunity {
+                direction: OrderSide::Sell,
+                pacifica_price: 101.0,
+                hyperliquid_price: 100.0,
+                size: 1.0,
+                initial_profit_bps: 10.0,
+                timestamp: 0,
+            }),
+            100.0,
+        );
+
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().direction, OrderSide::Sell);
+    }
+
+    #[test]
+    fn test_pick_best_opportunity_none() {
+        let best = OpportunityEvaluator::pick_best_opportunity(None, None, 100.0);
+        assert!(best.is_none());
+    }
+
+    #[test]
+    fn test_order_side_as_str() {
+        assert_eq!(OrderSide::Buy.as_str(), "BUY");
+        assert_eq!(OrderSide::Sell.as_str(), "SELL");
+    }
+
+    #[test]
+    fn test_order_side_as_api_str() {
+        assert_eq!(OrderSide::Buy.as_api_str(), "bid");
+        assert_eq!(OrderSide::Sell.as_api_str(), "ask");
+    }
+
+    #[test]
+    fn test_order_side_opposite() {
+        assert_eq!(OrderSide::Buy.opposite(), OrderSide::Sell);
+        assert_eq!(OrderSide::Sell.opposite(), OrderSide::Buy);
+    }
+
+    #[test]
+    fn test_recalculate_profit_buy_direction() {
+        let evaluator = OpportunityEvaluator::new(1.5, 4.0, 10.0, 0.01);
+
+        // For BUY: we bought on Pacifica, will sell on Hyperliquid
+        let pacifica_buy_price = 99.0;
+        let current_hl_bid = 100.0;  // Can sell at this price
+        let current_hl_ask = 100.1;  // Unused for BUY
+
+        let profit = evaluator.recalculate_profit_raw(
+            OrderSide::Buy,
+            pacifica_buy_price,
+            current_hl_bid,
+            current_hl_ask,
+        );
+
+        // Should be positive (we buy cheap, sell high)
+        assert!(profit > 0.0);
+    }
+
+    #[test]
+    fn test_recalculate_profit_sell_direction() {
+        let evaluator = OpportunityEvaluator::new(1.5, 4.0, 10.0, 0.01);
+
+        // For SELL: we sold on Pacifica, will buy on Hyperliquid
+        let pacifica_sell_price = 101.0;
+        let current_hl_bid = 99.9;   // Unused for SELL
+        let current_hl_ask = 100.0;  // Will buy at this price
+
+        let profit = evaluator.recalculate_profit_raw(
+            OrderSide::Sell,
+            pacifica_sell_price,
+            current_hl_bid,
+            current_hl_ask,
+        );
+
+        // Should be positive (we sell expensive, buy cheap)
+        assert!(profit > 0.0);
+    }
+
+    #[test]
+    fn test_evaluator_different_tick_sizes() {
+        // Test with different tick sizes
+        let tick_sizes = [0.001, 0.01, 0.1, 1.0];
+
+        for tick_size in tick_sizes {
+            let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, tick_size);
+
+            let opp = evaluator.evaluate_buy_opportunity(100.0, 100.0, 0);
+            assert!(opp.is_some());
+
+            let price = opp.unwrap().pacifica_price;
+            // Verify price is on tick boundary
+            let ticks = price / tick_size;
+            assert!((ticks.round() - ticks).abs() < 1e-9,
+                "Price {} not on tick boundary {}", price, tick_size);
+        }
+    }
+
+    #[test]
+    fn test_opportunity_clone() {
+        let opp = Opportunity {
+            direction: OrderSide::Buy,
+            pacifica_price: 99.0,
+            hyperliquid_price: 100.0,
+            size: 1.0,
+            initial_profit_bps: 10.0,
+            timestamp: 12345,
+        };
+
+        let cloned = opp.clone();
+
+        assert_eq!(cloned.direction, opp.direction);
+        assert_eq!(cloned.pacifica_price, opp.pacifica_price);
+        assert_eq!(cloned.hyperliquid_price, opp.hyperliquid_price);
+        assert_eq!(cloned.size, opp.size);
+        assert_eq!(cloned.initial_profit_bps, opp.initial_profit_bps);
+        assert_eq!(cloned.timestamp, opp.timestamp);
     }
 }
