@@ -201,7 +201,7 @@ impl HedgeService {
             }
 
             if attempt < 5 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 let cached = self.hyperliquid_prices.load_bid_ask();
                 if cached.0 > 0.0 && cached.1 > 0.0 {
                     return Some(cached);

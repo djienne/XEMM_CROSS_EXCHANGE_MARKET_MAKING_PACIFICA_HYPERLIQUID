@@ -27,9 +27,11 @@ static PREFIX_POSITION_DELTA: Lazy<String> = Lazy::new(|| "[POSITION_MONITOR]".b
 static PREFIX_FILL_HANDLER: Lazy<String> = Lazy::new(|| "[FILL_HANDLER]".bright_blue().bold().to_string());
 
 /// Status values for atomic fast-path checks (must match BotStatus encoding)
+#[allow(dead_code)]
 const STATUS_IDLE: u8 = 0;
 const STATUS_ORDER_PLACED: u8 = 1;
 const STATUS_FILLED: u8 = 2;
+#[allow(dead_code)] // Reserved for future state tracking
 const STATUS_HEDGING: u8 = 3;
 
 /// Identifies the source of fill detection for logging.
@@ -65,14 +67,6 @@ pub enum FillType {
     Partial,
 }
 
-impl FillType {
-    fn prefix(&self) -> &'static str {
-        match self {
-            FillType::Full => "full",
-            FillType::Partial => "partial",
-        }
-    }
-}
 
 /// Shared fill handler that provides unified fill processing logic.
 ///
@@ -166,21 +160,16 @@ impl FillHandler {
     /// Check if a fill has already been processed (thread-safe).
     ///
     /// Returns `true` if the fill should be processed, `false` if already handled.
-    pub fn try_mark_processed(&self, fill_type: FillType, client_order_id: &str) -> bool {
-        let fill_id = format!("{}_{}", fill_type.prefix(), client_order_id);
+    /// Uses client_order_id directly as the dedup key (avoids allocations).
+    pub fn try_mark_processed(&self, _fill_type: FillType, client_order_id: &str) -> bool {
         let mut processed = self.processed_fills.lock();
 
-        // Also check for alternative fill IDs (WebSocket vs REST may use different prefixes)
-        if processed.contains(&fill_id)
-            || processed.contains(&format!("full_{}", client_order_id))
-            || processed.contains(&format!("partial_{}", client_order_id))
-            || processed.contains(&format!("full_{}_rest", client_order_id))
-            || processed.contains(&format!("partial_{}_rest", client_order_id))
-        {
+        // Use client_order_id directly - it's already unique per order
+        if processed.contains(client_order_id) {
             return false;
         }
 
-        processed.insert(fill_id);
+        processed.insert(client_order_id.to_string());
         true
     }
 

@@ -252,9 +252,7 @@ async fn rebalance_step(
     // We can track if we are in Dual Leg mode by checking if both are Some.
     let is_dual_leg = hl_trade.is_some() && pac_trade.is_some();
 
-    let mut hl_success = false;
-
-    if let Some((size, is_buy)) = hl_trade {
+    let hl_success = if let Some((size, is_buy)) = hl_trade {
         info!("Executing HL: {} {:.4}", if is_buy { "BUY" } else { "SELL" }, size);
         let bid = Some(hl_mid); 
         let ask = Some(hl_mid);
@@ -279,25 +277,18 @@ async fn rebalance_step(
         match res {
             Ok(r) => {
                 info!("HL Order sent: {:?}", r);
-                // Check if response indicates success (order_id present)
-                // The struct has `response: OrderResponseContent`.
-                // We need to check if it's Success.
-                // `place_market_order` returns `OrderResponse`.
-                // We should inspect it.
-                // Assuming `place_market_order` throws error if API returns error (it does bail on "error" status).
-                // But let's be sure.
-                hl_success = true;
+                true
             },
             Err(e) => {
                 error!("HL Order failed: {}", e);
-                hl_success = false;
+                false
             }
         }
     } else {
-        // No HL trade, so "HL success" is irrelevant or implicitly true for the purpose of "proceeding" 
+        // No HL trade, so "HL success" is irrelevant or implicitly true for the purpose of "proceeding"
         // if we were independent. But here we only care if is_dual_leg.
-        hl_success = true; 
-    }
+        true
+    };
 
     if let Some((size, is_buy)) = pac_trade {
         // If Dual Leg, only proceed if HL succeeded

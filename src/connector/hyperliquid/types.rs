@@ -1,3 +1,7 @@
+//! Hyperliquid API types for serialization/deserialization.
+//! Field names match API exactly (non-snake_case).
+#![allow(dead_code, non_snake_case)]
+
 use serde::{Deserialize, Serialize};
 
 /// WebSocket subscription message

@@ -1,3 +1,7 @@
+//! Pacifica API types for serialization/deserialization.
+//! Many fields are included for API completeness but may not be used directly.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// Websocket subscription message

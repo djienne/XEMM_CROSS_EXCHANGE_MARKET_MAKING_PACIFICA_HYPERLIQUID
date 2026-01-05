@@ -56,9 +56,12 @@ impl PositionBaselineUpdater {
         let delta = if side == "buy" { filled_amount } else { -filled_amount };
         let new_qty = prev_qty + delta;
 
+        // Pre-compute symbol string once (avoid double allocation)
+        let symbol_owned = symbol.to_string();
+
         // Update snapshot
         snapshots.insert(
-            symbol.to_string(),
+            symbol_owned.clone(),
             PositionSnapshot {
                 quantity: new_qty,
                 entry_price: avg_price,
@@ -69,18 +72,19 @@ impl PositionBaselineUpdater {
             },
         );
 
-        // Mark as initialized
-        initialized.insert(symbol.to_string());
+        // Mark as initialized (reuse the string)
+        initialized.insert(symbol_owned);
 
         debug!(
             "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({} {:.4} @ ${:.4})",
-            symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
+            symbol, prev_qty, new_qty, if side == "buy" { "BUY" } else { "SELL" }, filled_amount, avg_price
         );
     }
 }
 
 /// Position snapshot for tracking changes
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // entry_price stored for potential future use
 struct PositionSnapshot {
     quantity: f64,      // Signed quantity (+ for long, - for short)
     entry_price: f64,

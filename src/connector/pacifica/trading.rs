@@ -375,34 +375,15 @@ impl PacificaTrading {
         }
     }
 
-    /// Round price to tick size
-    fn round_to_tick_size(&self, price: f64, tick_size: String) -> Result<f64> {
-        let tick: f64 = tick_size.parse()?;
-        let rounded = (price / tick).round() * tick;
-
-        let decimal_places = if tick_size.contains('.') {
-            tick_size.split('.').nth(1).unwrap_or("").len()
-        } else {
-            0
-        };
-
-        let factor = 10_f64.powi(decimal_places as i32);
-        Ok((rounded * factor).round() / factor)
-    }
-
-    /// Round size to lot size
-    fn round_to_lot_size(&self, size: f64, lot_size: String) -> Result<f64> {
-        let lot: f64 = lot_size.parse()?;
-        let rounded = (size / lot).round() * lot;
-
-        let decimal_places = if lot_size.contains('.') {
-            lot_size.split('.').nth(1).unwrap_or("").len()
-        } else {
-            0
-        };
-
-        let factor = 10_f64.powi(decimal_places as i32);
-        Ok((rounded * factor).round() / factor)
+    /// Round a value to the nearest increment and fix floating-point precision.
+    /// This is the canonical rounding function used for both price (tick_size) and size (lot_size).
+    #[inline]
+    fn round_to_increment(value: f64, increment: f64) -> f64 {
+        let rounded = (value / increment).round() * increment;
+        // Fix floating-point precision issues
+        let decimals = (-increment.log10()).ceil().max(0.0) as i32;
+        let factor = 10_f64.powi(decimals);
+        (rounded * factor).round() / factor
     }
 
     /// Sign a message using Ed25519
@@ -467,7 +448,8 @@ impl PacificaTrading {
             .context(format!("Market info not found for {}", symbol))?;
 
         let lot_size = symbol_info.lot_size.clone();
-        let rounded_size = self.round_to_lot_size(size, lot_size.clone())?;
+        let lot_size_f64: f64 = lot_size.parse().context("Invalid lot_size")?;
+        let rounded_size = Self::round_to_increment(size, lot_size_f64);
 
         info!(
             "[PACIFICA] Placing MARKET {} order: {} {} (lot: {}, slippage: {}%, reduce_only: {})",
@@ -867,34 +849,69 @@ impl PacificaTrading {
 
 /// Canonicalize JSON by sorting keys alphabetically
 /// This matches Python's json.dumps(obj, separators=(",", ":"))
+/// Optimized version using pre-allocated buffer to avoid intermediate allocations.
 pub fn canonicalize_json(value: &serde_json::Value) -> String {
+    let mut out = String::with_capacity(400);
+    canonicalize_json_to_buf(value, &mut out);
+    out
+}
+
+/// Write canonicalized JSON to a buffer (avoids intermediate allocations)
+fn canonicalize_json_to_buf(value: &serde_json::Value, out: &mut String) {
+    use std::fmt::Write;
     match value {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => {
+            out.push_str(if *b { "true" } else { "false" });
+        }
+        serde_json::Value::Number(n) => {
+            let _ = write!(out, "{}", n);
+        }
         serde_json::Value::String(s) => {
-            // Use serde_json to properly escape the string
-            // This matches Python's json.dumps() string escaping
-            serde_json::to_string(s).unwrap()
+            // Escape string to match JSON spec
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if c.is_control() => {
+                        let _ = write!(out, "\\u{:04x}", c as u32);
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(canonicalize_json).collect();
-            format!("[{}]", items.join(","))
+            out.push('[');
+            for (i, v) in arr.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                canonicalize_json_to_buf(v, out);
+            }
+            out.push(']');
         }
         serde_json::Value::Object(map) => {
+            out.push('{');
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-
-            let pairs: Vec<String> = keys
-                .iter()
-                .map(|k| {
-                    // Use serde_json to properly escape the key
-                    let escaped_key = serde_json::to_string(k).unwrap();
-                    format!("{}:{}", escaped_key, canonicalize_json(&map[*k]))
-                })
-                .collect();
-
-            format!("{{{}}}", pairs.join(","))
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                // Escape key (keys are typically safe ASCII, but handle properly)
+                out.push('"');
+                for c in k.chars() {
+                    match c {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        c => out.push(c),
+                    }
+                }
+                out.push_str("\":");
+                canonicalize_json_to_buf(&map[*k], out);
+            }
+            out.push('}');
         }
     }
 }
@@ -947,19 +964,9 @@ impl PacificaTradingClient for PacificaTrading {
             }
         };
 
-        // Round to tick and lot size (using f64 math directly)
-        let rounded_price = (order_price / tick_size_f).round() * tick_size_f;
-        let rounded_size = (size / lot_size_f).round() * lot_size_f;
-
-        // Fix precision issues
-        let price_decimals = (-tick_size_f.log10()).ceil() as i32;
-        let size_decimals = (-lot_size_f.log10()).ceil() as i32;
-        
-        let price_factor = 10_f64.powi(price_decimals);
-        let size_factor = 10_f64.powi(size_decimals);
-        
-        let rounded_price = (rounded_price * price_factor).round() / price_factor;
-        let rounded_size = (rounded_size * size_factor).round() / size_factor;
+        // Round to tick and lot size using unified helper
+        let rounded_price = Self::round_to_increment(order_price, tick_size_f);
+        let rounded_size = Self::round_to_increment(size, lot_size_f);
 
         info!(
             "[PACIFICA] Placing {} order: {} {} @ ${} (tick: {}, lot: {})",
@@ -974,6 +981,11 @@ impl PacificaTradingClient for PacificaTrading {
         // Generate client order ID
         let client_order_id = Uuid::new_v4().to_string();
 
+        // Pre-compute string conversions (avoid double conversion)
+        let price_str = rounded_price.to_string();
+        let amount_str = rounded_size.to_string();
+        let side_str = side.as_api_str();
+
         // Build signature
         let timestamp = chrono::Utc::now().timestamp_millis();
         let expiry_window = 5000; // 5 seconds
@@ -986,9 +998,9 @@ impl PacificaTradingClient for PacificaTrading {
 
         let payload = json!({
             "symbol": symbol,
-            "price": rounded_price.to_string(),
-            "amount": rounded_size.to_string(),
-            "side": side.as_api_str(),
+            "price": price_str,
+            "amount": amount_str,
+            "side": side_str,
             "tif": "ALO",  // Add Liquidity Only (post-only)
             "reduce_only": false,
             "client_order_id": client_order_id
@@ -996,16 +1008,16 @@ impl PacificaTradingClient for PacificaTrading {
 
         let signature = self.sign_message(header, payload.clone())?;
 
-        // Build request
+        // Build request (reuse pre-computed strings)
         let request_body = serde_json::json!({
             "account": self.credentials.account,
             "signature": signature,
             "timestamp": timestamp,
             "expiry_window": expiry_window,
             "symbol": symbol,
-            "price": rounded_price.to_string(),
-            "amount": rounded_size.to_string(),
-            "side": side.as_api_str(),
+            "price": price_str,
+            "amount": amount_str,
+            "side": side_str,
             "tif": "ALO",
             "reduce_only": false,
             "client_order_id": client_order_id,

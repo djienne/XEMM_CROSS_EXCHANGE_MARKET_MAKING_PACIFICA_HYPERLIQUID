@@ -42,6 +42,7 @@ struct FeeFactors {
 
 /// Opportunity evaluator for XEMM strategy
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields stored for Debug trait and documentation
 pub struct OpportunityEvaluator {
     /// Pacifica maker fee (as decimal, e.g., 0.0001 for 1 bps)
     maker_fee: f64,
