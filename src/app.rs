@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
@@ -18,13 +16,24 @@ use crate::connector::pacifica::{
     PacificaWsTrading, OrderSide as PacificaOrderSide,
 };
 use crate::services::{
-    fill_detection::FillDetectionService, hedge::HedgeService,
+    fill_aggregator::FillAggregator,
+    fill_detection::FillDetectionService,
+    fill_dedup::FillDedup,
+    hedge::HedgeService,
     order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks, sync_atomic_status, update_order_snapshot},
-    orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
-    rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
+    price_source::{PricePollService, PriceStreamService},
+    HedgeEvent,
 };
+use crate::connector::hyperliquid::{OrderbookClient as HlOrderbookClient, OrderbookConfig as HlOrderbookConfig};
+use crate::connector::pacifica::{
+    OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
+};
+use crate::connector::hyperliquid::trading::HyperliquidPoller;
+use crate::connector::pacifica::trading::PacificaPoller;
 use crate::strategy::{OpportunityEvaluator, OrderSide};
+use crate::util::log::{tag, tag_static, Color};
+use crate::util::price::{prices_valid, SharedQuote};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 
@@ -42,25 +51,25 @@ pub struct XemmBot {
     pub config: Config,
     pub bot_state: Arc<RwLock<BotState>>,
 
-    // Trading clients (each task gets its own instance to avoid lock contention)
-    pub pacifica_trading_main: Arc<PacificaTrading>,
-    pub pacifica_trading_fill: Arc<PacificaTrading>,
-    pub pacifica_trading_rest_fill: Arc<PacificaTrading>,
-    pub pacifica_trading_monitor: Arc<PacificaTrading>,
-    pub pacifica_trading_hedge: Arc<PacificaTrading>,
-    pub pacifica_trading_rest_poll: Arc<PacificaTrading>,
+    // Trading clients. `PacificaTrading` wraps a cloneable, thread-safe
+    // `reqwest::Client` and an `Arc<Mutex<_>>` metadata cache, so all services
+    // share a single instance — the previous 6 instances each kept their own
+    // connection pool and cache with no concurrency benefit.
+    pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
 
     // Shared state (prices)
-    pub pacifica_prices: Arc<Mutex<(f64, f64)>>, // (bid, ask)
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>, // (bid, ask)
+    pub pacifica_prices: Arc<SharedQuote>, // (bid, ask)
+    pub hyperliquid_prices: Arc<SharedQuote>, // (bid, ask)
 
     // Opportunity evaluator
     pub evaluator: OpportunityEvaluator,
 
-    // Fill tracking state
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    // Fill tracking state (bounded dedup keyed on Pacifica order_id)
+    pub processed_fills: Arc<FillDedup>,
+    // Partial-fill aggregator (single hedge per order cycle)
+    pub fill_aggregator: Arc<FillAggregator>,
     pub last_position_snapshot: Arc<parking_lot::Mutex<Option<PositionSnapshot>>>,
 
     // Order monitor state (lock-free)
@@ -68,10 +77,14 @@ pub struct XemmBot {
     pub order_snapshot: Arc<SharedOrderSnapshot>,
 
     // Channels
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
-    pub hedge_rx: Option<mpsc::UnboundedReceiver<HedgeEvent>>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
+    pub hedge_rx: Option<mpsc::Receiver<HedgeEvent>>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub shutdown_rx: Option<mpsc::Receiver<()>>,
+
+    // Hedge-service drain signal. Fired on SIGINT/SIGTERM so any queued hedge
+    // event completes before the process exits.
+    pub hedge_shutdown_signal: Arc<tokio::sync::Notify>,
 
     // Credentials (needed for spawning services)
     pub pacifica_credentials: PacificaCredentials,
@@ -111,43 +124,43 @@ impl XemmBot {
         config.validate().context("Invalid configuration")?;
 
         info!("{} Symbol: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             config.symbol.bright_white().bold()
         );
         info!("{} Order Notional: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("${:.2}", config.order_notional_usd).bright_white()
         );
         info!("{} Pacifica Maker Fee: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{} bps", config.pacifica_maker_fee_bps).bright_white()
         );
         info!("{} Hyperliquid Taker Fee: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{} bps", config.hyperliquid_taker_fee_bps).bright_white()
         );
         info!("{} Target Profit: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{} bps", config.profit_rate_bps).green().bold()
         );
         info!("{} Profit Cancel Threshold: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{} bps", config.profit_cancel_threshold_bps).yellow()
         );
         info!("{} Order Refresh Interval: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{} secs", config.order_refresh_interval_secs).bright_white()
         );
         info!("{} Pacifica REST Poll Interval: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{} secs", config.pacifica_rest_poll_interval_secs).bright_white()
         );
         info!("{} Active Order REST Poll Interval: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{} ms", config.pacifica_active_order_rest_poll_interval_ms).bright_white()
         );
         info!("{} Hyperliquid Market Order maximum allowed Slippage: {}",
-            "[CONFIG]".blue().bold(),
+            tag_static("CONFIG", Color::Blue),
             format!("{}%", config.hyperliquid_slippage * 100.0).bright_white()
         );
         info!("");
@@ -160,34 +173,14 @@ impl XemmBot {
             HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials from environment")?;
 
         info!("{} {}",
-            "[INIT]".cyan().bold(),
+            tag_static("INIT", Color::Cyan),
             "Credentials loaded successfully".green()
         );
 
-        // Initialize trading clients
-        let pacifica_trading_main = Arc::new(
+        // Initialize trading client (single shared instance across all services)
+        let pacifica_trading = Arc::new(
             PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create main Pacifica trading client")?,
-        );
-        let pacifica_trading_fill = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create fill detection Pacifica trading client")?,
-        );
-        let pacifica_trading_rest_fill = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create REST fill detection Pacifica trading client")?,
-        );
-        let pacifica_trading_monitor = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create monitor Pacifica trading client")?,
-        );
-        let pacifica_trading_hedge = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create hedge Pacifica trading client")?,
-        );
-        let pacifica_trading_rest_poll = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create REST polling Pacifica trading client")?,
+                .context("Failed to create Pacifica trading client")?,
         );
 
         // Initialize WebSocket trading client for ultra-fast cancellations
@@ -199,13 +192,13 @@ impl XemmBot {
         );
 
         info!("{} {}",
-            "[INIT]".cyan().bold(),
-            "Trading clients initialized (6 REST instances + WebSocket)".green()
+            tag_static("INIT", Color::Cyan),
+            "Trading clients initialized (shared REST + WebSocket)".green()
         );
 
         // Pre-fetch Hyperliquid metadata (szDecimals, etc.) to reduce hedge latency
         info!("{} Pre-fetching Hyperliquid metadata for {}...",
-            "[INIT]".cyan().bold(),
+            tag_static("INIT", Color::Cyan),
             config.symbol.bright_white()
         );
         hyperliquid_trading
@@ -213,25 +206,25 @@ impl XemmBot {
             .await
             .context("Failed to pre-fetch Hyperliquid metadata")?;
         info!("{} {} Hyperliquid metadata cached",
-            "[INIT]".cyan().bold(),
+            tag_static("INIT", Color::Cyan),
             "✓".green().bold()
         );
 
         // Cancel any existing orders on Pacifica at startup
         info!("{} Cancelling any existing orders on Pacifica...",
-            "[INIT]".cyan().bold()
+            tag_static("INIT", Color::Cyan)
         );
-        match pacifica_trading_main
+        match pacifica_trading
             .cancel_all_orders(false, Some(&config.symbol), false)
             .await
         {
             Ok(count) => info!("{} {} Cancelled {} existing order(s)",
-                "[INIT]".cyan().bold(),
+                tag_static("INIT", Color::Cyan),
                 "✓".green().bold(),
                 count
             ),
             Err(e) => info!("{} {} Failed to cancel existing orders: {}",
-                "[INIT]".cyan().bold(),
+                tag_static("INIT", Color::Cyan),
                 "⚠".yellow().bold(),
                 e
             ),
@@ -239,7 +232,7 @@ impl XemmBot {
 
         // Get market info to determine tick size
         let pacifica_tick_size: f64 = {
-            let market_info = pacifica_trading_main
+            let market_info = pacifica_trading
                 .get_market_info()
                 .await
                 .context("Failed to fetch Pacifica market info")?;
@@ -250,7 +243,7 @@ impl XemmBot {
         };
 
         info!("{} Pacifica tick size for {}: {}",
-            "[INIT]".cyan().bold(),
+            tag_static("INIT", Color::Cyan),
             config.symbol.bright_white(),
             format!("{}", pacifica_tick_size).bright_white()
         );
@@ -264,29 +257,33 @@ impl XemmBot {
         );
 
         info!("{} {}",
-            "[INIT]".cyan().bold(),
+            tag_static("INIT", Color::Cyan),
             "Opportunity evaluator created".green()
         );
 
         // Shared state for orderbook prices
-        let pacifica_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
-        let hyperliquid_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
+        let pacifica_prices = SharedQuote::empty();
+        let hyperliquid_prices = SharedQuote::empty();
 
         // Shared bot state
         let bot_state = Arc::new(RwLock::new(BotState::new()));
 
-        // Channels for communication
-        // Unbounded hedge event queue: producers never block when enqueueing,
-        // hedge executor processes events sequentially.
-        let (hedge_tx, hedge_rx) = mpsc::unbounded_channel::<HedgeEvent>(); // (side, size, avg_price, fill_timestamp)
+        // Bounded hedge-event queue so backpressure is visible. A capacity of 256
+        // is generous: one fill cycle per evaluation, well above the sustained
+        // rate. If it ever fills, `try_send` on the producer side will surface
+        // the backlog instead of hiding it in an unbounded queue.
+        let (hedge_tx, hedge_rx) = mpsc::channel::<HedgeEvent>(256);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
         // Fill tracking state
-        let processed_fills = Arc::new(parking_lot::Mutex::new(HashSet::<String>::new()));
+        let processed_fills = FillDedup::new_default();
+        // Emergency ceiling = 2x the configured order notional. Anything above this on
+        // partial fills alone is treated as a terminal signal to avoid runaway exposure.
+        let fill_aggregator = FillAggregator::new(config.order_notional_usd * 2.0);
         let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
 
         info!("{} {}",
-            "[INIT]".cyan().bold(),
+            tag_static("INIT", Color::Cyan),
             "State and channels initialized".green()
         );
         info!("");
@@ -298,18 +295,14 @@ impl XemmBot {
         Ok(XemmBot {
             config,
             bot_state,
-            pacifica_trading_main,
-            pacifica_trading_fill,
-            pacifica_trading_rest_fill,
-            pacifica_trading_monitor,
-            pacifica_trading_hedge,
-            pacifica_trading_rest_poll,
+            pacifica_trading,
             pacifica_ws_trading,
             hyperliquid_trading,
             pacifica_prices,
             hyperliquid_prices,
             evaluator,
             processed_fills,
+            fill_aggregator,
             last_position_snapshot,
             atomic_status,
             order_snapshot,
@@ -317,6 +310,7 @@ impl XemmBot {
             hedge_rx: Some(hedge_rx),
             shutdown_tx,
             shutdown_rx: Some(shutdown_rx),
+            hedge_shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             pacifica_credentials,
         })
     }
@@ -327,28 +321,36 @@ impl XemmBot {
         // SPAWN ALL SERVICES
         // ═══════════════════════════════════════════════════
 
-        // Service 1: Pacifica Orderbook (WebSocket)
-        let pacifica_ob_service = PacificaOrderbookService {
-            prices: self.pacifica_prices.clone(),
+        // Service 1: Pacifica Orderbook (WebSocket, via generic PriceStreamService)
+        let pacifica_ob_client = PacOrderbookClient::new(PacOrderbookConfig {
             symbol: self.config.symbol.clone(),
             agg_level: self.config.agg_level,
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
-        };
-        tokio::spawn(async move {
-            pacifica_ob_service.run().await.ok();
-        });
+        })
+        .context("Failed to create Pacifica orderbook client")?;
+        tokio::spawn(
+            PriceStreamService {
+                client: pacifica_ob_client,
+                prices: self.pacifica_prices.clone(),
+            }
+            .run(),
+        );
 
-        // Service 2: Hyperliquid Orderbook (WebSocket)
-        let hyperliquid_ob_service = HyperliquidOrderbookService {
-            prices: self.hyperliquid_prices.clone(),
-            symbol: self.config.symbol.clone(),
+        // Service 2: Hyperliquid Orderbook (WebSocket, via generic PriceStreamService)
+        let hyperliquid_ob_client = HlOrderbookClient::new(HlOrderbookConfig {
+            coin: self.config.symbol.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
-        };
-        tokio::spawn(async move {
-            hyperliquid_ob_service.run().await.ok();
-        });
+        })
+        .context("Failed to create Hyperliquid orderbook client")?;
+        tokio::spawn(
+            PriceStreamService {
+                client: hyperliquid_ob_client,
+                prices: self.hyperliquid_prices.clone(),
+            }
+            .run(),
+        );
         let fill_config = FillDetectionConfig {
             account: self.pacifica_credentials.account.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
@@ -362,11 +364,12 @@ impl XemmBot {
         let fill_service = FillDetectionService {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
-            pacifica_trading: self.pacifica_trading_fill.clone(),
+            pacifica_trading: self.pacifica_trading.clone(),
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             fill_config,
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
+            fill_aggregator: self.fill_aggregator.clone(),
             baseline_updater,
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
@@ -375,41 +378,46 @@ impl XemmBot {
             fill_service.run().await;
         });
 
-        // Service 4: Pacifica REST Poll (price redundancy)
-        let pacifica_rest_poll_service = PacificaRestPollService {
-            prices: self.pacifica_prices.clone(),
-            pacifica_trading: self.pacifica_trading_rest_poll.clone(),
-            symbol: self.config.symbol.clone(),
-            agg_level: self.config.agg_level,
-            poll_interval_secs: self.config.pacifica_rest_poll_interval_secs,
-        };
-        tokio::spawn(async move {
-            pacifica_rest_poll_service.run().await;
-        });
+        // Service 4: Pacifica REST Poll (price redundancy, via generic PricePollService)
+        tokio::spawn(
+            PricePollService {
+                source: Arc::new(PacificaPoller {
+                    trading: self.pacifica_trading.clone(),
+                    symbol: self.config.symbol.clone(),
+                    agg_level: self.config.agg_level,
+                }),
+                prices: self.pacifica_prices.clone(),
+                interval_secs: self.config.pacifica_rest_poll_interval_secs,
+            }
+            .run(),
+        );
 
-        // Service 4.5: Hyperliquid REST Poll (price redundancy)
-        let hyperliquid_rest_poll_service = HyperliquidRestPollService {
-            prices: self.hyperliquid_prices.clone(),
-            hyperliquid_trading: self.hyperliquid_trading.clone(),
-            symbol: self.config.symbol.clone(),
-            poll_interval_secs: 2,
-        };
-        tokio::spawn(async move {
-            hyperliquid_rest_poll_service.run().await;
-        });
+        // Service 4.5: Hyperliquid REST Poll (price redundancy, via generic PricePollService)
+        tokio::spawn(
+            PricePollService {
+                source: Arc::new(HyperliquidPoller {
+                    trading: self.hyperliquid_trading.clone(),
+                    symbol: self.config.symbol.clone(),
+                }),
+                prices: self.hyperliquid_prices.clone(),
+                interval_secs: 2,
+            }
+            .run(),
+        );
 
         // Wait for initial orderbook data
-        info!("{} Waiting for orderbook data...", "[INIT]".cyan().bold());
+        info!("{} Waiting for orderbook data...", tag_static("INIT", Color::Cyan));
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Service 5: REST Fill Detection (backup)
         let rest_fill_service = RestFillDetectionService {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
-            pacifica_trading: self.pacifica_trading_rest_fill.clone(),
+            pacifica_trading: self.pacifica_trading.clone(),
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
+            fill_aggregator: self.fill_aggregator.clone(),
             min_hedge_notional: 10.0,
             poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
         };
@@ -418,18 +426,15 @@ impl XemmBot {
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Service 5.5: Position Monitor (ground truth)
-        let pacifica_trading_position = Arc::new(
-            PacificaTrading::new(self.pacifica_credentials.clone())
-                .context("Failed to create position monitor trading client")?
-        );
+        // Service 5.5: Position Monitor (ground truth) — shares the single Pacifica client.
         let position_monitor_service = PositionMonitorService {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
-            pacifica_trading: pacifica_trading_position,
+            pacifica_trading: self.pacifica_trading.clone(),
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
+            fill_aggregator: self.fill_aggregator.clone(),
             last_position_snapshot: self.last_position_snapshot.clone(),
         };
         tokio::spawn(async move {
@@ -446,11 +451,39 @@ impl XemmBot {
             self.hyperliquid_prices.clone(),
             self.config.clone(),
             self.evaluator.clone(),
-            self.pacifica_trading_monitor.clone(),
+            self.pacifica_trading.clone(),
             self.hyperliquid_trading.clone(),
         );
         let order_monitor_service = Arc::new(order_monitor_service);
         spawn_monitor_tasks(order_monitor_service, cancel_rx);
+
+        // Background: aggregator idle-flush + GC (1 Hz). Catches partials that
+        // never received a terminal event and evicts emitted entries older than
+        // 5 minutes so the map cannot grow unbounded over a long run.
+        {
+            let aggregator = self.fill_aggregator.clone();
+            let hedge_tx = self.hedge_tx.clone();
+            let processed_fills = self.processed_fills.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    ticker.tick().await;
+                    // Flush stale partials whose terminal event never arrived.
+                    for (order_id, d) in aggregator.flush_idle() {
+                        if processed_fills.insert_if_new(
+                            crate::services::fill_dedup::FillKey::OrderId(order_id),
+                        ) {
+                            warn!(
+                                "[AGGREGATOR] Idle-timeout flush (order_id={}): emitting hedge for {} @ ${:.4}",
+                                order_id, d.size, d.avg_price
+                            );
+                            let _ = hedge_tx.try_send((d.side, d.size, d.avg_price, d.detected_at));
+                        }
+                    }
+                    aggregator.gc(Duration::from_secs(300));
+                }
+            });
+        }
 
         // Service 7: Hedge Execution
         let hedge_service = HedgeService {
@@ -459,8 +492,9 @@ impl XemmBot {
             hyperliquid_prices: self.hyperliquid_prices.clone(),
             config: self.config.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
-            pacifica_trading: self.pacifica_trading_hedge.clone(),
+            pacifica_trading: self.pacifica_trading.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
+            shutdown_signal: self.hedge_shutdown_signal.clone(),
         };
         tokio::spawn(async move {
             hedge_service.run().await;
@@ -471,7 +505,7 @@ impl XemmBot {
         // ═══════════════════════════════════════════════════
 
         info!("{} Starting opportunity evaluation loop",
-            format!("[{} MAIN]", self.config.symbol).bright_white().bold()
+            tag(&self.config.symbol, "MAIN", Color::BrightWhite)
         );
         info!("");
 
@@ -491,7 +525,7 @@ impl XemmBot {
             tokio::select! {
                 _ = &mut sigint => {
                     info!("{} {} Received SIGINT (Ctrl+C), initiating graceful shutdown...",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
+                        tag(&self.config.symbol, "MAIN", Color::BrightWhite),
                         "⚠".yellow().bold()
                     );
                     break;
@@ -508,29 +542,36 @@ impl XemmBot {
                     }
                 } => {
                     info!("{} {} Received SIGTERM (Docker shutdown), initiating graceful shutdown...",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
+                        tag(&self.config.symbol, "MAIN", Color::BrightWhite),
                         "⚠".yellow().bold()
                     );
                     break;
                 }
 
                 _ = eval_interval.tick() => {
-                    // Check if we should exit
-                    let state = self.bot_state.read().await;
-                    if state.is_terminal() {
-                        break;
-                    }
-
-                    // Only evaluate if idle
-                    if !state.is_idle() {
+                    // Fast lock-free reject: atomic status check.
+                    // Terminal states (Complete/Error) are the only ones that exit the loop,
+                    // so we need a cheap read when atomic says we're NOT Idle to distinguish
+                    // them from the intermediate states (OrderPlaced/Filled/Hedging).
+                    let status = self.atomic_status.load(std::sync::atomic::Ordering::Acquire);
+                    if status != AtomicBotStatus::Idle as u8 {
+                        // Terminal status only escapes via the read below (rare, cheap).
+                        let st = self.bot_state.read().await;
+                        if st.is_terminal() {
+                            break;
+                        }
                         continue;
                     }
 
-                    // Check grace period
-                    if !state.grace_period_elapsed(3) {
-                        continue;
+                    // Grace period check (brief read lock). Keep this OUTSIDE the
+                    // placement critical section so that hot-path readers aren't
+                    // starved by long Pacifica REST calls.
+                    {
+                        let st = self.bot_state.read().await;
+                        if !st.grace_period_elapsed(3) {
+                            continue;
+                        }
                     }
-                    drop(state);
 
                     // Check rate limit backoff
                     if order_placement_rate_limit.should_skip() {
@@ -542,18 +583,18 @@ impl XemmBot {
                     }
 
                     // Get current prices
-                    let (pac_bid, pac_ask) = *self.pacifica_prices.lock();
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+                    let (pac_bid, pac_ask) = self.pacifica_prices.load();
+                    let (hl_bid, hl_ask) = self.hyperliquid_prices.load();
 
-                    // Validate prices
-                    if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {
+                    // Validate prices: non-zero, non-negative, non-crossed, sane spread.
+                    if !prices_valid(pac_bid, pac_ask) || !prices_valid(hl_bid, hl_ask) {
                         continue;
                     }
 
                     // Get timestamp once for this evaluation cycle
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_millis() as u64;
 
                     // Evaluate opportunities
@@ -564,7 +605,13 @@ impl XemmBot {
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
 
                     if let Some(opp) = best_opp {
-                        // Double-check bot is still idle
+                        // *** ATOMIC CRITICAL SECTION ***
+                        // Acquire write lock for the idle-check + place_order + set_active_order
+                        // transaction. Holding the lock across `.await` is intentional: nothing
+                        // else should transition state during placement (monitors/fill-detectors
+                        // only act on an active order, which hasn't been set yet). This closes
+                        // the check-then-act race that existed when the write lock was released
+                        // between the idle-check and the order placement call.
                         let mut state = self.bot_state.write().await;
                         if !state.is_idle() {
                             continue;
@@ -572,7 +619,7 @@ impl XemmBot {
 
                         info!(
                             "{} {} @ {} → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
-                            format!("[{} OPPORTUNITY]", self.config.symbol).bright_green().bold(),
+                            tag(&self.config.symbol, "OPPORTUNITY", Color::BrightGreen),
                             opp.direction.as_str().bright_yellow().bold(),
                             format!("${:.6}", opp.pacifica_price).cyan().bold(),
                             format!("${:.6}", opp.hyperliquid_price).cyan(),
@@ -586,7 +633,7 @@ impl XemmBot {
 
                         // Place order
                         info!("{} Placing {} on Pacifica...",
-                            format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                            tag(&self.config.symbol, "ORDER", Color::BrightYellow),
                             opp.direction.as_str().bright_yellow().bold()
                         );
 
@@ -595,7 +642,7 @@ impl XemmBot {
                             OrderSide::Sell => PacificaOrderSide::Sell,
                         };
 
-                        match self.pacifica_trading_main
+                        match self.pacifica_trading
                             .place_limit_order(
                                 &self.config.symbol,
                                 pacifica_side,
@@ -611,19 +658,21 @@ impl XemmBot {
                                 order_placement_rate_limit.record_success();
 
                                 if let Some(client_order_id) = order_data.client_order_id {
-                                    let order_id = order_data.order_id.unwrap_or(0);
+                                    let order_id_opt = order_data.order_id.or(order_data.i);
+                                    let order_id_display = order_id_opt.unwrap_or(0);
                                     info!(
                                         "{} {} Placed {} #{} @ {} | cloid: {}...{}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        tag(&self.config.symbol, "ORDER", Color::BrightYellow),
                                         "✓".green().bold(),
                                         opp.direction.as_str().bright_yellow(),
-                                        order_id,
+                                        order_id_display,
                                         format!("${:.4}", opp.pacifica_price).cyan().bold(),
                                         &client_order_id[..8],
                                         &client_order_id[client_order_id.len()-4..]
                                     );
 
                                     let active_order = ActiveOrder {
+                                        order_id: order_id_opt,
                                         client_order_id,
                                         symbol: self.config.symbol.clone(),
                                         side: opp.direction,
@@ -646,7 +695,7 @@ impl XemmBot {
                                     );
                                 } else {
                                     info!("{} {} Order placed but no client_order_id returned",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        tag(&self.config.symbol, "ORDER", Color::BrightYellow),
                                         "✗".red().bold()
                                     );
                                 }
@@ -657,14 +706,14 @@ impl XemmBot {
                                     let backoff_secs = order_placement_rate_limit.get_backoff_secs();
                                     info!(
                                         "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        tag(&self.config.symbol, "ORDER", Color::BrightYellow),
                                         "⚠".yellow().bold(),
                                         backoff_secs,
                                         order_placement_rate_limit.consecutive_errors()
                                     );
                                 } else {
                                     info!("{} {} Failed to place order: {}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        tag(&self.config.symbol, "ORDER", Color::BrightYellow),
                                         "✗".red().bold(),
                                         e.to_string().red()
                                     );
@@ -676,7 +725,7 @@ impl XemmBot {
 
                 _ = shutdown_rx.recv() => {
                     info!("{} Shutdown signal received",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold()
+                        tag(&self.config.symbol, "MAIN", Color::BrightWhite)
                     );
                     break;
                 }
@@ -687,19 +736,45 @@ impl XemmBot {
         // SHUTDOWN CLEANUP
         // ═══════════════════════════════════════════════════
 
+        // Tell the hedge service to drain any in-flight events. A fill can arrive
+        // during the shutdown window; dropping it would leave a Pacifica position
+        // un-hedged.
+        info!("{} Notifying hedge service to drain pending events...",
+            tag(&self.config.symbol, "SHUTDOWN", Color::Yellow)
+        );
+        self.hedge_shutdown_signal.notify_one();
+
+        // Wait up to 5 s for the hedge service to either signal `shutdown_tx`
+        // (normal exit path) or timeout. We tolerate the timeout to avoid hanging
+        // the process indefinitely if something is stuck on the Hyperliquid side.
+        match tokio::time::timeout(Duration::from_secs(5), shutdown_rx.recv()).await {
+            Ok(Some(())) => info!("{} {} Hedge service drained cleanly",
+                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
+                "✓".green().bold()
+            ),
+            Ok(None) => info!("{} {} Hedge service already exited",
+                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
+                "✓".green().bold()
+            ),
+            Err(_) => warn!("{} {} Hedge drain timed out after 5s — check data/unhedged_positions.jsonl",
+                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
+                "⚠".yellow().bold()
+            ),
+        }
+
         info!("");
         info!("{} Cancelling any remaining orders...",
-            format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold()
+            tag(&self.config.symbol, "SHUTDOWN", Color::Yellow)
         );
 
-        match self.pacifica_trading_main.cancel_all_orders(false, Some(&self.config.symbol), false).await {
+        match self.pacifica_trading.cancel_all_orders(false, Some(&self.config.symbol), false).await {
             Ok(count) => info!("{} {} Cancelled {} order(s)",
-                format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold(),
+                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
                 "✓".green().bold(),
                 count
             ),
             Err(e) => info!("{} {} Failed to cancel orders: {}",
-                format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold(),
+                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
                 "⚠".yellow().bold(),
                 e
             ),

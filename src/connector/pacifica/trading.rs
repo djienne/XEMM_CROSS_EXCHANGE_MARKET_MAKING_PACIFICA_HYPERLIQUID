@@ -1028,3 +1028,22 @@ pub fn canonicalize_json(value: &serde_json::Value) -> String {
         }
     }
 }
+
+/// REST top-of-book poller for the generic `PricePollService`.
+pub struct PacificaPoller {
+    pub trading: std::sync::Arc<PacificaTrading>,
+    pub symbol: String,
+    pub agg_level: u32,
+}
+
+#[async_trait::async_trait]
+impl crate::services::price_source::PricePoll for PacificaPoller {
+    fn label(&self) -> &'static str {
+        "PACIFICA_REST"
+    }
+    async fn fetch(&self) -> Result<Option<(f64, f64)>> {
+        self.trading
+            .get_best_bid_ask_rest(&self.symbol, self.agg_level)
+            .await
+    }
+}

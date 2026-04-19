@@ -364,7 +364,96 @@ mod tests {
             hl_bid,
             hl_ask,
         );
-        
+
         assert!((profit_struct - profit_raw).abs() < 1e-10);
+    }
+
+    #[test]
+    fn buy_opportunity_degenerate_inputs_do_not_panic() {
+        // Main loop guards against these via prices_valid, but the evaluator
+        // must at minimum not panic on degenerate inputs.
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
+        let _ = evaluator.evaluate_buy_opportunity(50.0, 100.0, 0);
+        let _ = evaluator.evaluate_buy_opportunity(0.0, 100.0, 0);
+        let _ = evaluator.evaluate_sell_opportunity(0.0, 100.0, 0);
+    }
+
+    #[test]
+    fn sell_opportunity_above_ask_generates_positive_profit() {
+        // Assume HL ask at 100, we should be able to round up pacifica sell
+        // price to a profitable level.
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
+        let opp = evaluator.evaluate_sell_opportunity(100.0, 20.0, 0);
+        assert!(opp.is_some());
+        let opp = opp.unwrap();
+        assert_eq!(opp.direction, OrderSide::Sell);
+        assert!(opp.initial_profit_bps > 0.0);
+        // Price should be tick-aligned
+        let ticks = opp.pacifica_price / 0.01;
+        assert!((ticks - ticks.round()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn buy_opportunity_above_threshold_generates_profit() {
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
+        let opp = evaluator.evaluate_buy_opportunity(100.0, 20.0, 0);
+        assert!(opp.is_some());
+        let opp = opp.unwrap();
+        assert_eq!(opp.direction, OrderSide::Buy);
+        assert!(opp.pacifica_price < 100.0); // buy below the HL bid
+        assert!(opp.initial_profit_bps > 0.0);
+    }
+
+    #[test]
+    fn pick_best_opportunity_prefers_closer_to_mid() {
+        let buy = Some(Opportunity {
+            direction: OrderSide::Buy,
+            pacifica_price: 99.8,
+            hyperliquid_price: 100.0,
+            size: 0.2,
+            initial_profit_bps: 8.0,
+            timestamp: 0,
+        });
+        let sell = Some(Opportunity {
+            direction: OrderSide::Sell,
+            pacifica_price: 100.5,
+            hyperliquid_price: 100.0,
+            size: 0.2,
+            initial_profit_bps: 12.0,
+            timestamp: 0,
+        });
+        // buy distance 0.2, sell distance 0.5 → buy wins despite lower profit
+        let best = OpportunityEvaluator::pick_best_opportunity(buy, sell, 100.0).unwrap();
+        assert_eq!(best.direction, OrderSide::Buy);
+    }
+
+    #[test]
+    fn pick_best_opportunity_none_both() {
+        assert!(OpportunityEvaluator::pick_best_opportunity(None, None, 100.0).is_none());
+    }
+
+    #[test]
+    fn buy_price_rounds_down_to_tick() {
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.05);
+        let opp = evaluator.evaluate_buy_opportunity(100.0, 20.0, 0).unwrap();
+        // Must be multiple of tick size 0.05
+        let quotient = opp.pacifica_price / 0.05;
+        assert!((quotient - quotient.round()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sell_price_rounds_up_to_tick() {
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.05);
+        let opp = evaluator.evaluate_sell_opportunity(100.0, 20.0, 0).unwrap();
+        let quotient = opp.pacifica_price / 0.05;
+        assert!((quotient - quotient.round()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn order_side_opposite_and_as_str() {
+        assert_eq!(OrderSide::Buy.opposite(), OrderSide::Sell);
+        assert_eq!(OrderSide::Sell.opposite(), OrderSide::Buy);
+        assert_eq!(OrderSide::Buy.as_str(), "BUY");
+        assert_eq!(OrderSide::Sell.as_str(), "SELL");
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -10,8 +9,11 @@ use parking_lot::Mutex;
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::services::fill_aggregator::FillAggregator;
+use crate::services::fill_dedup::{FillDedup, FillKey};
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
+use crate::util::log::{tag_static, Color};
 
 /// Position-based fill detection service (4th layer - ground truth)
 ///
@@ -20,11 +22,12 @@ use crate::strategy::OrderSide;
 /// a fill definitely occurred regardless of WebSocket/REST/order status detection.
 pub struct PositionMonitorService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<FillDedup>,
+    pub fill_aggregator: Arc<FillAggregator>,
     pub last_position_snapshot: Arc<Mutex<Option<PositionSnapshot>>>,
 }
 
@@ -51,6 +54,7 @@ impl PositionMonitorService {
                 }
 
                 state.active_order.as_ref().map(|o| (
+                    o.order_id,
                     o.client_order_id.clone(),
                     o.side,
                     o.size
@@ -85,7 +89,7 @@ impl PositionMonitorService {
                 continue;
             }
 
-            let (client_order_id, order_side, _order_size) = active_order_info.unwrap();
+            let (order_id_opt, client_order_id, order_side, _order_size) = active_order_info.unwrap();
 
             // Fetch current positions
             let positions_result = self.pacifica_trading.get_positions().await;
@@ -134,7 +138,7 @@ impl PositionMonitorService {
 
                         info!(
                             "{} {} Position delta detected: {} {} → {} {} (Δ {:.4})",
-                            "[POSITION_MONITOR]".bright_cyan().bold(),
+                            tag_static("POSITION_MONITOR", Color::BrightCyan),
                             "⚡".yellow().bold(),
                             format!("{:.4}", last_signed).bright_white(),
                             last_side.yellow(),
@@ -148,7 +152,7 @@ impl PositionMonitorService {
                         if last_snapshot.is_none() && last_signed.abs() < 0.0001 {
                             info!(
                                 "{} {} Skipping hedge for first position change from baseline (startup initialization)",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
+                                tag_static("POSITION_MONITOR", Color::BrightCyan),
                                 "ℹ".blue().bold()
                             );
 
@@ -177,7 +181,7 @@ impl PositionMonitorService {
                         ) {
                             info!(
                                 "{} {} Fill already handled by primary detection (state: {:?}), skipping duplicate hedge",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
+                                tag_static("POSITION_MONITOR", Color::BrightCyan),
                                 "ℹ".blue().bold(),
                                 current_state
                             );
@@ -192,22 +196,26 @@ impl PositionMonitorService {
                             continue;
                         }
 
-                        // Check if already processed - use consistent fill_id format with WebSocket detection
-                        let fill_id = format!("full_{}", client_order_id);
-                        let should_process = {
-                            let mut processed = self.processed_fills.lock();
-                            if !processed.contains(&fill_id) {
-                                processed.insert(fill_id.clone());
-                                true
-                            } else {
-                                false
-                            }
-                        }; // MutexGuard is dropped here
+                        // Route through the aggregator too so any earlier WS/REST partials
+                        // on the same order_id are reconciled. Position-delta events are
+                        // always terminal (the delta reflects a completed trade batch).
+                        // We best-effort compute absolute filled size via delta magnitude.
+                        if let Some(id) = order_id_opt {
+                            let _ = self.fill_aggregator.on_fill(id, order_side, fill_size, 0.0, true);
+                        }
+
+                        // Canonical dedup: prefer exchange order_id (shared with WS / REST
+                        // detectors); fall back to cloid only if order_id is missing.
+                        let dedup_key = match order_id_opt {
+                            Some(id) => FillKey::OrderId(id),
+                            None => FillKey::Cloid(client_order_id.clone()),
+                        };
+                        let should_process = self.processed_fills.insert_if_new(dedup_key);
 
                         if should_process {
                             info!(
                                 "{} {} FILL DETECTED via position change!",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
+                                tag_static("POSITION_MONITOR", Color::BrightCyan),
                                 "✓".green().bold()
                             );
 
@@ -219,7 +227,7 @@ impl PositionMonitorService {
 
                             // Dual cancellation
                             info!("{} {} Dual cancellation (REST + WebSocket)...",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
+                                tag_static("POSITION_MONITOR", Color::BrightCyan),
                                 "⚡".yellow().bold()
                             );
 
@@ -230,14 +238,14 @@ impl PositionMonitorService {
                             match rest_result {
                                 Ok(count) => {
                                     info!("{} {} REST API cancelled {} order(s)",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
+                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
                                         "✓".green().bold(),
                                         count
                                     );
                                 }
                                 Err(e) => {
                                     warn!("{} {} REST API cancel failed: {}",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
+                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
                                         "⚠".yellow().bold(),
                                         e
                                     );
@@ -251,14 +259,14 @@ impl PositionMonitorService {
                             match ws_result {
                                 Ok(count) => {
                                     info!("{} {} WebSocket cancelled {} order(s)",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
+                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
                                         "✓".green().bold(),
                                         count
                                     );
                                 }
                                 Err(e) => {
                                     warn!("{} {} WebSocket cancel failed: {}",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
+                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
                                         "⚠".yellow().bold(),
                                         e
                                     );
@@ -271,11 +279,18 @@ impl PositionMonitorService {
                                 .unwrap_or(0.0);
 
                             info!("{} Triggering hedge for position-detected fill",
-                                "[POSITION_MONITOR]".bright_cyan().bold()
+                                tag_static("POSITION_MONITOR", Color::BrightCyan)
                             );
 
                             // Trigger hedge (with current timestamp since position monitor detects fills retroactively)
-                            let _ = self.hedge_tx.send((order_side, fill_size, estimated_price, std::time::Instant::now()));
+                            if let Err(e) = self.hedge_tx.try_send((order_side, fill_size, estimated_price, std::time::Instant::now())) {
+                                error!(
+                                    "{} {} Hedge queue send failed — BACKLOG: {}",
+                                    tag_static("POSITION_MONITOR", Color::BrightCyan),
+                                    "✗".red().bold(),
+                                    e
+                                );
+                            }
                         } else {
                             debug!("[POSITION_MONITOR] Fill already processed by another detection method");
                         }

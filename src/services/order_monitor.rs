@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
 use crate::strategy::{OpportunityEvaluator, OrderSide};
+use crate::util::price::{prices_valid, SharedQuote};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 // ============================================================================
@@ -83,13 +84,17 @@ impl SharedOrderSnapshot {
 // CANCELLATION REQUEST CHANNEL (DECOUPLE FROM HOT PATH)
 // ============================================================================
 
-/// Cancellation request sent from monitor to cancellation handler
-#[derive(Debug)]
+/// Cancellation request sent from monitor to cancellation handler.
+///
+/// Hot-path `CancelRequest` values are `Copy` and allocation-free — the
+/// monitor loop runs at 1 kHz and can fire multiple requests per second, so
+/// any string building is deferred to the (cold) cancellation handler.
+#[derive(Debug, Clone, Copy)]
 pub enum CancelRequest {
-    /// Cancel due to age expiry
-    AgeExpiry { symbol: String, reason: String },
-    /// Cancel due to profit deviation
-    ProfitDeviation { symbol: String, current_profit_bps: f64, deviation_bps: f64 },
+    /// Cancel due to age expiry (order age in ms).
+    AgeExpiry { age_ms: u64 },
+    /// Cancel due to profit deviation.
+    ProfitDeviation { current_profit_bps: f64, deviation_bps: f64 },
 }
 
 // ============================================================================
@@ -119,8 +124,8 @@ pub struct OrderMonitorService {
     pub order_snapshot: Arc<SharedOrderSnapshot>,
     
     // Price feeds (lock-free reads via parking_lot)
-    pub pacifica_prices: Arc<Mutex<(f64, f64)>>,
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+    pub pacifica_prices: Arc<SharedQuote>,
+    pub hyperliquid_prices: Arc<SharedQuote>,
     
     // Configuration
     pub config: Config,
@@ -140,8 +145,8 @@ impl OrderMonitorService {
         bot_state: Arc<RwLock<BotState>>,
         atomic_status: Arc<AtomicU8>,
         order_snapshot: Arc<SharedOrderSnapshot>,
-        pacifica_prices: Arc<Mutex<(f64, f64)>>,
-        hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+        pacifica_prices: Arc<SharedQuote>,
+        hyperliquid_prices: Arc<SharedQuote>,
         config: Config,
         evaluator: OpportunityEvaluator,
         pacifica_trading: Arc<PacificaTrading>,
@@ -193,8 +198,8 @@ impl OrderMonitorService {
             };
 
             // Get prices (parking_lot mutex is very fast for uncontended case)
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
-            if hl_bid == 0.0 || hl_ask == 0.0 {
+            let (hl_bid, hl_ask) = self.hyperliquid_prices.load();
+            if !prices_valid(hl_bid, hl_ask) {
                 continue;
             }
 
@@ -202,10 +207,10 @@ impl OrderMonitorService {
 
             // Check 1: Age threshold
             if age > age_threshold {
-                // Send cancel request (non-blocking)
+                // Send allocation-free cancel request (non-blocking). The human
+                // formatting happens in the cold-path handler.
                 let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
-                    symbol: self.config.symbol.clone(),
-                    reason: format!("age {}ms > {}s threshold", age.as_millis(), self.config.order_refresh_interval_secs),
+                    age_ms: age.as_millis() as u64,
                 });
                 continue;
             }
@@ -223,9 +228,8 @@ impl OrderMonitorService {
             let profit_deviation = profit_change.abs();
 
             if profit_deviation > profit_threshold {
-                // Send cancel request (non-blocking)
+                // Send allocation-free cancel request (non-blocking).
                 let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
-                    symbol: self.config.symbol.clone(),
                     current_profit_bps: current_profit,
                     deviation_bps: profit_deviation,
                 });
@@ -284,12 +288,15 @@ impl OrderMonitorService {
                 }
             }
 
-            // Log the cancellation reason
-            match &request {
-                CancelRequest::AgeExpiry { reason, .. } => {
-                    info!("[CANCEL] Age expiry: {}", reason);
+            // Log the cancellation reason (cold path, formatting is fine here)
+            match request {
+                CancelRequest::AgeExpiry { age_ms } => {
+                    info!(
+                        "[CANCEL] Age expiry: age {}ms > {}s threshold",
+                        age_ms, self.config.order_refresh_interval_secs
+                    );
                 }
-                CancelRequest::ProfitDeviation { current_profit_bps, deviation_bps, .. } => {
+                CancelRequest::ProfitDeviation { current_profit_bps, deviation_bps } => {
                     info!(
                         "[CANCEL] Profit deviation: current={:.2} bps, deviation={:.2} bps",
                         current_profit_bps, deviation_bps
@@ -297,13 +304,8 @@ impl OrderMonitorService {
                 }
             }
 
-            // Execute cancellation
-            let symbol = match &request {
-                CancelRequest::AgeExpiry { symbol, .. } => symbol,
-                CancelRequest::ProfitDeviation { symbol, .. } => symbol,
-            };
-
-            match self.pacifica_trading.cancel_all_orders(false, Some(symbol), false).await {
+            // Execute cancellation against the configured symbol
+            match self.pacifica_trading.cancel_all_orders(false, Some(&self.config.symbol), false).await {
                 Ok(_) => {
                     rate_limit.record_success();
                     
@@ -353,8 +355,8 @@ impl OrderMonitorService {
                 None => continue,
             };
 
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
-            if hl_bid == 0.0 || hl_ask == 0.0 {
+            let (hl_bid, hl_ask) = self.hyperliquid_prices.load();
+            if !prices_valid(hl_bid, hl_ask) {
                 continue;
             }
 
@@ -422,12 +424,12 @@ impl OrderMonitorService {
         let (pac_result, hl_result) = tokio::join!(pac_future, hl_future);
 
         if let Ok(Some((bid, ask))) = pac_result {
-            *self.pacifica_prices.lock() = (bid, ask);
+            self.pacifica_prices.store(bid, ask);
             debug!("[REFRESH] Pacifica: bid=${:.6}, ask=${:.6}", bid, ask);
         }
 
         if let Ok(Some((bid, ask))) = hl_result {
-            *self.hyperliquid_prices.lock() = (bid, ask);
+            self.hyperliquid_prices.store(bid, ask);
             debug!("[REFRESH] Hyperliquid: bid=${:.6}, ask=${:.6}", bid, ask);
         }
     }

@@ -226,8 +226,8 @@ pub struct OrderRequest {
     pub action: Action,
     pub nonce: u64,
     pub signature: Signature,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vaultAddress: Option<String>,
+    #[serde(rename = "vaultAddress", skip_serializing_if = "Option::is_none")]
+    pub vault_address: Option<String>,
 }
 
 /// Asset metadata from meta endpoint
@@ -292,8 +292,10 @@ pub struct RestingOrder {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FilledOrder {
-    pub totalSz: String,
-    pub avgPx: String,
+    #[serde(rename = "totalSz")]
+    pub total_sz: String,
+    #[serde(rename = "avgPx")]
+    pub avg_px: String,
     pub oid: u64,
 }
 

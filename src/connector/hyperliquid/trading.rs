@@ -436,7 +436,7 @@ impl HyperliquidTrading {
             action,
             nonce,
             signature,
-            vaultAddress: None,
+            vault_address: None,
         })
     }
 
@@ -584,5 +584,21 @@ impl HyperliquidTrading {
     /// Get wallet address from the internal wallet
     pub fn get_wallet_address(&self) -> String {
         format!("{:?}", self.wallet.address())
+    }
+}
+
+/// REST top-of-book poller for the generic `PricePollService`.
+pub struct HyperliquidPoller {
+    pub trading: std::sync::Arc<HyperliquidTrading>,
+    pub symbol: String,
+}
+
+#[async_trait::async_trait]
+impl crate::services::price_source::PricePoll for HyperliquidPoller {
+    fn label(&self) -> &'static str {
+        "HYPERLIQUID_REST"
+    }
+    async fn fetch(&self) -> Result<Option<(f64, f64)>> {
+        self.trading.get_l2_snapshot(&self.symbol).await
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -8,9 +7,12 @@ use fast_float::parse;
 
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::services::fill_aggregator::FillAggregator;
+use crate::services::fill_dedup::{FillDedup, FillKey};
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
+use crate::util::log::{tag_static, Color};
 use crate::util::rate_limit::is_rate_limit_error;
 
 /// REST API fill detection service (backup/fallback method)
@@ -19,11 +21,12 @@ use crate::util::rate_limit::is_rate_limit_error;
 /// missed by WebSocket. This provides redundancy and recovery capabilities.
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<FillDedup>,
+    pub fill_aggregator: Arc<FillAggregator>,
     pub min_hedge_notional: f64,
     pub poll_interval_ms: u64,
 }
@@ -118,22 +121,43 @@ impl RestFillDetectionService {
                             // Check if this is a full fill or significant partial fill
                             let is_full_fill = (filled_amount - initial_amount).abs() < 0.0001;
 
-                            if is_full_fill || notional_value > self.min_hedge_notional {
-                                let fill_type = if is_full_fill { "full" } else { "partial" };
-                                let cloid = &order.client_order_id;
-                                let fill_id = format!("{}_{}_rest", fill_type, cloid);
+                            // Route through the aggregator. Only terminal events (full fill or
+                            // notional-breach partials) will emit a hedge decision.
+                            let order_side_tentative = if let Some(side) = order_side_opt {
+                                side
+                            } else {
+                                match order.side.as_str() {
+                                    "bid" | "buy" => OrderSide::Buy,
+                                    "ask" | "sell" => OrderSide::Sell,
+                                    _ => continue,
+                                }
+                            };
+                            let decision = self.fill_aggregator.on_fill(
+                                order.order_id,
+                                order_side_tentative,
+                                filled_amount,
+                                price,
+                                is_full_fill,
+                            );
+                            let Some(d) = decision else {
+                                debug!(
+                                    "[REST_FILL_DETECTION] Accumulated partial (order_id={}, cumulative ${:.2}), waiting for terminal",
+                                    order.order_id, notional_value
+                                );
+                                continue;
+                            };
 
-                                // Check if already processed (prevent duplicate hedges from WebSocket)
-                                let mut processed = self.processed_fills.lock();
-                                if processed.contains(&fill_id)
-                                    || processed.contains(&format!("full_{}", cloid))
-                                    || processed.contains(&format!("partial_{}", cloid))
-                                {
-                                    debug!("[REST_FILL_DETECTION] Fill already processed by WebSocket, skipping");
+                            if is_full_fill || notional_value > self.min_hedge_notional {
+                                // Canonical dedup by Pacifica order_id: shared across WS / REST /
+                                // position-monitor paths. Whichever detector sees the fill first wins.
+                                if !self.processed_fills.insert_if_new(FillKey::OrderId(order.order_id)) {
+                                    debug!(
+                                        "[REST_FILL_DETECTION] Fill already processed (order_id={}), skipping",
+                                        order.order_id
+                                    );
                                     continue;
                                 }
-                                processed.insert(fill_id);
-                                drop(processed);
+                                let _ = d; // decision values used via d below
 
                                 // Determine order side from order data or state
                                 let order_side = if let Some(side) = order_side_opt {
@@ -155,7 +179,7 @@ impl RestFillDetectionService {
 
                                 info!(
                                     "{} {} {} FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {} {}",
-                                    "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                    tag_static("REST_FILL_DETECTION", Color::BrightCyan),
                                     "✓".green().bold(),
                                     if is_full_fill { "FULL" } else { "PARTIAL" },
                                     order.side.bright_yellow(),
@@ -184,14 +208,14 @@ impl RestFillDetectionService {
 
                                     info!(
                                         "{} {} State updated to Filled (REST)",
-                                        "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
                                         "✓".green().bold()
                                     );
 
                                     // Dual cancellation
                                     info!(
                                         "{} {} Dual cancellation (REST + WebSocket)...",
-                                        "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
                                         "⚡".yellow().bold()
                                     );
 
@@ -200,7 +224,7 @@ impl RestFillDetectionService {
                                         Ok((rest_count, ws_count)) => {
                                             info!(
                                                 "{} {} Dual cancellation complete (REST: {}, WS: {})",
-                                                "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                                tag_static("REST_FILL_DETECTION", Color::BrightCyan),
                                                 "✓✓".green().bold(),
                                                 rest_count,
                                                 ws_count
@@ -209,7 +233,7 @@ impl RestFillDetectionService {
                                         Err(e) => {
                                             error!(
                                                 "{} {} Dual cancellation failed: {}",
-                                                "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                                tag_static("REST_FILL_DETECTION", Color::BrightCyan),
                                                 "✗".red().bold(),
                                                 e
                                             );
@@ -223,7 +247,14 @@ impl RestFillDetectionService {
                                     );
 
                                     // Trigger hedge (with current timestamp since REST detection detects fills retroactively)
-                                    let _ = hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now()));
+                                    if let Err(e) = hedge_tx_clone.try_send((order_side, filled_amount, price, std::time::Instant::now())) {
+                                        error!(
+                                            "{} {} Hedge queue send failed — BACKLOG: {}",
+                                            tag_static("REST_FILL_DETECTION", Color::BrightCyan),
+                                            "✗".red().bold(),
+                                            e
+                                        );
+                                    }
                                 });
                             } else {
                                 debug!(
@@ -248,7 +279,7 @@ impl RestFillDetectionService {
                         let backoff_secs = std::cmp::min(2u64.pow(consecutive_errors - 1), 32);
                         warn!(
                             "{} {} Rate limit hit, backing off for {} seconds...",
-                            "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                            tag_static("REST_FILL_DETECTION", Color::BrightCyan),
                             "⚠".yellow().bold(),
                             backoff_secs
                         );
@@ -264,7 +295,7 @@ impl RestFillDetectionService {
                         if consecutive_errors >= 5 {
                             warn!(
                                 "{} {} {} consecutive errors fetching open orders",
-                                "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                tag_static("REST_FILL_DETECTION", Color::BrightCyan),
                                 "⚠".yellow().bold(),
                                 consecutive_errors
                             );

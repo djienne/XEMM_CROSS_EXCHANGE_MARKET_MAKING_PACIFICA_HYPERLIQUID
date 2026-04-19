@@ -34,3 +34,14 @@ parking_lot = "0.12"
 crossfire = "2.1"
 bloomfilter = "1.0"
 fast-float = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "opportunity"
+harness = false
+
+[[bench]]
+name = "price_quote"
+harness = false

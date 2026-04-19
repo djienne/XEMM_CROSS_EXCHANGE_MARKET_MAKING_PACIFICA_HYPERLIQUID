@@ -225,3 +225,16 @@ impl Drop for OrderbookClient {
         info!("[HYPERLIQUID] OrderbookClient dropped for coin: {}", self.config.coin);
     }
 }
+
+#[async_trait::async_trait]
+impl crate::services::price_source::PriceStream for OrderbookClient {
+    fn label(&self) -> &'static str {
+        "HYPERLIQUID_OB"
+    }
+    async fn run_with(
+        &mut self,
+        mut cb: crate::services::price_source::BookCallback,
+    ) -> anyhow::Result<()> {
+        self.start(move |bid, ask, coin, ts| cb(bid, ask, coin, ts)).await
+    }
+}

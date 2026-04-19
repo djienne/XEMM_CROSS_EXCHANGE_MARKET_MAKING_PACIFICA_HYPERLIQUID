@@ -334,77 +334,9 @@ impl OrderUpdate {
 // WebSocket Trading Operations
 // ═══════════════════════════════════════════════════
 
-/// WebSocket cancel all orders request
-#[derive(Debug, Serialize)]
-pub struct WsCancelAllOrdersRequest {
-    /// Request ID (UUID)
-    pub id: String,
-    /// Request parameters
-    pub params: WsCancelAllOrdersParams,
-}
-
-/// Parameters for cancel all orders
-#[derive(Debug, Serialize)]
-pub struct WsCancelAllOrdersParams {
-    pub cancel_all_orders: WsCancelAllOrdersData,
-}
-
-/// Cancel all orders data payload
-#[derive(Debug, Serialize)]
-pub struct WsCancelAllOrdersData {
-    /// User's wallet address
-    pub account: String,
-    /// Agent wallet address (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_wallet: Option<String>,
-    /// Cryptographic signature
-    pub signature: String,
-    /// Current timestamp in milliseconds
-    pub timestamp: i64,
-    /// Signature expiry in milliseconds
-    pub expiry_window: i64,
-    /// Whether to cancel orders for all symbols
-    pub all_symbols: bool,
-    /// Whether to exclude reduce-only orders
-    pub exclude_reduce_only: bool,
-    /// Trading pair symbol (required if all_symbols is false)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
-}
-
-/// WebSocket cancel all orders response
-#[derive(Debug, Deserialize)]
-pub struct WsCancelAllOrdersResponse {
-    /// Status code
-    pub code: u16,
-    /// Response data
-    pub data: WsCancelAllOrdersResponseData,
-    /// Request ID (matches request)
-    pub id: String,
-    /// Response timestamp
-    pub t: i64,
-    /// Response type
-    #[serde(rename = "type")]
-    pub response_type: String,
-}
-
-/// Cancel all orders response data
-#[derive(Debug, Deserialize)]
-pub struct WsCancelAllOrdersResponseData {
-    /// Number of orders successfully cancelled
-    pub cancelled_count: u32,
-}
-
-/// Generic WebSocket trading error response
-#[derive(Debug, Deserialize)]
-pub struct WsErrorResponse {
-    pub code: u16,
-    pub error: Option<String>,
-    pub id: String,
-    pub t: i64,
-    #[serde(rename = "type")]
-    pub response_type: String,
-}
+// NOTE: the old strongly-typed WS trading request/response structs were
+// removed when `ws_trading.rs` was refactored to build payloads inline
+// against a persistent connection.
 
 // ═══════════════════════════════════════════════════
 // Account Positions WebSocket

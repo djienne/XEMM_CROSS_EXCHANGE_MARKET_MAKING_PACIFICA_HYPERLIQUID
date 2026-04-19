@@ -23,6 +23,9 @@ pub enum BotStatus {
 /// Active order information
 #[derive(Debug, Clone)]
 pub struct ActiveOrder {
+    /// Exchange-assigned order ID (canonical across fill-detection paths).
+    /// `None` only if the exchange response omitted it.
+    pub order_id: Option<u64>,
     /// Client order ID
     pub client_order_id: String,
     /// Trading symbol (e.g., "SOL")
@@ -152,3 +155,133 @@ impl Default for BotState {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn sample_order() -> ActiveOrder {
+        ActiveOrder {
+            order_id: Some(42),
+            client_order_id: "cloid-1234".to_string(),
+            symbol: "SOL".to_string(),
+            side: OrderSide::Buy,
+            price: 150.0,
+            size: 0.1,
+            initial_profit_bps: 15.0,
+            placed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn new_state_is_idle() {
+        let s = BotState::new();
+        assert!(s.is_idle());
+        assert!(s.is_idle_fast());
+        assert!(!s.is_terminal());
+        assert_eq!(s.position, 0.0);
+        assert_eq!(s.get_status_atomic(), 0);
+        assert!(s.active_order.is_none());
+        assert!(s.last_cancellation_time.is_none());
+    }
+
+    #[test]
+    fn set_active_order_transitions_to_order_placed() {
+        let mut s = BotState::new();
+        s.set_active_order(sample_order());
+        assert_eq!(s.status, BotStatus::OrderPlaced);
+        assert_eq!(s.get_status_atomic(), 1);
+        assert!(s.has_active_order_fast());
+        assert!(!s.is_idle());
+        assert!(s.active_order.is_some());
+    }
+
+    #[test]
+    fn clear_active_order_back_to_idle_and_records_cancel_time() {
+        let mut s = BotState::new();
+        s.set_active_order(sample_order());
+        s.clear_active_order();
+        assert!(s.is_idle());
+        assert_eq!(s.get_status_atomic(), 0);
+        assert!(s.active_order.is_none());
+        assert!(s.last_cancellation_time.is_some());
+    }
+
+    #[test]
+    fn mark_filled_updates_position_buy() {
+        let mut s = BotState::new();
+        s.set_active_order(sample_order());
+        s.mark_filled(0.3, OrderSide::Buy);
+        assert_eq!(s.status, BotStatus::Filled);
+        assert_eq!(s.get_status_atomic(), 2);
+        assert!((s.position - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mark_filled_updates_position_sell() {
+        let mut s = BotState::new();
+        s.set_active_order(sample_order());
+        s.mark_filled(0.5, OrderSide::Sell);
+        assert_eq!(s.status, BotStatus::Filled);
+        assert!((s.position + 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mark_hedging_then_complete_clears_order() {
+        let mut s = BotState::new();
+        s.set_active_order(sample_order());
+        s.mark_hedging();
+        assert_eq!(s.get_status_atomic(), 3);
+        s.mark_complete();
+        assert_eq!(s.get_status_atomic(), 4);
+        assert!(s.is_terminal());
+        assert!(s.active_order.is_none());
+    }
+
+    #[test]
+    fn set_error_flips_to_terminal_error() {
+        let mut s = BotState::new();
+        s.set_error("boom".to_string());
+        assert_eq!(s.get_status_atomic(), 5);
+        assert!(s.is_terminal());
+        match &s.status {
+            BotStatus::Error(msg) => assert_eq!(msg, "boom"),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn atomic_status_mirrors_status_field() {
+        let mut s = BotState::new();
+        let expected = [
+            (BotStatus::OrderPlaced, 1u8),
+            (BotStatus::Filled, 2),
+            (BotStatus::Hedging, 3),
+            (BotStatus::Complete, 4),
+        ];
+        s.set_active_order(sample_order());
+        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[0].1);
+        s.mark_filled(0.1, OrderSide::Buy);
+        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[1].1);
+        s.mark_hedging();
+        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[2].1);
+        s.mark_complete();
+        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[3].1);
+    }
+
+    #[test]
+    fn grace_period_elapsed_without_prior_cancel_is_true() {
+        let s = BotState::new();
+        assert!(s.grace_period_elapsed(3));
+    }
+
+    #[test]
+    fn grace_period_not_elapsed_right_after_cancel() {
+        let mut s = BotState::new();
+        s.set_active_order(sample_order());
+        s.clear_active_order();
+        assert!(!s.grace_period_elapsed(60));
+    }
+}
+

@@ -5,8 +5,9 @@ pub mod rest_fill_detection;
 pub mod position_monitor;
 pub mod order_monitor;
 pub mod hedge;
-pub mod orderbook;
-pub mod rest_poll;
+pub mod price_source;
+pub mod fill_dedup;
+pub mod fill_aggregator;
 
 use crate::strategy::OrderSide;
 

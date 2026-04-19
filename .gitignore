@@ -26,6 +26,9 @@ Thumbs.db
 # Debug files
 *debug*.txt
 
+# Generated artifact from collect_rust_code.py
+rust_code_collection.txt
+
 # CSV files
 *.csv
 

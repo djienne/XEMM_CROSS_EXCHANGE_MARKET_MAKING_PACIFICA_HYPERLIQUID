@@ -1,33 +1,47 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use parking_lot::Mutex;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::oneshot;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::types::{
-    WsCancelAllOrdersData, WsCancelAllOrdersParams, WsCancelAllOrdersRequest,
-    WsCancelAllOrdersResponse, WsErrorResponse,
-};
 use super::trading::canonicalize_json;
 use crate::connector::pacifica::PacificaCredentials;
 
-/// WebSocket-based trading client for Pacifica
+/// Maximum time to wait for a request/response round trip before giving up.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Keepalive ping cadence. Pacifica closes idle connections after 60 s.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Max backoff between reconnect attempts.
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+
+type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
+
+/// Persistent WebSocket-based trading client for Pacifica.
 ///
-/// This is an alternative to REST API trading operations with lower latency
-/// and no rate limits. Uses the same WebSocket connection for multiple operations.
+/// One connection is maintained for the lifetime of the process. A background
+/// task owns the socket, demultiplexes incoming frames by request id, and
+/// reconnects on disconnect with exponential backoff. Callers push outbound
+/// JSON through a channel and await a matching response via `oneshot`.
 pub struct PacificaWsTrading {
     credentials: PacificaCredentials,
-    ws_url: String,
+    outbound_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    pending: PendingMap,
+    connected: Arc<AtomicBool>,
 }
 
 impl PacificaWsTrading {
-    /// Create a new WebSocket trading client
-    ///
-    /// # Arguments
-    /// * `credentials` - Pacifica credentials
-    /// * `is_testnet` - Whether to use testnet (false = mainnet)
+    /// Create a new WebSocket trading client and start the persistent
+    /// connection task. Returns immediately; the connection is established
+    /// asynchronously. Callers can observe `is_connected()` to probe status.
     pub fn new(credentials: PacificaCredentials, is_testnet: bool) -> Self {
         let ws_url = if is_testnet {
             "wss://test-ws.pacifica.fi/ws".to_string()
@@ -35,21 +49,35 @@ impl PacificaWsTrading {
             "wss://ws.pacifica.fi/ws".to_string()
         };
 
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(false));
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // Spawn the persistent connection runner.
+        let pending_bg = pending.clone();
+        let connected_bg = connected.clone();
+        tokio::spawn(async move {
+            Self::run_connection_loop(ws_url, outbound_rx, pending_bg, connected_bg).await;
+        });
+
         Self {
             credentials,
-            ws_url,
+            outbound_tx,
+            pending,
+            connected,
         }
     }
 
-    /// Cancel all orders via WebSocket
+    /// Returns true if the underlying WebSocket is currently connected.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Cancel all orders via WebSocket. Returns the number of orders cancelled.
     ///
-    /// # Arguments
-    /// * `all_symbols` - Whether to cancel orders for all symbols
-    /// * `symbol` - Symbol to cancel orders for (required if all_symbols is false)
-    /// * `exclude_reduce_only` - Whether to exclude reduce-only orders
-    ///
-    /// # Returns
-    /// Number of orders cancelled
+    /// Uses the long-lived connection established by `new()`. If the socket is
+    /// currently down, returns an error so the caller (dual_cancel) can fall
+    /// back to REST.
     pub async fn cancel_all_orders_ws(
         &self,
         all_symbols: bool,
@@ -59,165 +87,235 @@ impl PacificaWsTrading {
         if !all_symbols && symbol.is_none() {
             anyhow::bail!("symbol is required when all_symbols is false");
         }
+        if !self.is_connected() {
+            anyhow::bail!("Pacifica WS not connected");
+        }
 
-        info!(
-            "[PACIFICA_WS] Cancelling all orders via WebSocket (all_symbols: {}, symbol: {:?}, exclude_reduce_only: {})",
-            all_symbols,
-            symbol,
-            exclude_reduce_only
-        );
-
-        // Connect to WebSocket
-        let (ws_stream, _) = connect_async(&self.ws_url)
-            .await
-            .context("Failed to connect to Pacifica WebSocket")?;
-
-        debug!("[PACIFICA_WS] Connected to {}", self.ws_url);
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // Generate request ID
         let request_id = Uuid::new_v4().to_string();
-
-        // Build signature
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window = 5000;
+        let expiry_window: i64 = 5000;
 
         let header = json!({
             "type": "cancel_all_orders",
             "timestamp": timestamp,
-            "expiry_window": expiry_window
+            "expiry_window": expiry_window,
         });
-
         let mut payload = json!({
             "all_symbols": all_symbols,
-            "exclude_reduce_only": exclude_reduce_only
+            "exclude_reduce_only": exclude_reduce_only,
         });
-
-        // Add symbol if provided
         if let Some(sym) = symbol {
             payload["symbol"] = json!(sym);
         }
 
         let signature = self.sign_message(header, payload.clone())?;
 
-        // Build cancel all orders request
-        let cancel_request = WsCancelAllOrdersRequest {
-            id: request_id.clone(),
-            params: WsCancelAllOrdersParams {
-                cancel_all_orders: WsCancelAllOrdersData {
-                    account: self.credentials.account.clone(),
-                    agent_wallet: Some(self.credentials.agent_wallet.clone()),
-                    signature,
-                    timestamp,
-                    expiry_window,
-                    all_symbols,
-                    exclude_reduce_only,
-                    symbol: symbol.map(|s| s.to_string()),
-                },
+        // Params object matching FULL_websocket.txt's cancel_all_orders format.
+        let mut params_inner = serde_json::Map::new();
+        params_inner.insert("account".into(), json!(self.credentials.account));
+        params_inner.insert("agent_wallet".into(), json!(self.credentials.agent_wallet));
+        params_inner.insert("signature".into(), json!(signature));
+        params_inner.insert("timestamp".into(), json!(timestamp));
+        params_inner.insert("expiry_window".into(), json!(expiry_window));
+        params_inner.insert("all_symbols".into(), json!(all_symbols));
+        params_inner.insert("exclude_reduce_only".into(), json!(exclude_reduce_only));
+        if let Some(sym) = symbol {
+            params_inner.insert("symbol".into(), json!(sym));
+        }
+
+        let request_json = json!({
+            "id": request_id,
+            "params": {
+                "cancel_all_orders": Value::Object(params_inner),
             },
-        };
+        });
+        let request_text = serde_json::to_string(&request_json)?;
 
-        // Serialize and send request
-        let request_json = serde_json::to_string(&cancel_request)?;
-        debug!("[PACIFICA_WS] Sending request: {}", request_json);
-        write.send(Message::Text(request_json)).await?;
+        // Register pending oneshot before sending to avoid a race where the
+        // response arrives before we insert.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().insert(request_id.clone(), tx);
 
-        // Wait for response with matching ID
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    debug!("[PACIFICA_WS] Received: {}", text);
+        if self.outbound_tx.send(request_text).is_err() {
+            self.pending.lock().remove(&request_id);
+            anyhow::bail!("Pacifica WS outbound channel closed");
+        }
 
-                    // Try to parse as success response
-                    if let Ok(response) = serde_json::from_str::<WsCancelAllOrdersResponse>(&text)
-                    {
-                        if response.id == request_id {
-                            if response.code == 200 {
-                                info!(
-                                    "[PACIFICA_WS] Successfully cancelled {} order(s)",
-                                    response.data.cancelled_count
-                                );
-                                return Ok(response.data.cancelled_count);
-                            } else {
-                                anyhow::bail!(
-                                    "Cancel all orders failed with code: {}",
-                                    response.code
-                                );
+        match timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(value)) => {
+                let code = value.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
+                if code == 200 {
+                    let cancelled = value
+                        .get("data")
+                        .and_then(|d| d.get("cancelled_count"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    info!("[PACIFICA_WS] Cancelled {} order(s)", cancelled);
+                    Ok(cancelled)
+                } else {
+                    let err = value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("code={}", code));
+                    anyhow::bail!("Pacifica WS cancel_all failed: {}", err);
+                }
+            }
+            Ok(Err(_)) => {
+                self.pending.lock().remove(&request_id);
+                anyhow::bail!("Pacifica WS response channel dropped")
+            }
+            Err(_) => {
+                self.pending.lock().remove(&request_id);
+                anyhow::bail!("Pacifica WS cancel_all timed out after {:?}", REQUEST_TIMEOUT)
+            }
+        }
+    }
+
+    /// Background task: own the socket, multiplex writes, demultiplex reads,
+    /// reconnect on failure. Exits only when `outbound_rx` is dropped (process
+    /// shutdown).
+    async fn run_connection_loop(
+        ws_url: String,
+        mut outbound_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        pending: PendingMap,
+        connected: Arc<AtomicBool>,
+    ) {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            info!("[PACIFICA_WS] Connecting to {}", ws_url);
+            let stream = match connect_async(&ws_url).await {
+                Ok((s, _)) => {
+                    info!("[PACIFICA_WS] Connected");
+                    backoff = Duration::from_secs(1);
+                    s
+                }
+                Err(e) => {
+                    warn!("[PACIFICA_WS] Connect failed: {} — retrying in {:?}", e, backoff);
+                    Self::fail_all_pending(&pending, "ws connect failed");
+                    sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, MAX_RECONNECT_BACKOFF);
+                    continue;
+                }
+            };
+            connected.store(true, Ordering::Release);
+
+            let (mut write, mut read) = stream.split();
+            let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // Pump until one side fails.
+            let dc_reason: String = loop {
+                tokio::select! {
+                    msg = outbound_rx.recv() => {
+                        match msg {
+                            Some(text) => {
+                                if let Err(e) = write.send(Message::Text(text)).await {
+                                    break format!("write error: {}", e);
+                                }
+                            }
+                            None => {
+                                // Sender dropped — process is shutting down.
+                                let _ = write.close().await;
+                                connected.store(false, Ordering::Release);
+                                return;
                             }
                         }
                     }
-
-                    // Try to parse as error response
-                    if let Ok(error_response) = serde_json::from_str::<WsErrorResponse>(&text) {
-                        if error_response.id == request_id {
-                            let error_msg = error_response
-                                .error
-                                .unwrap_or_else(|| format!("Unknown error (code: {})", error_response.code));
-                            anyhow::bail!("WebSocket error: {}", error_msg);
+                    _ = keepalive.tick() => {
+                        let ping = json!({"method": "ping"}).to_string();
+                        if let Err(e) = write.send(Message::Text(ping)).await {
+                            break format!("keepalive write error: {}", e);
                         }
                     }
+                    frame = read.next() => {
+                        match frame {
+                            Some(Ok(Message::Text(text))) => {
+                                Self::dispatch_incoming(&text, &pending);
+                            }
+                            Some(Ok(Message::Ping(data))) => {
+                                let _ = write.send(Message::Pong(data)).await;
+                            }
+                            Some(Ok(Message::Pong(_))) => {}
+                            Some(Ok(Message::Close(_))) => break "server closed".to_string(),
+                            Some(Err(e)) => break format!("read error: {}", e),
+                            None => break "stream ended".to_string(),
+                            _ => {}
+                        }
+                    }
+                }
+            };
 
-                    // Ignore messages with different IDs (might be from other subscriptions)
-                }
-                Ok(Message::Close(_)) => {
-                    anyhow::bail!("WebSocket closed before receiving response");
-                }
-                Err(e) => {
-                    anyhow::bail!("WebSocket error: {}", e);
-                }
-                _ => {}
-            }
+            connected.store(false, Ordering::Release);
+            warn!("[PACIFICA_WS] Disconnected: {} — reconnecting in {:?}", dc_reason, backoff);
+            Self::fail_all_pending(&pending, &dc_reason);
+            sleep(backoff).await;
+            backoff = std::cmp::min(backoff * 2, MAX_RECONNECT_BACKOFF);
         }
-
-        anyhow::bail!("WebSocket stream ended before receiving response")
     }
 
-    /// Sign a message using Ed25519
-    ///
-    /// This is identical to the REST API signature method
-    fn sign_message(
-        &self,
-        header: serde_json::Value,
-        payload: serde_json::Value,
-    ) -> Result<String> {
-        // Construct message: {... header, data: payload}
+    /// Route an incoming text frame to its registered `oneshot::Sender`.
+    fn dispatch_incoming(text: &str, pending: &PendingMap) {
+        let value: Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("[PACIFICA_WS] Skipping unparseable frame: {}", e);
+                return;
+            }
+        };
+        // The `id` field correlates responses to pending oneshots.
+        let id = match value.get("id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                // Subscription push (no id) — ignore in the trading client.
+                return;
+            }
+        };
+        if let Some(tx) = pending.lock().remove(&id) {
+            let _ = tx.send(value);
+        } else {
+            debug!("[PACIFICA_WS] Unmatched response id={}", id);
+        }
+    }
+
+    /// On disconnect, drop every pending oneshot so callers unblock with an
+    /// error rather than timing out at 2 s.
+    fn fail_all_pending(pending: &PendingMap, reason: &str) {
+        let mut g = pending.lock();
+        if !g.is_empty() {
+            error!("[PACIFICA_WS] Failing {} pending request(s): {}", g.len(), reason);
+        }
+        g.clear();
+    }
+
+    /// Sign a message using Ed25519 (same scheme as REST).
+    fn sign_message(&self, header: Value, payload: Value) -> Result<String> {
         let mut message = serde_json::json!({});
-        if let serde_json::Value::Object(ref mut map) = message {
-            if let serde_json::Value::Object(header_map) = header {
+        if let Value::Object(ref mut map) = message {
+            if let Value::Object(header_map) = header {
                 for (k, v) in header_map {
                     map.insert(k, v);
                 }
             }
             map.insert("data".to_string(), payload);
         }
-
-        // Canonicalize JSON (sort keys alphabetically)
         let canonical = canonicalize_json(&message);
 
-        // Decode private key from base58
         let private_key_bytes = bs58::decode(&self.credentials.private_key)
             .into_vec()
             .context("Failed to decode private key")?;
-
-        // Solana/Pacifica private keys are 64 bytes (32 bytes seed + 32 bytes public key)
-        // Ed25519 SigningKey needs only the first 32 bytes (the seed)
         if private_key_bytes.len() != 64 {
             anyhow::bail!(
                 "Invalid private key length: expected 64 bytes, got {}",
                 private_key_bytes.len()
             );
         }
-
         let seed_bytes: [u8; 32] = private_key_bytes[0..32]
             .try_into()
             .context("Failed to extract 32-byte seed")?;
 
-        // Create signing key and sign
         let signing_key = SigningKey::from_bytes(&seed_bytes);
         let signature = signing_key.sign(canonical.as_bytes());
-
-        // Encode signature as base58
         Ok(bs58::encode(signature.to_bytes()).into_string())
     }
 }

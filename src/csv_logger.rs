@@ -9,6 +9,9 @@ use csv::Writer;
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::mpsc;
+use std::sync::OnceLock;
+use std::thread;
 
 use crate::strategy::OrderSide;
 
@@ -108,45 +111,73 @@ impl TradeRecord {
     }
 }
 
-/// Append a trade record to the CSV file
+/// Append a trade record to the CSV file (blocking).
 ///
-/// Creates the file with headers if it doesn't exist.
-/// Appends to the file if it already exists.
-///
-/// # Arguments
-/// * `file_path` - Path to the CSV file (e.g., "trades_history.csv")
-/// * `record` - Trade record to append
-///
-/// # Returns
-/// Result indicating success or failure
+/// Prefer `log_trade_async` on the hedge hot path — this function is kept
+/// for tests and non-latency-critical call sites. Creates the file if it
+/// doesn't exist, otherwise appends.
 pub fn log_trade(file_path: &str, record: &TradeRecord) -> Result<()> {
     let path = Path::new(file_path);
-    let file_exists = path.exists();
+    let _file_exists = path.exists();
 
-    // Open file in append mode (create if doesn't exist)
     let file = OpenOptions::new()
-        .write(true)
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("Failed to open CSV file: {}", file_path))?;
 
     let mut writer = Writer::from_writer(file);
-
-    // Write headers only if file is new
-    if !file_exists {
-        writer.serialize(record)
-            .context("Failed to write CSV headers")?;
-    } else {
-        // For existing files, don't write headers again
-        writer.serialize(record)
-            .context("Failed to write CSV record")?;
-    }
-
-    writer.flush()
-        .context("Failed to flush CSV writer")?;
-
+    writer.serialize(record).context("Failed to write CSV record")?;
+    writer.flush().context("Failed to flush CSV writer")?;
     Ok(())
+}
+
+/// Message sent to the background CSV-writer thread.
+struct LogMessage {
+    file_path: String,
+    record: TradeRecord,
+}
+
+static CSV_WRITER_TX: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
+
+/// Lazily spawn the dedicated CSV writer thread and return its sender.
+///
+/// A single `std::thread` (not a tokio task) owns the writing side. Hedge
+/// callers push records via an unbounded `std::sync::mpsc::channel` — sending
+/// never blocks. If the thread panics (e.g. disk full), subsequent sends
+/// become no-ops so the hedge path is never stalled by I/O.
+fn writer_tx() -> &'static mpsc::Sender<LogMessage> {
+    CSV_WRITER_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<LogMessage>();
+        thread::Builder::new()
+            .name("csv-logger".to_string())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    if let Err(e) = log_trade(&msg.file_path, &msg.record) {
+                        tracing::warn!(
+                            "[CSV_LOGGER] Failed to persist trade to {}: {}",
+                            msg.file_path,
+                            e
+                        );
+                    }
+                }
+            })
+            .expect("failed to spawn csv-logger thread");
+        tx
+    })
+}
+
+/// Non-blocking trade logging: push a record into the writer thread's queue.
+///
+/// Used by the hedge service so disk I/O never blocks the next hedge event.
+pub fn log_trade_async(file_path: impl Into<String>, record: TradeRecord) {
+    let tx = writer_tx();
+    if let Err(e) = tx.send(LogMessage {
+        file_path: file_path.into(),
+        record,
+    }) {
+        tracing::warn!("[CSV_LOGGER] Writer thread unavailable: {}", e);
+    }
 }
 
 #[cfg(test)]

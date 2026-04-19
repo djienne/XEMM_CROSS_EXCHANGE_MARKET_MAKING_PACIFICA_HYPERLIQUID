@@ -87,6 +87,15 @@ struct PositionSnapshot {
     timestamp: u64,
 }
 
+/// Async hook invoked on every successful (re)connect so the caller can
+/// perform REST reconciliation (e.g. scan open_orders for fills that
+/// occurred during the outage). Returns `()`; errors should be logged.
+pub type ReconcileHook = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+        + Send
+        + Sync,
+>;
+
 /// WebSocket client for monitoring order fills and updates
 pub struct FillDetectionClient {
     config: FillDetectionConfig,
@@ -97,6 +106,9 @@ pub struct FillDetectionClient {
     last_order_fill_time: Arc<Mutex<Instant>>,
     /// Track which symbols have received their first position update (for baseline initialization)
     position_initialized: Arc<Mutex<HashSet<String>>>,
+    /// Optional hook called after each (re)connect. Populate to run REST
+    /// reconciliation and catch up on fills that happened during the outage.
+    reconcile_hook: Arc<Mutex<Option<ReconcileHook>>>,
 }
 
 impl FillDetectionClient {
@@ -118,7 +130,15 @@ impl FillDetectionClient {
             position_snapshots: Arc::new(Mutex::new(HashMap::new())),
             last_order_fill_time: Arc::new(Mutex::new(Instant::now())),
             position_initialized: Arc::new(Mutex::new(HashSet::new())),
+            reconcile_hook: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Register a reconciliation hook that runs after every (re)connect.
+    /// Use this to fetch open orders / recent trades via REST so any fills
+    /// that occurred during the WS outage are replayed into the fill pipeline.
+    pub fn set_reconcile_hook(&self, hook: ReconcileHook) {
+        *self.reconcile_hook.lock() = Some(hook);
     }
 
     /// Get a handle for updating position baselines from external sources
@@ -263,6 +283,15 @@ impl FillDetectionClient {
             .context("Failed to connect to WebSocket")?;
 
         info!("WebSocket connected successfully");
+
+        // Reconcile any fills that landed during the outage via a caller-supplied
+        // REST catch-up hook. Runs once per (re)connect before we start serving
+        // live messages. Errors inside the hook are logged, not propagated.
+        let hook_opt = self.reconcile_hook.lock().clone();
+        if let Some(hook) = hook_opt {
+            info!("[PACIFICA_FILL] Running reconcile hook after connect");
+            hook().await;
+        }
 
         let (mut write, mut read) = ws_stream.split();
 
