@@ -66,6 +66,46 @@ pub struct Config {
     /// Used by REST fill detection to poll more frequently when an order is active.
     #[serde(default = "default_pacifica_active_order_rest_poll_interval")]
     pub pacifica_active_order_rest_poll_interval_ms: u64,
+
+    /// Maximum quote age for maker opportunity evaluation.
+    #[serde(default = "default_max_quote_age_ms")]
+    pub max_quote_age_ms: u64,
+
+    /// Maximum Hyperliquid quote age accepted by the hedge executor.
+    #[serde(default = "default_hedge_quote_max_age_ms")]
+    pub hedge_quote_max_age_ms: u64,
+
+    /// Maximum distance from Pacifica top-of-book for maker quotes.
+    #[serde(default = "default_max_quote_distance_bps")]
+    pub max_quote_distance_bps: f64,
+
+    /// Net base-unit dust tolerance for final neutral checks.
+    #[serde(default = "default_neutral_dust_base")]
+    pub neutral_dust_base: f64,
+
+    /// Hyperliquid WebSocket hedge response timeout.
+    #[serde(default = "default_hedge_ws_response_timeout_ms")]
+    pub hedge_ws_response_timeout_ms: u64,
+
+    /// Maximum unhedged base exposure before reconciler escalates.
+    #[serde(default = "default_max_unhedged_base")]
+    pub max_unhedged_base: f64,
+
+    /// Maximum unhedged USD exposure before reconciler escalates.
+    #[serde(default = "default_max_unhedged_usd")]
+    pub max_unhedged_usd: f64,
+
+    /// Maximum unhedged age before reconciler escalates.
+    #[serde(default = "default_max_unhedged_ms")]
+    pub max_unhedged_ms: u64,
+
+    /// Maximum consecutive hedge failures before halting.
+    #[serde(default = "default_max_consecutive_hedge_failures")]
+    pub max_consecutive_hedge_failures: u32,
+
+    /// Permit startup to continue if stale Pacifica order cancellation fails.
+    #[serde(default = "default_allow_startup_with_cancel_failure")]
+    pub allow_startup_with_cancel_failure: bool,
 }
 
 // Default values
@@ -125,6 +165,46 @@ fn default_pacifica_active_order_rest_poll_interval() -> u64 {
     500 // 500 ms (safer than 100ms to avoid rate limits)
 }
 
+fn default_max_quote_age_ms() -> u64 {
+    500
+}
+
+fn default_hedge_quote_max_age_ms() -> u64 {
+    250
+}
+
+fn default_max_quote_distance_bps() -> f64 {
+    50.0
+}
+
+fn default_neutral_dust_base() -> f64 {
+    0.01
+}
+
+fn default_hedge_ws_response_timeout_ms() -> u64 {
+    800
+}
+
+fn default_max_unhedged_base() -> f64 {
+    0.05
+}
+
+fn default_max_unhedged_usd() -> f64 {
+    10.0
+}
+
+fn default_max_unhedged_ms() -> u64 {
+    5_000
+}
+
+fn default_max_consecutive_hedge_failures() -> u32 {
+    3
+}
+
+fn default_allow_startup_with_cancel_failure() -> bool {
+    false
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -142,7 +222,18 @@ impl Default for Config {
             hyperliquid_slippage: default_hyperliquid_slippage(),
             hyperliquid_use_ws_for_hedge: default_hyperliquid_use_ws_for_hedge(),
             pacifica_rest_poll_interval_secs: default_pacifica_rest_poll_interval(),
-            pacifica_active_order_rest_poll_interval_ms: default_pacifica_active_order_rest_poll_interval(),
+            pacifica_active_order_rest_poll_interval_ms:
+                default_pacifica_active_order_rest_poll_interval(),
+            max_quote_age_ms: default_max_quote_age_ms(),
+            hedge_quote_max_age_ms: default_hedge_quote_max_age_ms(),
+            max_quote_distance_bps: default_max_quote_distance_bps(),
+            neutral_dust_base: default_neutral_dust_base(),
+            hedge_ws_response_timeout_ms: default_hedge_ws_response_timeout_ms(),
+            max_unhedged_base: default_max_unhedged_base(),
+            max_unhedged_usd: default_max_unhedged_usd(),
+            max_unhedged_ms: default_max_unhedged_ms(),
+            max_consecutive_hedge_failures: default_max_consecutive_hedge_failures(),
+            allow_startup_with_cancel_failure: default_allow_startup_with_cancel_failure(),
         }
     }
 }
@@ -168,8 +259,7 @@ impl Config {
     /// Save configuration to a JSON file
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let content = serde_json::to_string_pretty(self).context("Failed to serialize config")?;
 
         fs::write(path, content)
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
@@ -200,6 +290,62 @@ impl Config {
         anyhow::ensure!(
             self.reconnect_attempts > 0,
             "Reconnect attempts must be greater than 0"
+        );
+
+        anyhow::ensure!(
+            self.order_notional_usd > 0.0,
+            "Order notional must be positive"
+        );
+        anyhow::ensure!(
+            self.pacifica_maker_fee_bps.is_finite() && self.hyperliquid_taker_fee_bps.is_finite(),
+            "Fees must be finite"
+        );
+        anyhow::ensure!(
+            self.profit_rate_bps.is_finite(),
+            "Profit rate must be finite"
+        );
+        anyhow::ensure!(
+            self.profit_cancel_threshold_bps >= 0.0,
+            "Profit cancel threshold cannot be negative"
+        );
+        anyhow::ensure!(
+            self.order_refresh_interval_secs > 0,
+            "Order refresh interval must be positive"
+        );
+        anyhow::ensure!(
+            self.hyperliquid_slippage > 0.0 && self.hyperliquid_slippage < 1.0,
+            "Hyperliquid slippage must be between 0 and 1"
+        );
+        anyhow::ensure!(
+            self.pacifica_rest_poll_interval_secs > 0
+                && self.pacifica_active_order_rest_poll_interval_ms > 0,
+            "Poll intervals must be positive"
+        );
+        anyhow::ensure!(self.max_quote_age_ms > 0, "Max quote age must be positive");
+        anyhow::ensure!(
+            self.hedge_quote_max_age_ms > 0,
+            "Hedge quote max age must be positive"
+        );
+        anyhow::ensure!(
+            self.max_quote_distance_bps > 0.0,
+            "Max quote distance must be positive"
+        );
+        anyhow::ensure!(
+            self.neutral_dust_base >= 0.0,
+            "Neutral dust cannot be negative"
+        );
+        anyhow::ensure!(
+            self.hedge_ws_response_timeout_ms > 0,
+            "Hedge WS response timeout must be positive"
+        );
+        anyhow::ensure!(
+            self.max_unhedged_base >= 0.0 && self.max_unhedged_usd >= 0.0,
+            "Max unhedged exposure limits cannot be negative"
+        );
+        anyhow::ensure!(self.max_unhedged_ms > 0, "Max unhedged ms must be positive");
+        anyhow::ensure!(
+            self.max_consecutive_hedge_failures > 0,
+            "Max consecutive hedge failures must be positive"
         );
 
         Ok(())

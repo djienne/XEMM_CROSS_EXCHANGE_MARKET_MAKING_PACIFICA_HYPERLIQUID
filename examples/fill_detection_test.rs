@@ -1,10 +1,10 @@
-use xemm_rust::connector::pacifica::{
-    OrderbookClient, OrderbookConfig, PacificaTrading, PacificaCredentials, OrderSide,
-    FillDetectionClient, FillDetectionConfig, FillEvent,
-};
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::info;
+use xemm_rust::connector::pacifica::{
+    FillDetectionClient, FillDetectionConfig, FillEvent, OrderSide, OrderbookClient,
+    OrderbookConfig, PacificaCredentials, PacificaTrading,
+};
 
 /// Test script for fill detection functionality
 ///
@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     // Load credentials from .env
     dotenv::dotenv().ok();
     let credentials = PacificaCredentials::from_env()?;
-    info!("✓ Loaded credentials for account: {}", credentials.account);
+    info!("OK Loaded credentials for account: {}", credentials.account);
 
     // Shared state for current prices
     let prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
@@ -50,11 +50,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn orderbook client in background
     tokio::spawn(async move {
-        orderbook_client.start(move |bid, ask, _symbol, _timestamp| {
-            let bid_price: f64 = bid.parse().unwrap_or(0.0);
-            let ask_price: f64 = ask.parse().unwrap_or(0.0);
-            *prices_clone.lock().unwrap() = (bid_price, ask_price);
-        }).await.ok();
+        orderbook_client
+            .start(move |bid, ask, _symbol, _timestamp| {
+                let bid_price: f64 = bid.parse().unwrap_or(0.0);
+                let ask_price: f64 = ask.parse().unwrap_or(0.0);
+                *prices_clone.lock().unwrap() = (bid_price, ask_price);
+            })
+            .await
+            .ok();
     });
 
     // Wait for initial price data
@@ -68,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mid = (bid + ask) / 2.0;
-    info!("Current prices - Bid: ${:.2}, Ask: ${:.2}, Mid: ${:.2}", bid, ask, mid);
+    info!(
+        "Current prices - Bid: ${:.2}, Ask: ${:.2}, Mid: ${:.2}",
+        bid, ask, mid
+    );
 
     // Calculate order price (0.05% below mid)
     let offset_percent = 0.05;
@@ -90,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         account: credentials.account.clone(),
         reconnect_attempts: 5,
         ping_interval_secs: 30,
+        enable_position_fill_detection: true,
     };
 
     let mut fill_detection_client = FillDetectionClient::new(fill_detection_config, false)?;
@@ -100,8 +107,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting fill detection monitor...");
     tokio::spawn(async move {
-        fill_detection_client.start(move |fill_event| {
-            match fill_event {
+        fill_detection_client
+            .start(move |fill_event| match fill_event {
                 FillEvent::PartialFill {
                     order_id,
                     client_order_id,
@@ -113,9 +120,9 @@ async fn main() -> anyhow::Result<()> {
                     timestamp,
                 } => {
                     info!("");
-                    info!("🟡 ════════════════════════════════════════════════");
-                    info!("🟡 PARTIAL FILL DETECTED!");
-                    info!("🟡 ════════════════════════════════════════════════");
+                    info!("[PARTIAL] ════════════════════════════════════════════════");
+                    info!("[PARTIAL] PARTIAL FILL DETECTED!");
+                    info!("[PARTIAL] ════════════════════════════════════════════════");
                     info!("Order ID: {}", order_id);
                     if let Some(cloid) = client_order_id {
                         info!("Client Order ID: {}", cloid);
@@ -125,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
                     info!("Filled: {} / {} SOL", filled_amount, original_amount);
                     info!("Average Price: ${}", avg_price);
                     info!("Timestamp: {}", timestamp);
-                    info!("🟡 ════════════════════════════════════════════════");
+                    info!("[PARTIAL] ════════════════════════════════════════════════");
                     info!("");
                     *fill_received_clone.lock().unwrap() = true;
                 }
@@ -139,9 +146,9 @@ async fn main() -> anyhow::Result<()> {
                     timestamp,
                 } => {
                     info!("");
-                    info!("🟢 ════════════════════════════════════════════════");
-                    info!("🟢 FULL FILL DETECTED!");
-                    info!("🟢 ════════════════════════════════════════════════");
+                    info!("[FULL] ════════════════════════════════════════════════");
+                    info!("[FULL] FULL FILL DETECTED!");
+                    info!("[FULL] ════════════════════════════════════════════════");
                     info!("Order ID: {}", order_id);
                     if let Some(cloid) = client_order_id {
                         info!("Client Order ID: {}", cloid);
@@ -151,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
                     info!("Filled: {} SOL", filled_amount);
                     info!("Average Price: ${}", avg_price);
                     info!("Timestamp: {}", timestamp);
-                    info!("🟢 ════════════════════════════════════════════════");
+                    info!("[FULL] ════════════════════════════════════════════════");
                     info!("");
                     *fill_received_clone.lock().unwrap() = true;
                 }
@@ -166,9 +173,9 @@ async fn main() -> anyhow::Result<()> {
                     timestamp,
                 } => {
                     info!("");
-                    info!("🔴 ════════════════════════════════════════════════");
-                    info!("🔴 ORDER CANCELLED!");
-                    info!("🔴 ════════════════════════════════════════════════");
+                    info!("[CANCEL] ════════════════════════════════════════════════");
+                    info!("[CANCEL] ORDER CANCELLED!");
+                    info!("[CANCEL] ════════════════════════════════════════════════");
                     info!("Order ID: {}", order_id);
                     if let Some(cloid) = client_order_id {
                         info!("Client Order ID: {}", cloid);
@@ -178,33 +185,54 @@ async fn main() -> anyhow::Result<()> {
                     info!("Filled: {} / {} SOL", filled_amount, original_amount);
                     info!("Reason: {}", reason);
                     info!("Timestamp: {}", timestamp);
-                    info!("🔴 ════════════════════════════════════════════════");
+                    info!("[CANCEL] ════════════════════════════════════════════════");
                     info!("");
                     *fill_received_clone.lock().unwrap() = true;
                 }
-            }
-        }).await.ok();
+                FillEvent::PositionFill {
+                    symbol,
+                    side,
+                    filled_amount,
+                    avg_price,
+                    timestamp,
+                    ..
+                } => {
+                    info!("");
+                    info!("[POSITION] POSITION FILL DETECTED!");
+                    info!("Symbol: {}", symbol);
+                    info!("Side: {}", side);
+                    info!("Filled: {} SOL", filled_amount);
+                    info!("Average Price: ${}", avg_price);
+                    info!("Timestamp: {}", timestamp);
+                    info!("");
+                    *fill_received_clone.lock().unwrap() = true;
+                }
+            })
+            .await
+            .ok();
     });
 
     // Give fill detection time to connect and subscribe
     sleep(Duration::from_secs(2)).await;
 
     // Place the order
-    let mut trading_client = PacificaTrading::new(credentials);
+    let mut trading_client = PacificaTrading::new(credentials)?;
 
     info!("Placing order...");
-    let order = trading_client.place_limit_order(
-        "SOL",
-        OrderSide::Buy,
-        0.1,  // Small size for testing
-        Some(order_price),  // Exact price
-        0.05,  // Offset (ignored when exact price is provided)
-        Some(bid),
-        Some(ask),
-    ).await?;
+    let order = trading_client
+        .place_limit_order(
+            "SOL",
+            OrderSide::Buy,
+            0.1,               // Small size for testing
+            Some(order_price), // Exact price
+            0.05,              // Offset (ignored when exact price is provided)
+            Some(bid),
+            Some(ask),
+        )
+        .await?;
 
     let client_order_id = order.client_order_id.clone().unwrap();
-    info!("✓ Order placed successfully!");
+    info!("OK Order placed successfully!");
     info!("  Order ID: {}", order.order_id.unwrap());
     info!("  Client Order ID: {}", client_order_id);
     info!("");
@@ -229,20 +257,20 @@ async fn main() -> anyhow::Result<()> {
         // Check for timeout
         if start_time.elapsed() > timeout {
             info!("");
-            info!("⏱️  Timeout reached (60 seconds)");
+            info!("TIME  Timeout reached (60 seconds)");
             info!("No fill detected - order may still be open on the exchange");
             info!("Attempting to cancel order...");
 
             match trading_client.cancel_order("SOL", &client_order_id).await {
                 Ok(_) => {
-                    info!("✓ Order cancelled successfully");
+                    info!("OK Order cancelled successfully");
                     info!("The cancellation should be detected by the fill detection monitor");
 
                     // Wait a bit more to see if we get the cancellation event
                     sleep(Duration::from_secs(5)).await;
                 }
                 Err(e) => {
-                    info!("✗ Failed to cancel order: {}", e);
+                    info!("FAIL Failed to cancel order: {}", e);
                 }
             }
             break;
@@ -250,7 +278,10 @@ async fn main() -> anyhow::Result<()> {
 
         // Show periodic status
         if start_time.elapsed().as_secs() % 10 == 0 {
-            info!("Still monitoring... ({} seconds elapsed)", start_time.elapsed().as_secs());
+            info!(
+                "Still monitoring... ({} seconds elapsed)",
+                start_time.elapsed().as_secs()
+            );
         }
     }
 

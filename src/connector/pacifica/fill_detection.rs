@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::Mutex;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -53,7 +53,11 @@ impl PositionBaselineUpdater {
         let prev_qty = snapshots.get(symbol).map(|s| s.quantity).unwrap_or(0.0);
 
         // Calculate new position based on fill
-        let delta = if side == "buy" { filled_amount } else { -filled_amount };
+        let delta = if side == "buy" {
+            filled_amount
+        } else {
+            -filled_amount
+        };
         let new_qty = prev_qty + delta;
 
         // Update snapshot
@@ -73,8 +77,13 @@ impl PositionBaselineUpdater {
         initialized.insert(symbol.to_string());
 
         debug!(
-            "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({} {:.4} @ ${:.4})",
-            symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
+            "[POSITION SYNC] Updated {} baseline: {:.4} -> {:.4} ({} {:.4} @ ${:.4})",
+            symbol,
+            prev_qty,
+            new_qty,
+            side.to_uppercase(),
+            filled_amount,
+            avg_price
         );
     }
 }
@@ -82,7 +91,7 @@ impl PositionBaselineUpdater {
 /// Position snapshot for tracking changes
 #[derive(Debug, Clone)]
 struct PositionSnapshot {
-    quantity: f64,      // Signed quantity (+ for long, - for short)
+    quantity: f64, // Signed quantity (+ for long, - for short)
     entry_price: f64,
     timestamp: u64,
 }
@@ -192,7 +201,13 @@ impl FillDetectionClient {
     /// * `side` - Fill side ("buy" or "sell")
     /// * `filled_amount` - Amount that was filled
     /// * `avg_price` - Average fill price
-    pub fn update_position_baseline(&self, symbol: &str, side: &str, filled_amount: f64, avg_price: f64) {
+    pub fn update_position_baseline(
+        &self,
+        symbol: &str,
+        side: &str,
+        filled_amount: f64,
+        avg_price: f64,
+    ) {
         // Batch lock acquisition for lower latency
         let mut snapshots = self.position_snapshots.lock();
         let mut initialized = self.position_initialized.lock();
@@ -201,7 +216,11 @@ impl FillDetectionClient {
         let prev_qty = snapshots.get(symbol).map(|s| s.quantity).unwrap_or(0.0);
 
         // Calculate new position based on fill
-        let delta = if side == "buy" { filled_amount } else { -filled_amount };
+        let delta = if side == "buy" {
+            filled_amount
+        } else {
+            -filled_amount
+        };
         let new_qty = prev_qty + delta;
 
         // Update snapshot
@@ -221,8 +240,13 @@ impl FillDetectionClient {
         initialized.insert(symbol.to_string());
 
         debug!(
-            "[POSITION SYNC] Updated {} baseline: {:.4} → {:.4} ({}  {:.4} @ ${:.4})",
-            symbol, prev_qty, new_qty, side.to_uppercase(), filled_amount, avg_price
+            "[POSITION SYNC] Updated {} baseline: {:.4} -> {:.4} ({}  {:.4} @ ${:.4})",
+            symbol,
+            prev_qty,
+            new_qty,
+            side.to_uppercase(),
+            filled_amount,
+            avg_price
         );
     }
 
@@ -373,10 +397,7 @@ impl FillDetectionClient {
                 "account_order_updates" => {
                     // Parse as account order updates response
                     let updates: AccountOrderUpdatesResponse = serde_json::from_str(text)?;
-                    debug!(
-                        "Received {} order update(s)",
-                        updates.data.len()
-                    );
+                    debug!("Received {} order update(s)", updates.data.len());
 
                     // Update last order fill time for cross-validation
                     *self.last_order_fill_time.lock() = Instant::now();
@@ -402,10 +423,7 @@ impl FillDetectionClient {
                     if self.config.enable_position_fill_detection {
                         // Parse as account positions response
                         let positions: AccountPositionsResponse = serde_json::from_str(text)?;
-                        debug!(
-                            "Received {} position update(s)",
-                            positions.data.len()
-                        );
+                        debug!("Received {} position update(s)", positions.data.len());
 
                         // Process each position update
                         for position in positions.data {
@@ -427,7 +445,10 @@ impl FillDetectionClient {
     /// Detect fill from position change (redundancy layer)
     ///
     /// Optimized for low latency with batched lock acquisition.
-    fn detect_fill_from_position(&self, position: &super::types::PositionData) -> Option<FillEvent> {
+    fn detect_fill_from_position(
+        &self,
+        position: &super::types::PositionData,
+    ) -> Option<FillEvent> {
         // Parse position data with validation (no locks needed)
         let amount: f64 = match position.amount.parse::<f64>() {
             Ok(val) if val >= 0.0 && val.is_finite() => val,
@@ -476,9 +497,9 @@ impl FillDetectionClient {
 
         // Convert to signed quantity (+ for long, - for short)
         let quantity = if position.side == "ask" {
-            -amount  // Short position
+            -amount // Short position
         } else {
-            amount   // Long position
+            amount // Long position
         };
 
         debug!(
@@ -502,10 +523,7 @@ impl FillDetectionClient {
         if is_first_update {
             info!(
                 "[POSITION BASELINE] Initializing position snapshot for {}: {:.4} (side: {}, entry: ${:.4})",
-                position.symbol,
-                quantity,
-                position.side,
-                entry_price
+                position.symbol, quantity, position.side, entry_price
             );
 
             // Mark this symbol as initialized and save baseline snapshot
@@ -519,7 +537,7 @@ impl FillDetectionClient {
                 },
             );
 
-            return None;  // Don't trigger fill detection on first update
+            return None; // Don't trigger fill detection on first update
         }
 
         // Validate timestamp - reject stale updates (older than previous snapshot)
@@ -527,11 +545,9 @@ impl FillDetectionClient {
             if position.timestamp <= prev.timestamp {
                 warn!(
                     "[POSITION VALIDATION] Stale position update detected for {} (current: {}, previous: {}). Ignoring.",
-                    position.symbol,
-                    position.timestamp,
-                    prev.timestamp
+                    position.symbol, position.timestamp, prev.timestamp
                 );
-                return None;  // Ignore stale updates
+                return None; // Ignore stale updates
             }
         }
 
@@ -597,7 +613,7 @@ impl FillDetectionClient {
         // Log fill detection with cross-validation status (informational only)
         if cross_validated {
             info!(
-                "[POSITION FILL ✓] {} {:.4} {} @ {:.4} (pos: {:.4} → {:.4}, cross-validated with order updates)",
+                "[POSITION FILL OK] {} {:.4} {} @ {:.4} (pos: {:.4} -> {:.4}, cross-validated with order updates)",
                 side.to_uppercase(),
                 delta.abs(),
                 position.symbol,
@@ -607,7 +623,7 @@ impl FillDetectionClient {
             );
         } else {
             info!(
-                "[POSITION FILL ⚠] {} {:.4} {} @ {:.4} (pos: {:.4} → {:.4}, {} sec since last order activity)",
+                "[POSITION FILL WARN] {} {:.4} {} @ {:.4} (pos: {:.4} -> {:.4}, {} sec since last order activity)",
                 side.to_uppercase(),
                 delta.abs(),
                 position.symbol,

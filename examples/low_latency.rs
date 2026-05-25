@@ -1,8 +1,8 @@
-use xemm_rust::connector::pacifica::{OrderbookClient, OrderbookConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
+use xemm_rust::connector::pacifica::{OrderbookClient, OrderbookConfig};
 
 /// Example demonstrating low-latency mode for maximum speed
 #[tokio::main]
@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -61,20 +61,22 @@ async fn main() -> anyhow::Result<()> {
     info!("");
 
     // Start client with minimal processing callback
-    client.start(move |_best_bid, _best_ask, _symbol, _timestamp| {
-        // Increment counter with atomic operation (lock-free, very fast)
-        update_count.fetch_add(1, Ordering::Relaxed);
+    client
+        .start(move |_best_bid, _best_ask, _symbol, _timestamp| {
+            // Increment counter with atomic operation (lock-free, very fast)
+            update_count.fetch_add(1, Ordering::Relaxed);
 
-        // NO string parsing
-        // NO calculations
-        // NO logging (except in stats task)
-        // Just raw data reception!
+            // NO string parsing
+            // NO calculations
+            // NO logging (except in stats task)
+            // Just raw data reception!
 
-        // In production, you would:
-        // 1. Send to a lock-free queue (crossbeam-channel)
-        // 2. Process in a separate thread/task
-        // 3. Store in shared memory for other processes
-    }).await?;
+            // In production, you would:
+            // 1. Send to a lock-free queue (crossbeam-channel)
+            // 2. Process in a separate thread/task
+            // 3. Store in shared memory for other processes
+        })
+        .await?;
 
     Ok(())
 }

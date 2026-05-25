@@ -4,17 +4,17 @@ use xemm_rust::connector::hyperliquid::types::*;
 fn main() -> anyhow::Result<()> {
     // Create a simple order action
     let order = Order {
-        a: 4,  // Asset ID
-        b: true,  // Is buy
-        p: "1100".to_string(),  // Price
+        a: 4,                  // Asset ID
+        b: true,               // Is buy
+        p: "1100".to_string(), // Price
         s: "0.2".to_string(),  // Size
-        r: false,  // Reduce only
+        r: false,              // Reduce only
         t: OrderType {
             limit: LimitOrderType {
                 tif: TimeInForce::Gtc,
             },
         },
-        c: None,  // No client order ID
+        c: None, // No client order ID
     };
 
     let action = Action {

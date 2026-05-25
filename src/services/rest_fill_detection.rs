@@ -1,24 +1,23 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn, error};
+
 use colored::Colorize;
 use fast_float::parse;
+use parking_lot::RwLock;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
-use crate::bot::BotState;
+use crate::bot::{BotState, BotStatus};
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::HedgeEvent;
+use crate::services::{enqueue_hedge_intent, HedgeEvent};
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
 use crate::util::log::{tag_static, Color};
 use crate::util::rate_limit::is_rate_limit_error;
 
-/// REST API fill detection service (backup/fallback method)
-///
-/// Polls open_orders via REST API every 500ms to detect fills that may have been
-/// missed by WebSocket. This provides redundancy and recovery capabilities.
+/// REST API fill detection service (backup/fallback method).
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_tx: mpsc::Sender<HedgeEvent>,
@@ -37,59 +36,53 @@ impl RestFillDetectionService {
         let mut last_known_filled_amount: f64 = 0.0;
 
         loop {
-            // Adaptive polling: fast when order active, slow when idle
             let has_active_order = {
-                let state = self.bot_state.read().await;
-                state.has_active_order_fast() || matches!(state.status, crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging)
+                let state = self.bot_state.read();
+                state.has_active_order_fast()
+                    || matches!(
+                        state.status,
+                        BotStatus::Filled | BotStatus::Hedging | BotStatus::Reconciling
+                    )
             };
 
-            let poll_ms = if has_active_order { self.poll_interval_ms } else { 1000 };
+            let poll_ms = if has_active_order {
+                self.poll_interval_ms
+            } else {
+                1000
+            };
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
-            // Get active order info, with recovery logic for recent cancellations
+            let is_terminal = {
+                let state = self.bot_state.read();
+                matches!(state.status, BotStatus::Complete | BotStatus::Error(_))
+            };
+            if is_terminal {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
             let active_order_info = {
-                let state = self.bot_state.read().await;
-
-                // Skip only for terminal states
-                if matches!(
-                    state.status,
-                    crate::bot::BotStatus::Complete | crate::bot::BotStatus::Error(_)
-                ) {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-
+                let state = self.bot_state.read();
                 if let Some(ref order) = state.active_order {
                     Some((order.client_order_id.clone(), order.side))
+                } else if matches!(state.status, BotStatus::Filled | BotStatus::Hedging) {
+                    None
                 } else {
-                    // No active order - check if this is a recent cancellation
-                    if matches!(state.status, crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging) {
-                        // Recent fill/hedge - keep polling briefly for catch-up
-                        None // Will query all open orders below
-                    } else {
-                        // Old cancellation, truly idle
-                        last_known_filled_amount = 0.0;
-                        continue;
-                    }
+                    last_known_filled_amount = 0.0;
+                    continue;
                 }
             };
 
             let client_order_id_opt = active_order_info.as_ref().map(|(id, _)| id.clone());
             let order_side_opt = active_order_info.as_ref().map(|(_, side)| *side);
 
-            // Fetch open orders via REST API
-            let open_orders_result = self.pacifica_trading.get_open_orders().await;
-
-            match open_orders_result {
+            match self.pacifica_trading.get_open_orders().await {
                 Ok(orders) => {
-                    consecutive_errors = 0; // Reset error counter on success
+                    consecutive_errors = 0;
 
-                    // Find our order - either by client_order_id or any filled order in recovery mode
                     let our_order = if let Some(ref cloid) = client_order_id_opt {
-                        // Normal mode: Find by client_order_id
                         orders.iter().find(|o| &o.client_order_id == cloid)
                     } else {
-                        // Recovery mode: Find any order with fills for our symbol
                         debug!(
                             "[REST_FILL_DETECTION] Recovery mode: searching {} orders for filled orders",
                             orders.len()
@@ -100,203 +93,169 @@ impl RestFillDetectionService {
                         })
                     };
 
-                    if let Some(order) = our_order {
-                        let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
-                        let initial_amount: f64 = parse(&order.initial_amount).unwrap_or(0.0);
-                        let price: f64 = parse(&order.price).unwrap_or(0.0);
-
-                        // Check if there's a NEW fill (filled_amount increased since last check)
-                        if filled_amount > last_known_filled_amount && filled_amount > 0.0 {
-                            let new_fill_amount = filled_amount - last_known_filled_amount;
-                            let notional_value = new_fill_amount * price;
-
-                            debug!(
-                                "[REST_FILL_DETECTION] Fill detected: {} -> {} (new: {}) | Notional: ${:.2}",
-                                last_known_filled_amount, filled_amount, new_fill_amount, notional_value
-                            );
-
-                            // Update last known amount
-                            last_known_filled_amount = filled_amount;
-
-                            // Check if this is a full fill or significant partial fill
-                            let is_full_fill = (filled_amount - initial_amount).abs() < 0.0001;
-
-                            // Route through the aggregator. Only terminal events (full fill or
-                            // notional-breach partials) will emit a hedge decision.
-                            let order_side_tentative = if let Some(side) = order_side_opt {
-                                side
-                            } else {
-                                match order.side.as_str() {
-                                    "bid" | "buy" => OrderSide::Buy,
-                                    "ask" | "sell" => OrderSide::Sell,
-                                    _ => continue,
-                                }
-                            };
-                            let decision = self.fill_aggregator.on_fill(
-                                order.order_id,
-                                order_side_tentative,
-                                filled_amount,
-                                price,
-                                is_full_fill,
-                            );
-                            let Some(d) = decision else {
-                                debug!(
-                                    "[REST_FILL_DETECTION] Accumulated partial (order_id={}, cumulative ${:.2}), waiting for terminal",
-                                    order.order_id, notional_value
-                                );
-                                continue;
-                            };
-
-                            if is_full_fill || notional_value > self.min_hedge_notional {
-                                // Canonical dedup by Pacifica order_id: shared across WS / REST /
-                                // position-monitor paths. Whichever detector sees the fill first wins.
-                                if !self.processed_fills.insert_if_new(FillKey::OrderId(order.order_id)) {
-                                    debug!(
-                                        "[REST_FILL_DETECTION] Fill already processed (order_id={}), skipping",
-                                        order.order_id
-                                    );
-                                    continue;
-                                }
-                                let _ = d; // decision values used via d below
-
-                                // Determine order side from order data or state
-                                let order_side = if let Some(side) = order_side_opt {
-                                    side
-                                } else {
-                                    // Recovery mode: parse from order.side string
-                                    match order.side.as_str() {
-                                        "bid" | "buy" => OrderSide::Buy,
-                                        "ask" | "sell" => OrderSide::Sell,
-                                        _ => {
-                                            debug!(
-                                                "[REST_FILL_DETECTION] Unknown order side: {}, skipping",
-                                                order.side
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                };
-
-                                info!(
-                                    "{} {} {} FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {} {}",
-                                    tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                    "✓".green().bold(),
-                                    if is_full_fill { "FULL" } else { "PARTIAL" },
-                                    order.side.bright_yellow(),
-                                    filled_amount,
-                                    self.symbol.bright_white().bold(),
-                                    format!("${:.6}", price).cyan(),
-                                    filled_amount,
-                                    initial_amount,
-                                    format!("${:.2}", notional_value).cyan().bold(),
-                                    "(REST API)".bright_black()
-                                );
-
-                                // Trigger hedge (same flow as WebSocket)
-                                let bot_state_clone = self.bot_state.clone();
-                                let hedge_tx_clone = self.hedge_tx.clone();
-                                let pac_trading_clone = self.pacifica_trading.clone();
-                                let pac_ws_trading_clone = self.pacifica_ws_trading.clone();
-                                let symbol_clone = self.symbol.clone();
-
-                                tokio::spawn(async move {
-                                    // Update state
-                                    {
-                                        let mut state = bot_state_clone.write().await;
-                                        state.mark_filled(filled_amount, order_side);
-                                    }
-
-                                    info!(
-                                        "{} {} State updated to Filled (REST)",
-                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                        "✓".green().bold()
-                                    );
-
-                                    // Dual cancellation
-                                    info!(
-                                        "{} {} Dual cancellation (REST + WebSocket)...",
-                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                        "⚡".yellow().bold()
-                                    );
-
-                                    match dual_cancel(&pac_trading_clone, &pac_ws_trading_clone, &symbol_clone).await
-                                    {
-                                        Ok((rest_count, ws_count)) => {
-                                            info!(
-                                                "{} {} Dual cancellation complete (REST: {}, WS: {})",
-                                                tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                                "✓✓".green().bold(),
-                                                rest_count,
-                                                ws_count
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "{} {} Dual cancellation failed: {}",
-                                                tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                                "✗".red().bold(),
-                                                e
-                                            );
-                                        }
-                                    }
-
-                                    info!(
-                                        "{} {}, triggering hedge (REST)",
-                                        format!("[{}]", symbol_clone).bright_white().bold(),
-                                        "Order filled".green().bold()
-                                    );
-
-                                    // Trigger hedge (with current timestamp since REST detection detects fills retroactively)
-                                    if let Err(e) = hedge_tx_clone.try_send((order_side, filled_amount, price, std::time::Instant::now())) {
-                                        error!(
-                                            "{} {} Hedge queue send failed — BACKLOG: {}",
-                                            tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                            "✗".red().bold(),
-                                            e
-                                        );
-                                    }
-                                });
-                            } else {
-                                debug!(
-                                    "[REST_FILL_DETECTION] Fill notional ${:.2} < ${:.2} threshold, skipping",
-                                    notional_value, self.min_hedge_notional
-                                );
-                            }
+                    let Some(order) = our_order else {
+                        if client_order_id_opt.is_some() {
+                            debug!("[REST_FILL_DETECTION] Active order not found in open_orders");
                         }
-                    } else if client_order_id_opt.is_some() {
-                        // Order not found but we expect it - might be filled and removed
-                        debug!("[REST_FILL_DETECTION] Active order not found in open_orders (might be fully filled)");
+                        continue;
+                    };
+
+                    let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
+                    let initial_amount: f64 = parse(&order.initial_amount).unwrap_or(0.0);
+                    let price: f64 = parse(&order.price).unwrap_or(0.0);
+
+                    if filled_amount <= last_known_filled_amount || filled_amount <= 0.0 {
+                        continue;
                     }
+
+                    let new_fill_amount = filled_amount - last_known_filled_amount;
+                    let notional_value = new_fill_amount * price;
+                    last_known_filled_amount = filled_amount;
+
+                    let is_full_fill = (filled_amount - initial_amount).abs() < 0.0001;
+                    let order_side = if let Some(side) = order_side_opt {
+                        side
+                    } else {
+                        match order.side.as_str() {
+                            "bid" | "buy" => OrderSide::Buy,
+                            "ask" | "sell" => OrderSide::Sell,
+                            _ => continue,
+                        }
+                    };
+
+                    let decision = self.fill_aggregator.on_fill(
+                        order.order_id,
+                        order_side,
+                        filled_amount,
+                        price,
+                        is_full_fill,
+                    );
+
+                    let Some(decision) = decision else {
+                        debug!(
+                            "[REST_FILL_DETECTION] Accumulated partial (order_id={}, cumulative ${:.2})",
+                            order.order_id, notional_value
+                        );
+                        continue;
+                    };
+
+                    if !is_full_fill && notional_value <= self.min_hedge_notional {
+                        debug!(
+                            "[REST_FILL_DETECTION] Fill notional ${:.2} < ${:.2} threshold",
+                            notional_value, self.min_hedge_notional
+                        );
+                        continue;
+                    }
+
+                    if !self
+                        .processed_fills
+                        .insert_if_new(FillKey::from_cloid_cumulative(
+                            order.client_order_id.clone(),
+                            filled_amount,
+                        ))
+                    {
+                        debug!(
+                            "[REST_FILL_DETECTION] Fill already processed (order_id={}, cloid={}, cumulative={})",
+                            order.order_id, order.client_order_id, filled_amount
+                        );
+                        continue;
+                    }
+
+                    info!(
+                        "{} {} {} FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {} {}",
+                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
+                        "*".green().bold(),
+                        if is_full_fill { "FULL" } else { "PARTIAL" },
+                        order.side.bright_yellow(),
+                        decision.size,
+                        self.symbol.bright_white().bold(),
+                        format!("${:.6}", price).cyan(),
+                        filled_amount,
+                        initial_amount,
+                        format!("${:.2}", notional_value).cyan().bold(),
+                        "(REST API)".bright_black()
+                    );
+
+                    let bot_state = self.bot_state.clone();
+                    let hedge_tx = self.hedge_tx.clone();
+                    let pac_trading = self.pacifica_trading.clone();
+                    let pac_ws_trading = self.pacifica_ws_trading.clone();
+                    let symbol = self.symbol.clone();
+
+                    tokio::spawn(async move {
+                        {
+                            let mut state = bot_state.write();
+                            state.mark_filled(decision.size, decision.side);
+                        }
+
+                        info!(
+                            "{} {} State updated to Filled (REST)",
+                            tag_static("REST_FILL_DETECTION", Color::BrightCyan),
+                            "*".green().bold()
+                        );
+
+                        let pac_trading_bg = pac_trading.clone();
+                        let pac_ws_trading_bg = pac_ws_trading.clone();
+                        let symbol_bg = symbol.clone();
+                        tokio::spawn(async move {
+                            match dual_cancel(&pac_trading_bg, &pac_ws_trading_bg, &symbol_bg).await
+                            {
+                                Ok((rest_count, ws_count)) => {
+                                    info!(
+                                        "{} Dual cancellation complete (REST: {}, WS: {})",
+                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
+                                        rest_count,
+                                        ws_count
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "{} Dual cancellation failed: {}",
+                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
+                                        e
+                                    );
+                                }
+                            }
+                        });
+
+                        info!(
+                            "{} {}, triggering hedge (REST)",
+                            format!("[{}]", symbol).bright_white().bold(),
+                            "Order filled".green().bold()
+                        );
+
+                        if let Err(e) =
+                            enqueue_hedge_intent(&hedge_tx, &bot_state, decision.into()).await
+                        {
+                            error!(
+                                "{} {} Hedge intent enqueue failed: {}",
+                                tag_static("REST_FILL_DETECTION", Color::BrightCyan),
+                                "x".red().bold(),
+                                e
+                            );
+                        }
+                    });
                 }
                 Err(e) => {
                     consecutive_errors += 1;
 
-                    // Check if it's a rate limit error
-                    let is_rate_limit = is_rate_limit_error(&e);
-
-                    if is_rate_limit {
-                        // Exponential backoff for rate limits: 1s, 2s, 4s, 8s, 16s, 32s (max)
+                    if is_rate_limit_error(&e) {
                         let backoff_secs = std::cmp::min(2u64.pow(consecutive_errors - 1), 32);
                         warn!(
-                            "{} {} Rate limit hit, backing off for {} seconds...",
+                            "{} Rate limit hit, backing off for {} seconds",
                             tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                            "⚠".yellow().bold(),
                             backoff_secs
                         );
                         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     } else {
-                        // Other errors: log and continue with normal polling
                         debug!(
                             "[REST_FILL_DETECTION] Error fetching open orders (attempt {}): {}",
                             consecutive_errors, e
                         );
-
-                        // If too many consecutive errors, log warning
                         if consecutive_errors >= 5 {
                             warn!(
-                                "{} {} {} consecutive errors fetching open orders",
+                                "{} {} consecutive errors fetching open orders",
                                 tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                "⚠".yellow().bold(),
                                 consecutive_errors
                             );
                         }

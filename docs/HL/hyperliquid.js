@@ -1089,7 +1089,7 @@ class HyperliquidConnector extends EventEmitter {
     let midPrice;
     if (options.overrideMidPrice && Number.isFinite(options.overrideMidPrice)) {
       midPrice = options.overrideMidPrice;
-      console.log(`[Hyperliquid] ℹ️ Using provided override mid-price: ${midPrice}`);
+      console.log(`[Hyperliquid] INFO Using provided override mid-price: ${midPrice}`);
     } else {
       // Use cached prices from the REST poller
       let bidAsk = this.getBidAsk(coin);
@@ -1103,7 +1103,7 @@ class HyperliquidConnector extends EventEmitter {
         }
       }
       
-      console.log(`[Hyperliquid] ℹ️ Using cached prices (age: ${Date.now() - bidAsk.timestamp}ms): bid=${bidAsk.bid}, ask=${bidAsk.ask}`);
+      console.log(`[Hyperliquid] INFO Using cached prices (age: ${Date.now() - bidAsk.timestamp}ms): bid=${bidAsk.bid}, ask=${bidAsk.ask}`);
 
       // Calculate mid price
       midPrice = (bidAsk.bid + bidAsk.ask) / 2;

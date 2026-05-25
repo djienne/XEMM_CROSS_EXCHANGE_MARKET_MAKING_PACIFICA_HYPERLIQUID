@@ -3,21 +3,119 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Canonical lock-free run state for hot-path checks.
+///
+/// The `Arc<AtomicU8>` carrying this value is shared by the main loop,
+/// monitors, fill detectors, and hedge executor. `BotStatus` remains the
+/// richer cold-path diagnostic snapshot, but all fast placement/cancel/hedge
+/// decisions read this enum.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    Idle = 0,
+    Placing = 1,
+    OrderPlaced = 2,
+    Cancelling = 3,
+    Filled = 4,
+    Hedging = 5,
+    Reconciling = 6,
+    Complete = 7,
+    Error = 8,
+}
+
+impl RunState {
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Placing,
+            2 => Self::OrderPlaced,
+            3 => Self::Cancelling,
+            4 => Self::Filled,
+            5 => Self::Hedging,
+            6 => Self::Reconciling,
+            7 => Self::Complete,
+            8 => Self::Error,
+            _ => Self::Error,
+        }
+    }
+
+    #[inline]
+    pub fn new_atomic(initial: Self) -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(initial.as_u8()))
+    }
+
+    #[inline]
+    pub fn load(atomic: &AtomicU8) -> Self {
+        Self::from_u8(atomic.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    pub fn store(atomic: &AtomicU8, state: Self) {
+        atomic.store(state.as_u8(), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn try_transition(atomic: &AtomicU8, from: Self, to: Self) -> bool {
+        atomic
+            .compare_exchange(
+                from.as_u8(),
+                to.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Error)
+    }
+}
+
 /// Bot status enumeration
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotStatus {
     /// Bot is idle, waiting for an opportunity
     Idle,
+    /// Main loop has reserved the right to place an order
+    Placing,
     /// Order has been placed on Pacifica
     OrderPlaced,
+    /// Existing maker order is being cancelled
+    Cancelling,
     /// Order has been filled on Pacifica
     Filled,
     /// Hedge is being executed on Hyperliquid
     Hedging,
+    /// Exposure/open-order state is being reconciled
+    Reconciling,
     /// Full cycle complete (order filled + hedged)
     Complete,
     /// Error occurred
     Error(String),
+}
+
+impl BotStatus {
+    #[inline]
+    pub fn run_state(&self) -> RunState {
+        match self {
+            BotStatus::Idle => RunState::Idle,
+            BotStatus::Placing => RunState::Placing,
+            BotStatus::OrderPlaced => RunState::OrderPlaced,
+            BotStatus::Cancelling => RunState::Cancelling,
+            BotStatus::Filled => RunState::Filled,
+            BotStatus::Hedging => RunState::Hedging,
+            BotStatus::Reconciling => RunState::Reconciling,
+            BotStatus::Complete => RunState::Complete,
+            BotStatus::Error(_) => RunState::Error,
+        }
+    }
 }
 
 /// Active order information
@@ -51,8 +149,8 @@ pub struct BotState {
     pub position: f64,
     /// Current bot status
     pub status: BotStatus,
-    /// Atomic status for fast lock-free checks (0=Idle, 1=OrderPlaced, 2=Filled, 3=Hedging, 4=Complete, 5=Error)
-    pub status_atomic: Arc<AtomicU8>,
+    /// Canonical atomic run state for fast lock-free checks.
+    pub run_state: Arc<AtomicU8>,
     /// Last time an order was cancelled (for grace period enforcement)
     pub last_cancellation_time: Option<Instant>,
 }
@@ -60,34 +158,67 @@ pub struct BotState {
 impl BotState {
     /// Create a new bot state in Idle status
     pub fn new() -> Self {
+        Self::with_run_state(RunState::new_atomic(RunState::Idle))
+    }
+
+    /// Create a bot state backed by an externally shared canonical run-state.
+    pub fn with_run_state(run_state: Arc<AtomicU8>) -> Self {
+        RunState::store(&run_state, RunState::Idle);
         Self {
             active_order: None,
             position: 0.0,
             status: BotStatus::Idle,
-            status_atomic: Arc::new(AtomicU8::new(0)), // 0 = Idle
+            run_state,
             last_cancellation_time: None,
         }
+    }
+
+    #[inline]
+    pub fn store_status(&self) {
+        RunState::store(&self.run_state, self.status.run_state());
+    }
+
+    /// Mark the state snapshot as a placement reservation.
+    pub fn mark_placing(&mut self) {
+        self.status = BotStatus::Placing;
+        self.store_status();
+    }
+
+    /// Register an order before the REST placement call returns.
+    ///
+    /// The client order ID is already known at this point, which lets racing
+    /// WebSocket fill events match the order even during the placement window.
+    pub fn set_prospective_order(&mut self, order: ActiveOrder) {
+        self.active_order = Some(order);
+        self.status = BotStatus::Placing;
+        self.store_status();
     }
 
     /// Set active order and update status
     pub fn set_active_order(&mut self, order: ActiveOrder) {
         self.active_order = Some(order);
         self.status = BotStatus::OrderPlaced;
-        self.status_atomic.store(1, Ordering::Release); // 1 = OrderPlaced
+        self.store_status();
     }
 
     /// Clear active order and return to Idle
     pub fn clear_active_order(&mut self) {
         self.active_order = None;
         self.status = BotStatus::Idle;
-        self.status_atomic.store(0, Ordering::Release); // 0 = Idle
+        self.store_status();
         self.last_cancellation_time = Some(Instant::now());
+    }
+
+    /// Mark active order cancellation in progress.
+    pub fn mark_cancelling(&mut self) {
+        self.status = BotStatus::Cancelling;
+        self.store_status();
     }
 
     /// Mark order as filled
     pub fn mark_filled(&mut self, filled_size: f64, side: OrderSide) {
         self.status = BotStatus::Filled;
-        self.status_atomic.store(2, Ordering::Release); // 2 = Filled
+        self.store_status();
 
         // Update position
         match side {
@@ -99,20 +230,26 @@ impl BotState {
     /// Mark as hedging
     pub fn mark_hedging(&mut self) {
         self.status = BotStatus::Hedging;
-        self.status_atomic.store(3, Ordering::Release); // 3 = Hedging
+        self.store_status();
+    }
+
+    /// Mark as reconciling.
+    pub fn mark_reconciling(&mut self) {
+        self.status = BotStatus::Reconciling;
+        self.store_status();
     }
 
     /// Mark as complete
     pub fn mark_complete(&mut self) {
         self.status = BotStatus::Complete;
-        self.status_atomic.store(4, Ordering::Release); // 4 = Complete
+        self.store_status();
         self.active_order = None;
     }
 
     /// Set error status
     pub fn set_error(&mut self, error: String) {
         self.status = BotStatus::Error(error);
-        self.status_atomic.store(5, Ordering::Release); // 5 = Error
+        self.store_status();
     }
 
     /// Check if bot is in a terminal state
@@ -127,17 +264,22 @@ impl BotState {
 
     /// Fast lock-free check if bot is idle (using atomic status)
     pub fn is_idle_fast(&self) -> bool {
-        self.status_atomic.load(Ordering::Acquire) == 0
+        RunState::load(&self.run_state) == RunState::Idle
     }
 
     /// Fast lock-free check if bot has an active order (OrderPlaced status)
     pub fn has_active_order_fast(&self) -> bool {
-        self.status_atomic.load(Ordering::Acquire) == 1
+        RunState::load(&self.run_state) == RunState::OrderPlaced
     }
 
     /// Fast lock-free get current status as u8
     pub fn get_status_atomic(&self) -> u8 {
-        self.status_atomic.load(Ordering::Acquire)
+        self.run_state.load(Ordering::Acquire)
+    }
+
+    /// Fast lock-free get current run state.
+    pub fn get_run_state(&self) -> RunState {
+        RunState::load(&self.run_state)
     }
 
     /// Check if the grace period has passed since last cancellation
@@ -187,11 +329,26 @@ mod tests {
     }
 
     #[test]
+    fn shared_run_state_is_canonical() {
+        let atomic = RunState::new_atomic(RunState::Idle);
+        let mut s = BotState::with_run_state(atomic.clone());
+        assert!(RunState::try_transition(
+            &atomic,
+            RunState::Idle,
+            RunState::Placing
+        ));
+        assert_eq!(RunState::load(&atomic), RunState::Placing);
+        s.mark_placing();
+        assert_eq!(s.status, BotStatus::Placing);
+        assert_eq!(s.get_run_state(), RunState::Placing);
+    }
+
+    #[test]
     fn set_active_order_transitions_to_order_placed() {
         let mut s = BotState::new();
         s.set_active_order(sample_order());
         assert_eq!(s.status, BotStatus::OrderPlaced);
-        assert_eq!(s.get_status_atomic(), 1);
+        assert_eq!(s.get_run_state(), RunState::OrderPlaced);
         assert!(s.has_active_order_fast());
         assert!(!s.is_idle());
         assert!(s.active_order.is_some());
@@ -203,7 +360,7 @@ mod tests {
         s.set_active_order(sample_order());
         s.clear_active_order();
         assert!(s.is_idle());
-        assert_eq!(s.get_status_atomic(), 0);
+        assert_eq!(s.get_run_state(), RunState::Idle);
         assert!(s.active_order.is_none());
         assert!(s.last_cancellation_time.is_some());
     }
@@ -214,7 +371,7 @@ mod tests {
         s.set_active_order(sample_order());
         s.mark_filled(0.3, OrderSide::Buy);
         assert_eq!(s.status, BotStatus::Filled);
-        assert_eq!(s.get_status_atomic(), 2);
+        assert_eq!(s.get_run_state(), RunState::Filled);
         assert!((s.position - 0.3).abs() < 1e-9);
     }
 
@@ -232,9 +389,9 @@ mod tests {
         let mut s = BotState::new();
         s.set_active_order(sample_order());
         s.mark_hedging();
-        assert_eq!(s.get_status_atomic(), 3);
+        assert_eq!(s.get_run_state(), RunState::Hedging);
         s.mark_complete();
-        assert_eq!(s.get_status_atomic(), 4);
+        assert_eq!(s.get_run_state(), RunState::Complete);
         assert!(s.is_terminal());
         assert!(s.active_order.is_none());
     }
@@ -243,7 +400,7 @@ mod tests {
     fn set_error_flips_to_terminal_error() {
         let mut s = BotState::new();
         s.set_error("boom".to_string());
-        assert_eq!(s.get_status_atomic(), 5);
+        assert_eq!(s.get_run_state(), RunState::Error);
         assert!(s.is_terminal());
         match &s.status {
             BotStatus::Error(msg) => assert_eq!(msg, "boom"),
@@ -255,19 +412,19 @@ mod tests {
     fn atomic_status_mirrors_status_field() {
         let mut s = BotState::new();
         let expected = [
-            (BotStatus::OrderPlaced, 1u8),
-            (BotStatus::Filled, 2),
-            (BotStatus::Hedging, 3),
-            (BotStatus::Complete, 4),
+            (BotStatus::OrderPlaced, RunState::OrderPlaced.as_u8()),
+            (BotStatus::Filled, RunState::Filled.as_u8()),
+            (BotStatus::Hedging, RunState::Hedging.as_u8()),
+            (BotStatus::Complete, RunState::Complete.as_u8()),
         ];
         s.set_active_order(sample_order());
-        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[0].1);
+        assert_eq!(s.run_state.load(Ordering::Acquire), expected[0].1);
         s.mark_filled(0.1, OrderSide::Buy);
-        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[1].1);
+        assert_eq!(s.run_state.load(Ordering::Acquire), expected[1].1);
         s.mark_hedging();
-        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[2].1);
+        assert_eq!(s.run_state.load(Ordering::Acquire), expected[2].1);
         s.mark_complete();
-        assert_eq!(s.status_atomic.load(Ordering::Acquire), expected[3].1);
+        assert_eq!(s.run_state.load(Ordering::Acquire), expected[3].1);
     }
 
     #[test]
@@ -284,4 +441,3 @@ mod tests {
         assert!(!s.grace_period_elapsed(60));
     }
 }
-

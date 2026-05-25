@@ -127,9 +127,9 @@ pub struct L2BookSubscriptionResponse {
 /// Book level with price, size, and number of orders
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookLevel {
-    pub px: String,  // Price
-    pub sz: String,  // Size
-    pub n: u32,      // Number of orders
+    pub px: String, // Price
+    pub sz: String, // Size
+    pub n: u32,     // Number of orders
 }
 
 /// Top of book (best bid and ask)
@@ -168,15 +168,13 @@ impl L2BookData {
     }
 }
 
-
-
 /// Time in force for orders
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum TimeInForce {
-    Gtc,  // Good till cancel
-    Ioc,  // Immediate or cancel (for market orders)
-    Alo,  // Add liquidity only (post-only)
+    Gtc, // Good till cancel
+    Ioc, // Immediate or cancel (for market orders)
+    Alo, // Add liquidity only (post-only)
 }
 
 /// Order type configuration
@@ -193,12 +191,12 @@ pub struct LimitOrderType {
 /// Order for placement
 #[derive(Debug, Clone, Serialize)]
 pub struct Order {
-    pub a: u32,           // Asset ID
-    pub b: bool,          // Is buy
-    pub p: String,        // Limit price
-    pub s: String,        // Size
-    pub r: bool,          // Reduce only
-    pub t: OrderType,     // Order type
+    pub a: u32,       // Asset ID
+    pub b: bool,      // Is buy
+    pub p: String,    // Limit price
+    pub s: String,    // Size
+    pub r: bool,      // Reduce only
+    pub t: OrderType, // Order type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub c: Option<String>, // Client order ID
 }
@@ -302,23 +300,23 @@ pub struct FilledOrder {
 /// User fill item from userFills endpoint
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserFill {
-    pub coin: String,             // Symbol (e.g., "AVAX" or "@107" for spot)
-    pub px: String,               // Fill price
-    pub sz: String,               // Fill size
-    pub side: String,             // "B" for buy, "A" for ask/sell
-    pub time: u64,                // Timestamp in milliseconds
-    pub dir: String,              // Direction: "Open Long", "Sell", "Buy", etc.
-    pub fee: String,              // Fee amount
+    pub coin: String, // Symbol (e.g., "AVAX" or "@107" for spot)
+    pub px: String,   // Fill price
+    pub sz: String,   // Fill size
+    pub side: String, // "B" for buy, "A" for ask/sell
+    pub time: u64,    // Timestamp in milliseconds
+    pub dir: String,  // Direction: "Open Long", "Sell", "Buy", etc.
+    pub fee: String,  // Fee amount
     #[serde(rename = "feeToken")]
-    pub fee_token: String,        // Fee token (e.g., "USDC")
-    pub oid: u64,                 // Order ID
-    pub tid: u64,                 // Trade ID
-    pub hash: String,             // Transaction hash
-    pub crossed: bool,            // Whether order crossed the spread
+    pub fee_token: String, // Fee token (e.g., "USDC")
+    pub oid: u64,     // Order ID
+    pub tid: u64,     // Trade ID
+    pub hash: String, // Transaction hash
+    pub crossed: bool, // Whether order crossed the spread
     #[serde(rename = "closedPnl")]
-    pub closed_pnl: String,       // Closed PnL
+    pub closed_pnl: String, // Closed PnL
     #[serde(rename = "startPosition")]
-    pub start_position: String,   // Position size before fill
+    pub start_position: String, // Position size before fill
     #[serde(rename = "builderFee")]
     pub builder_fee: Option<String>, // Optional builder fee
 }
@@ -341,32 +339,32 @@ pub struct UserState {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssetPosition {
     #[serde(rename = "type")]
-    pub type_: String,  // "oneWay" for one-way mode
+    pub type_: String, // "oneWay" for one-way mode
     pub position: Position,
 }
 
 /// Position data for a specific asset
 #[derive(Debug, Clone, Deserialize)]
 pub struct Position {
-    pub coin: String,                 // Symbol (e.g., "SOL", "BTC")
-    pub szi: String,                  // Signed size (positive = long, negative = short)
+    pub coin: String, // Symbol (e.g., "SOL", "BTC")
+    pub szi: String,  // Signed size (positive = long, negative = short)
     #[serde(rename = "entryPx")]
-    pub entry_px: Option<String>,     // Entry price
+    pub entry_px: Option<String>, // Entry price
     #[serde(rename = "positionValue")]
-    pub position_value: String,       // Position value in USD
+    pub position_value: String, // Position value in USD
     #[serde(rename = "unrealizedPnl")]
-    pub unrealized_pnl: String,       // Unrealized PnL
+    pub unrealized_pnl: String, // Unrealized PnL
     #[serde(rename = "returnOnEquity")]
-    pub return_on_equity: String,     // ROE
+    pub return_on_equity: String, // ROE
     #[serde(rename = "liquidationPx")]
     pub liquidation_px: Option<String>, // Liquidation price (if applicable)
-    pub leverage: Leverage,           // Leverage configuration
+    pub leverage: Leverage, // Leverage configuration
     #[serde(rename = "marginUsed")]
-    pub margin_used: String,          // Margin used for this position
+    pub margin_used: String, // Margin used for this position
     #[serde(rename = "maxLeverage")]
-    pub max_leverage: u32,            // Max leverage allowed for this asset
+    pub max_leverage: u32, // Max leverage allowed for this asset
     #[serde(rename = "cumFunding")]
-    pub cum_funding: CumFunding,      // Cumulative funding
+    pub cum_funding: CumFunding, // Cumulative funding
 }
 
 /// Cumulative funding data
@@ -384,34 +382,34 @@ pub struct CumFunding {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Leverage {
     #[serde(rename = "type")]
-    pub type_: String,  // "cross" or "isolated"
-    pub value: u32,     // Leverage value (e.g., 1, 5, 20)
+    pub type_: String, // "cross" or "isolated"
+    pub value: u32, // Leverage value (e.g., 1, 5, 20)
     #[serde(rename = "rawUsd")]
-    pub raw_usd: Option<String>,  // Raw USD value (for isolated positions)
+    pub raw_usd: Option<String>, // Raw USD value (for isolated positions)
 }
 
 /// Margin summary
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarginSummary {
     #[serde(rename = "accountValue")]
-    pub account_value: String,        // Total account value
+    pub account_value: String, // Total account value
     #[serde(rename = "totalNtlPos")]
-    pub total_ntl_pos: String,        // Total notional position
+    pub total_ntl_pos: String, // Total notional position
     #[serde(rename = "totalRawUsd")]
-    pub total_raw_usd: String,        // Total raw USD
+    pub total_raw_usd: String, // Total raw USD
     #[serde(rename = "totalMarginUsed")]
-    pub total_margin_used: String,    // Total margin used
+    pub total_margin_used: String, // Total margin used
 }
 
 /// Cross margin summary
 #[derive(Debug, Clone, Deserialize)]
 pub struct CrossMarginSummary {
     #[serde(rename = "accountValue")]
-    pub account_value: String,        // Account value
+    pub account_value: String, // Account value
     #[serde(rename = "totalNtlPos")]
-    pub total_ntl_pos: String,        // Total notional position
+    pub total_ntl_pos: String, // Total notional position
     #[serde(rename = "totalRawUsd")]
-    pub total_raw_usd: String,        // Total raw USD
+    pub total_raw_usd: String, // Total raw USD
     #[serde(rename = "totalMarginUsed")]
-    pub total_margin_used: String,    // Total margin used
+    pub total_margin_used: String, // Total margin used
 }

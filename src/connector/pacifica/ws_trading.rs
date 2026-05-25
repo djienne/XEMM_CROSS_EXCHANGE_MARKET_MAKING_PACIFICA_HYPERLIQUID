@@ -167,7 +167,10 @@ impl PacificaWsTrading {
             }
             Err(_) => {
                 self.pending.lock().remove(&request_id);
-                anyhow::bail!("Pacifica WS cancel_all timed out after {:?}", REQUEST_TIMEOUT)
+                anyhow::bail!(
+                    "Pacifica WS cancel_all timed out after {:?}",
+                    REQUEST_TIMEOUT
+                )
             }
         }
     }
@@ -191,7 +194,10 @@ impl PacificaWsTrading {
                     s
                 }
                 Err(e) => {
-                    warn!("[PACIFICA_WS] Connect failed: {} — retrying in {:?}", e, backoff);
+                    warn!(
+                        "[PACIFICA_WS] Connect failed: {} - retrying in {:?}",
+                        e, backoff
+                    );
                     Self::fail_all_pending(&pending, "ws connect failed");
                     sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, MAX_RECONNECT_BACKOFF);
@@ -215,7 +221,7 @@ impl PacificaWsTrading {
                                 }
                             }
                             None => {
-                                // Sender dropped — process is shutting down.
+                                // Sender dropped - process is shutting down.
                                 let _ = write.close().await;
                                 connected.store(false, Ordering::Release);
                                 return;
@@ -247,7 +253,10 @@ impl PacificaWsTrading {
             };
 
             connected.store(false, Ordering::Release);
-            warn!("[PACIFICA_WS] Disconnected: {} — reconnecting in {:?}", dc_reason, backoff);
+            warn!(
+                "[PACIFICA_WS] Disconnected: {} - reconnecting in {:?}",
+                dc_reason, backoff
+            );
             Self::fail_all_pending(&pending, &dc_reason);
             sleep(backoff).await;
             backoff = std::cmp::min(backoff * 2, MAX_RECONNECT_BACKOFF);
@@ -267,7 +276,7 @@ impl PacificaWsTrading {
         let id = match value.get("id").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => {
-                // Subscription push (no id) — ignore in the trading client.
+                // Subscription push (no id) - ignore in the trading client.
                 return;
             }
         };
@@ -283,7 +292,11 @@ impl PacificaWsTrading {
     fn fail_all_pending(pending: &PendingMap, reason: &str) {
         let mut g = pending.lock();
         if !g.is_empty() {
-            error!("[PACIFICA_WS] Failing {} pending request(s): {}", g.len(), reason);
+            error!(
+                "[PACIFICA_WS] Failing {} pending request(s): {}",
+                g.len(),
+                reason
+            );
         }
         g.clear();
     }

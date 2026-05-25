@@ -96,7 +96,7 @@ impl OpportunityEvaluator {
 
     /// Evaluate BUY opportunity on Pacifica
     ///
-    /// Strategy: BUY on Pacifica → SELL (taker) on Hyperliquid
+    /// Strategy: BUY on Pacifica -> SELL (taker) on Hyperliquid
     ///
     /// # Arguments
     /// * `hl_bid` - Current Hyperliquid best bid
@@ -114,7 +114,8 @@ impl OpportunityEvaluator {
     ) -> Option<Opportunity> {
         // Calculate ideal limit price using precomputed factors
         // buy_limit_price = (HL_bid * (1 - takerFee)) / (1 + makerFee + profitRate)
-        let buy_limit_price = (hl_bid * self.fee_factors.one_minus_taker) / self.fee_factors.buy_denominator;
+        let buy_limit_price =
+            (hl_bid * self.fee_factors.one_minus_taker) / self.fee_factors.buy_denominator;
 
         // Round DOWN to tick (conservative for buy)
         let buy_limit_rounded = self.round_price_down(buy_limit_price);
@@ -144,7 +145,7 @@ impl OpportunityEvaluator {
 
     /// Evaluate SELL opportunity on Pacifica
     ///
-    /// Strategy: SELL on Pacifica → BUY (taker) on Hyperliquid
+    /// Strategy: SELL on Pacifica -> BUY (taker) on Hyperliquid
     ///
     /// # Arguments
     /// * `hl_ask` - Current Hyperliquid best ask
@@ -162,7 +163,8 @@ impl OpportunityEvaluator {
     ) -> Option<Opportunity> {
         // Calculate ideal limit price using precomputed factors
         // sell_limit_price = (HL_ask * (1 + takerFee)) / (1 - makerFee - profitRate)
-        let sell_limit_price = (hl_ask * self.fee_factors.one_plus_taker) / self.fee_factors.sell_denominator;
+        let sell_limit_price =
+            (hl_ask * self.fee_factors.one_plus_taker) / self.fee_factors.sell_denominator;
 
         // Round UP to tick (conservative for sell)
         let sell_limit_rounded = self.round_price_up(sell_limit_price);
@@ -185,6 +187,50 @@ impl OpportunityEvaluator {
                 initial_profit_bps: sell_profit_bps,
                 timestamp: timestamp_ms,
             })
+        } else {
+            None
+        }
+    }
+
+    /// Evaluate a Pacifica BUY with local-book post-only and distance guards.
+    #[inline]
+    pub fn evaluate_buy_opportunity_local(
+        &self,
+        hl_bid: f64,
+        pac_bid: f64,
+        pac_ask: f64,
+        notional_usd: f64,
+        timestamp_ms: u64,
+        max_quote_distance_bps: f64,
+    ) -> Option<Opportunity> {
+        let opp = self.evaluate_buy_opportunity(hl_bid, notional_usd, timestamp_ms)?;
+        let max_distance = pac_bid * (max_quote_distance_bps / 10_000.0);
+        if opp.pacifica_price <= pac_ask - self.pacifica_tick_size
+            && opp.pacifica_price >= pac_bid - max_distance
+        {
+            Some(opp)
+        } else {
+            None
+        }
+    }
+
+    /// Evaluate a Pacifica SELL with local-book post-only and distance guards.
+    #[inline]
+    pub fn evaluate_sell_opportunity_local(
+        &self,
+        hl_ask: f64,
+        pac_bid: f64,
+        pac_ask: f64,
+        notional_usd: f64,
+        timestamp_ms: u64,
+        max_quote_distance_bps: f64,
+    ) -> Option<Opportunity> {
+        let opp = self.evaluate_sell_opportunity(hl_ask, notional_usd, timestamp_ms)?;
+        let max_distance = pac_ask * (max_quote_distance_bps / 10_000.0);
+        if opp.pacifica_price >= pac_bid + self.pacifica_tick_size
+            && opp.pacifica_price <= pac_ask + max_distance
+        {
+            Some(opp)
         } else {
             None
         }
@@ -238,13 +284,13 @@ impl OpportunityEvaluator {
     ) -> f64 {
         match direction {
             OrderSide::Buy => {
-                // BUY on Pacifica (at pacifica_price) → SELL on Hyperliquid (at current_hl_bid)
+                // BUY on Pacifica (at pacifica_price) -> SELL on Hyperliquid (at current_hl_bid)
                 let buy_cost = pacifica_price * self.fee_factors.one_plus_maker;
                 let buy_revenue = current_hl_bid * self.fee_factors.one_minus_taker;
                 ((buy_revenue - buy_cost) / buy_cost) * 10000.0
             }
             OrderSide::Sell => {
-                // SELL on Pacifica (at pacifica_price) → BUY on Hyperliquid (at current_hl_ask)
+                // SELL on Pacifica (at pacifica_price) -> BUY on Hyperliquid (at current_hl_ask)
                 let sell_revenue = pacifica_price * self.fee_factors.one_minus_maker;
                 let sell_cost = current_hl_ask * self.fee_factors.one_plus_taker;
                 ((sell_revenue - sell_cost) / sell_cost) * 10000.0
@@ -295,6 +341,37 @@ impl OpportunityEvaluator {
         }
     }
 
+    /// Pick between local-book-safe opportunities using expected profit and
+    /// queue distance from the relevant Pacifica touch.
+    #[inline]
+    pub fn pick_best_local_book_opportunity(
+        buy_opp: Option<Opportunity>,
+        sell_opp: Option<Opportunity>,
+        pac_bid: f64,
+        pac_ask: f64,
+    ) -> Option<Opportunity> {
+        fn score(opp: &Opportunity, pac_bid: f64, pac_ask: f64) -> f64 {
+            let touch_distance_bps = match opp.direction {
+                OrderSide::Buy => ((pac_bid - opp.pacifica_price).max(0.0) / pac_bid) * 10_000.0,
+                OrderSide::Sell => ((opp.pacifica_price - pac_ask).max(0.0) / pac_ask) * 10_000.0,
+            };
+            opp.initial_profit_bps - touch_distance_bps
+        }
+
+        match (buy_opp, sell_opp) {
+            (Some(buy), Some(sell)) => {
+                if score(&buy, pac_bid, pac_ask) >= score(&sell, pac_bid, pac_ask) {
+                    Some(buy)
+                } else {
+                    Some(sell)
+                }
+            }
+            (Some(buy), None) => Some(buy),
+            (None, Some(sell)) => Some(sell),
+            (None, None) => None,
+        }
+    }
+
     /// Round price down to nearest tick size (for BUY orders)
     #[inline(always)]
     fn round_price_down(&self, price: f64) -> f64 {
@@ -335,7 +412,7 @@ mod tests {
     #[test]
     fn test_fee_factors_precomputation() {
         let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
-        
+
         // Verify precomputed factors
         assert!((evaluator.fee_factors.one_plus_maker - 1.0001).abs() < 1e-10);
         assert!((evaluator.fee_factors.one_minus_taker - 0.99975).abs() < 1e-10);
@@ -344,7 +421,7 @@ mod tests {
     #[test]
     fn test_recalculate_profit_raw_matches_struct_version() {
         let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
-        
+
         let opp = Opportunity {
             direction: OrderSide::Buy,
             pacifica_price: 100.0,
@@ -353,17 +430,13 @@ mod tests {
             initial_profit_bps: 5.0,
             timestamp: 0,
         };
-        
+
         let hl_bid = 100.3;
         let hl_ask = 100.4;
-        
+
         let profit_struct = evaluator.recalculate_profit(&opp, hl_bid, hl_ask);
-        let profit_raw = evaluator.recalculate_profit_raw(
-            opp.direction,
-            opp.pacifica_price,
-            hl_bid,
-            hl_ask,
-        );
+        let profit_raw =
+            evaluator.recalculate_profit_raw(opp.direction, opp.pacifica_price, hl_bid, hl_ask);
 
         assert!((profit_struct - profit_raw).abs() < 1e-10);
     }
@@ -422,7 +495,7 @@ mod tests {
             initial_profit_bps: 12.0,
             timestamp: 0,
         });
-        // buy distance 0.2, sell distance 0.5 → buy wins despite lower profit
+        // buy distance 0.2, sell distance 0.5 -> buy wins despite lower profit
         let best = OpportunityEvaluator::pick_best_opportunity(buy, sell, 100.0).unwrap();
         assert_eq!(best.direction, OrderSide::Buy);
     }
@@ -430,6 +503,36 @@ mod tests {
     #[test]
     fn pick_best_opportunity_none_both() {
         assert!(OpportunityEvaluator::pick_best_opportunity(None, None, 100.0).is_none());
+    }
+
+    #[test]
+    fn local_book_guard_rejects_crossing_buy_quote() {
+        let evaluator = OpportunityEvaluator::new(1.0, 2.5, 10.0, 0.01);
+        let opp = evaluator.evaluate_buy_opportunity_local(100.0, 99.99, 100.0, 20.0, 0, 1.0);
+        assert!(opp.is_none());
+    }
+
+    #[test]
+    fn local_book_picker_penalizes_queue_distance() {
+        let buy = Some(Opportunity {
+            direction: OrderSide::Buy,
+            pacifica_price: 99.99,
+            hyperliquid_price: 101.0,
+            size: 1.0,
+            initial_profit_bps: 12.0,
+            timestamp: 0,
+        });
+        let sell = Some(Opportunity {
+            direction: OrderSide::Sell,
+            pacifica_price: 100.50,
+            hyperliquid_price: 99.0,
+            size: 1.0,
+            initial_profit_bps: 13.0,
+            timestamp: 0,
+        });
+        let best = OpportunityEvaluator::pick_best_local_book_opportunity(buy, sell, 100.0, 100.01)
+            .unwrap();
+        assert_eq!(best.direction, OrderSide::Buy);
     }
 
     #[test]

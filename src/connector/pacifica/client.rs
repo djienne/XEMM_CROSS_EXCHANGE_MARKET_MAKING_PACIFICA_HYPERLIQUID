@@ -1,7 +1,7 @@
 use crate::connector::pacifica::types::*;
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
-use tokio::time::{sleep, Duration, interval};
+use tokio::time::{interval, sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
@@ -108,15 +108,16 @@ impl OrderbookClient {
         let (mut write, mut read) = ws_stream.split();
 
         // Subscribe to orderbook
-        let subscribe_msg = SubscribeMessage::new(
-            self.config.symbol.clone(),
-            self.config.agg_level,
-        );
+        let subscribe_msg =
+            SubscribeMessage::new(self.config.symbol.clone(), self.config.agg_level);
         let subscribe_json = serde_json::to_string(&subscribe_msg)?;
 
         debug!("[PACIFICA] Sending subscription: {}", subscribe_json);
         write.send(Message::Text(subscribe_json)).await?;
-        info!("[PACIFICA] Subscribed to orderbook for {}", self.config.symbol);
+        info!(
+            "[PACIFICA] Subscribed to orderbook for {}",
+            self.config.symbol
+        );
 
         // Setup ping interval
         let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
@@ -183,8 +184,10 @@ impl OrderbookClient {
         let channel = match response.channel {
             Some(ch) => ch,
             None => {
-                debug!("[PACIFICA] Received message without channel field, ignoring: {}",
-                    if text.len() > 100 { &text[..100] } else { text });
+                debug!(
+                    "[PACIFICA] Received message without channel field, ignoring: {}",
+                    if text.len() > 100 { &text[..100] } else { text }
+                );
                 return Ok(());
             }
         };
@@ -204,12 +207,7 @@ impl OrderbookClient {
 
                 // Call the callback with top of book data
                 if let (Some(bid), Some(ask)) = (tob.best_bid, tob.best_ask) {
-                    callback(
-                        bid.price,
-                        ask.price,
-                        tob.symbol,
-                        tob.timestamp,
-                    );
+                    callback(bid.price, ask.price, tob.symbol, tob.timestamp);
                 } else {
                     warn!("[PACIFICA] Incomplete top of book data received");
                 }
@@ -226,7 +224,10 @@ impl OrderbookClient {
 
 impl Drop for OrderbookClient {
     fn drop(&mut self) {
-        info!("[PACIFICA] OrderbookClient dropped for symbol: {}", self.config.symbol);
+        info!(
+            "[PACIFICA] OrderbookClient dropped for symbol: {}",
+            self.config.symbol
+        );
     }
 }
 
@@ -239,6 +240,7 @@ impl crate::services::price_source::PriceStream for OrderbookClient {
         &mut self,
         mut cb: crate::services::price_source::BookCallback,
     ) -> anyhow::Result<()> {
-        self.start(move |bid, ask, sym, ts| cb(bid, ask, sym, ts)).await
+        self.start(move |bid, ask, sym, ts| cb(bid, ask, sym, ts))
+            .await
     }
 }

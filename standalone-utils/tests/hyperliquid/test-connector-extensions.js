@@ -57,7 +57,7 @@ describe('Hyperliquid Connector Extensions', () => {
 
         console.log(`[Test] Sample order: ${order.side} ${order.size} ${order.coin} @ ${order.limitPrice}`);
       } else {
-        console.log('[Test] ℹ️  No open orders found (this is ok)');
+        console.log('[Test] INFO  No open orders found (this is ok)');
       }
     });
 
@@ -117,7 +117,7 @@ describe('Hyperliquid Connector Extensions', () => {
 
         console.log(`[Test] Sample fill: ${fill.side} ${fill.size} ${fill.coin} @ ${fill.price} (PnL: ${fill.closedPnl})`);
       } else {
-        console.log('[Test] ℹ️  No fills found (this is ok for new accounts)');
+        console.log('[Test] INFO  No fills found (this is ok for new accounts)');
       }
     });
 
@@ -199,7 +199,7 @@ describe('Hyperliquid Connector Extensions', () => {
 
         console.log(`[Test] Sample position: ${pos.side} ${pos.size} ${pos.coin} @ ${pos.entryPrice} (PnL: ${pos.unrealizedPnl})`);
       } else {
-        console.log('[Test] ℹ️  No open positions');
+        console.log('[Test] INFO  No open positions');
       }
 
       // Validate cross margin structure
@@ -252,7 +252,7 @@ describe('Hyperliquid Connector Extensions', () => {
         assert.ok(Array.isArray(result), 'Each result should be an array');
       });
 
-      console.log('[Test] ✓ Rate limiting handled 5 rapid requests');
+      console.log('[Test] OK Rate limiting handled 5 rapid requests');
     });
   });
 

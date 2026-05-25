@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 /// API endpoint group for per-endpoint rate-limit tracking.
 ///
-/// One 429 on `Info` must not back off `PlaceOrder` — each exchange endpoint
+/// One 429 on `Info` must not back off `PlaceOrder` - each exchange endpoint
 /// has its own bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EndpointGroup {
@@ -30,20 +30,12 @@ impl RateLimitBook {
 
     /// Record a rate-limit error for a specific endpoint group.
     pub fn record_error(&self, group: EndpointGroup) {
-        self.inner
-            .lock()
-            .entry(group)
-            .or_default()
-            .record_error();
+        self.inner.lock().entry(group).or_default().record_error();
     }
 
-    /// Record a successful call — resets the per-group backoff.
+    /// Record a successful call - resets the per-group backoff.
     pub fn record_success(&self, group: EndpointGroup) {
-        self.inner
-            .lock()
-            .entry(group)
-            .or_default()
-            .record_success();
+        self.inner.lock().entry(group).or_default().record_success();
     }
 
     /// Should this endpoint skip work because of an active backoff?

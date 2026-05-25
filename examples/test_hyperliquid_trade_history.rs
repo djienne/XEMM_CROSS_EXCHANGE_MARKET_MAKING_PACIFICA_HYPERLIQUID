@@ -47,13 +47,27 @@ async fn main() -> Result<()> {
 
         // Display fee with percentage
         let fee: f64 = fill.fee.parse().unwrap_or(0.0);
-        let fee_bps = if notional > 0.0 { (fee / notional) * 10000.0 } else { 0.0 };
-        println!("  Fee: {} {} ({:.2} bps)", fill.fee, fill.fee_token, fee_bps);
+        let fee_bps = if notional > 0.0 {
+            (fee / notional) * 10000.0
+        } else {
+            0.0
+        };
+        println!(
+            "  Fee: {} {} ({:.2} bps)",
+            fill.fee, fill.fee_token, fee_bps
+        );
 
         if let Some(builder_fee) = &fill.builder_fee {
             let builder_fee_val: f64 = builder_fee.parse().unwrap_or(0.0);
-            let builder_fee_bps = if notional > 0.0 { (builder_fee_val / notional) * 10000.0 } else { 0.0 };
-            println!("  Builder Fee: {} {} ({:.2} bps)", builder_fee, fill.fee_token, builder_fee_bps);
+            let builder_fee_bps = if notional > 0.0 {
+                (builder_fee_val / notional) * 10000.0
+            } else {
+                0.0
+            };
+            println!(
+                "  Builder Fee: {} {} ({:.2} bps)",
+                builder_fee, fill.fee_token, builder_fee_bps
+            );
         }
 
         // Convert timestamp to readable format
@@ -73,9 +87,7 @@ async fn main() -> Result<()> {
     }
 
     // Filter for ENA fills
-    let ena_fills: Vec<_> = fills.iter()
-        .filter(|f| f.coin == "ENA")
-        .collect();
+    let ena_fills: Vec<_> = fills.iter().filter(|f| f.coin == "ENA").collect();
 
     if !ena_fills.is_empty() {
         println!("\n=== ENA Fills ({}) ===\n", ena_fills.len());
@@ -89,16 +101,15 @@ async fn main() -> Result<()> {
             let price: f64 = fill.px.parse().unwrap_or(0.0);
             let notional = size * price;
             let fee: f64 = fill.fee.parse().unwrap_or(0.0);
-            let fee_bps = if notional > 0.0 { (fee / notional) * 10000.0 } else { 0.0 };
+            let fee_bps = if notional > 0.0 {
+                (fee / notional) * 10000.0
+            } else {
+                0.0
+            };
 
-            println!("  {} - {} {} ENA @ ${} | Fee: {} {} ({:.2} bps)",
-                datetime,
-                fill.dir,
-                fill.sz,
-                fill.px,
-                fill.fee,
-                fill.fee_token,
-                fee_bps
+            println!(
+                "  {} - {} {} ENA @ ${} | Fee: {} {} ({:.2} bps)",
+                datetime, fill.dir, fill.sz, fill.px, fill.fee, fill.fee_token, fee_bps
             );
         }
     }

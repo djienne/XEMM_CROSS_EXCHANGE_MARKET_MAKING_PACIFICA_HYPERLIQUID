@@ -12,9 +12,9 @@ const MAINNET_REST_URL: &str = "https://api.pacifica.fi";
 /// Credentials for Pacifica trading
 #[derive(Debug, Clone)]
 pub struct PacificaCredentials {
-    pub account: String,           // Main wallet address (SOL_WALLET)
-    pub agent_wallet: String,      // Agent wallet public key (API_PUBLIC)
-    pub private_key: String,       // Agent wallet private key (API_PRIVATE)
+    pub account: String,      // Main wallet address (SOL_WALLET)
+    pub agent_wallet: String, // Agent wallet public key (API_PUBLIC)
+    pub private_key: String,  // Agent wallet private key (API_PRIVATE)
 }
 
 impl PacificaCredentials {
@@ -22,12 +22,11 @@ impl PacificaCredentials {
     pub fn from_env() -> Result<Self> {
         dotenv::dotenv().ok(); // Load .env file
 
-        let account = std::env::var("SOL_WALLET")
-            .context("SOL_WALLET not found in environment")?;
-        let agent_wallet = std::env::var("API_PUBLIC")
-            .context("API_PUBLIC not found in environment")?;
-        let private_key = std::env::var("API_PRIVATE")
-            .context("API_PRIVATE not found in environment")?;
+        let account = std::env::var("SOL_WALLET").context("SOL_WALLET not found in environment")?;
+        let agent_wallet =
+            std::env::var("API_PUBLIC").context("API_PUBLIC not found in environment")?;
+        let private_key =
+            std::env::var("API_PRIVATE").context("API_PRIVATE not found in environment")?;
 
         Ok(Self {
             account,
@@ -41,8 +40,8 @@ impl PacificaCredentials {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketInfo {
     pub symbol: String,
-    pub tick_size: String,  // Minimum price increment (e.g., "0.1")
-    pub lot_size: String,   // Minimum size increment (e.g., "0.001")
+    pub tick_size: String, // Minimum price increment (e.g., "0.1")
+    pub lot_size: String,  // Minimum size increment (e.g., "0.001")
 }
 
 /// Order side
@@ -72,11 +71,17 @@ pub struct OrderResponse {
 pub struct OrderData {
     pub order_id: Option<u64>,
     #[serde(rename = "i")]
-    pub i: Option<u64>,  // Alternative field name
+    pub i: Option<u64>, // Alternative field name
     #[serde(rename = "I")]
     pub client_order_id: Option<String>,
     #[serde(rename = "s")]
     pub symbol: Option<String>,
+    #[serde(default)]
+    pub requested_size: Option<f64>,
+    #[serde(default)]
+    pub submitted_size: Option<f64>,
+    #[serde(default)]
+    pub submitted_price: Option<f64>,
 }
 
 /// Orderbook level from REST API
@@ -125,19 +130,19 @@ pub struct OrderbookSnapshot {
 pub struct TradeHistoryItem {
     pub history_id: u64,
     pub order_id: u64,
-    pub client_order_id: Option<String>,  // Can be null for some orders (e.g., liquidations)
+    pub client_order_id: Option<String>, // Can be null for some orders (e.g., liquidations)
     pub symbol: String,
-    pub amount: String,           // Size of trade in token denomination
-    pub price: String,            // Current market price
-    pub entry_price: String,      // Actual fill price
-    pub fee: String,              // Fee paid
-    pub pnl: String,              // PnL from this trade
-    pub event_type: String,       // "fulfill_maker" or "fulfill_taker"
-    pub side: String,             // "open_long", "open_short", "close_long", "close_short"
-    pub created_at: u64,          // Timestamp in milliseconds
-    pub cause: String,            // "normal", "market_liquidation", etc.
+    pub amount: String,      // Size of trade in token denomination
+    pub price: String,       // Current market price
+    pub entry_price: String, // Actual fill price
+    pub fee: String,         // Fee paid
+    pub pnl: String,         // PnL from this trade
+    pub event_type: String,  // "fulfill_maker" or "fulfill_taker"
+    pub side: String,        // "open_long", "open_short", "close_long", "close_short"
+    pub created_at: u64,     // Timestamp in milliseconds
+    pub cause: String,       // "normal", "market_liquidation", etc.
     #[serde(default)]
-    pub value: Option<String>,    // Actual USD notional value of the trade (if provided by API)
+    pub value: Option<String>, // Actual USD notional value of the trade (if provided by API)
 }
 
 /// Trade history response from API
@@ -146,9 +151,9 @@ pub struct TradeHistoryResponse {
     pub success: bool,
     pub data: Option<Vec<TradeHistoryItem>>,
     #[serde(default)]
-    pub next_cursor: Option<String>,  // Pagination cursor for next page
+    pub next_cursor: Option<String>, // Pagination cursor for next page
     #[serde(default)]
-    pub has_more: Option<bool>,       // Whether more results exist
+    pub has_more: Option<bool>, // Whether more results exist
     pub error: Option<String>,
     pub code: Option<String>,
 }
@@ -159,14 +164,14 @@ pub struct OpenOrderItem {
     pub order_id: u64,
     pub client_order_id: String,
     pub symbol: String,
-    pub side: String,              // "bid" or "ask"
+    pub side: String, // "bid" or "ask"
     pub price: String,
     pub initial_amount: String,
     pub filled_amount: String,
     pub cancelled_amount: String,
     #[serde(default)]
     pub stop_price: Option<String>,
-    pub order_type: String,        // "limit" or "market"
+    pub order_type: String, // "limit" or "market"
     #[serde(default)]
     pub stop_parent_order_id: Option<String>,
     pub reduce_only: bool,
@@ -187,15 +192,15 @@ pub struct OpenOrdersResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PositionItem {
     pub symbol: String,
-    pub side: String,              // "bid" (long) or "ask" (short)
-    pub amount: String,            // Position size (always positive)
-    pub entry_price: String,       // Average entry price
+    pub side: String,        // "bid" (long) or "ask" (short)
+    pub amount: String,      // Position size (always positive)
+    pub entry_price: String, // Average entry price
     #[serde(default)]
-    pub margin: Option<String>,    // Margin for isolated positions
-    pub funding: String,           // Funding paid since position opened
-    pub isolated: bool,            // Whether position is in isolated margin mode
-    pub created_at: u64,           // Timestamp in milliseconds
-    pub updated_at: u64,           // Timestamp in milliseconds
+    pub margin: Option<String>, // Margin for isolated positions
+    pub funding: String,     // Funding paid since position opened
+    pub isolated: bool,      // Whether position is in isolated margin mode
+    pub created_at: u64,     // Timestamp in milliseconds
+    pub updated_at: u64,     // Timestamp in milliseconds
 }
 
 /// Position API response
@@ -219,7 +224,7 @@ impl PacificaTrading {
     /// Create a new trading client (mainnet only)
     pub fn new(credentials: PacificaCredentials) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))        // Max 10s per request
+            .timeout(std::time::Duration::from_secs(10)) // Max 10s per request
             .connect_timeout(std::time::Duration::from_secs(5)) // Max 5s to connect
             .build()
             .context("Failed to build HTTP client")?;
@@ -263,7 +268,10 @@ impl PacificaTrading {
             new_cache.insert(info.symbol.clone(), info);
         }
 
-        info!("[PACIFICA] Cached market info for {} symbols", new_cache.len());
+        info!(
+            "[PACIFICA] Cached market info for {} symbols",
+            new_cache.len()
+        );
 
         // Update cache
         {
@@ -313,7 +321,9 @@ impl PacificaTrading {
             .context("No orderbook data in response")?;
 
         // Convert from RestBookLevel to OrderbookLevel
-        let bids: Vec<OrderbookLevel> = book_data.levels.0
+        let bids: Vec<OrderbookLevel> = book_data
+            .levels
+            .0
             .into_iter()
             .map(|level| OrderbookLevel {
                 price: level.price,
@@ -321,7 +331,9 @@ impl PacificaTrading {
             })
             .collect();
 
-        let asks: Vec<OrderbookLevel> = book_data.levels.1
+        let asks: Vec<OrderbookLevel> = book_data
+            .levels
+            .1
             .into_iter()
             .map(|level| OrderbookLevel {
                 price: level.price,
@@ -388,7 +400,7 @@ impl PacificaTrading {
     /// Round size to lot size
     fn round_to_lot_size(&self, size: f64, lot_size: String) -> Result<f64> {
         let lot: f64 = lot_size.parse()?;
-        let rounded = (size / lot).round() * lot;
+        let rounded = (size / lot).floor() * lot;
 
         let decimal_places = if lot_size.contains('.') {
             lot_size.split('.').nth(1).unwrap().len()
@@ -401,7 +413,11 @@ impl PacificaTrading {
     }
 
     /// Sign a message using Ed25519
-    fn sign_message(&self, header: serde_json::Value, payload: serde_json::Value) -> Result<String> {
+    fn sign_message(
+        &self,
+        header: serde_json::Value,
+        payload: serde_json::Value,
+    ) -> Result<String> {
         // Construct message: {... header, data: payload}
         let mut message = serde_json::json!({});
         if let serde_json::Value::Object(ref mut map) = message {
@@ -464,6 +480,35 @@ impl PacificaTrading {
         current_bid: Option<f64>,
         current_ask: Option<f64>,
     ) -> Result<OrderData> {
+        self.place_limit_order_with_client_order_id(
+            symbol,
+            side,
+            size,
+            price,
+            mid_price_offset_pct,
+            current_bid,
+            current_ask,
+            None,
+        )
+        .await
+    }
+
+    /// Place a limit order using a caller-provided client order ID.
+    ///
+    /// Pre-generating the client order ID lets the bot register a prospective
+    /// active order before Pacifica REST returns, so a racing WebSocket fill can
+    /// still be matched and hedged.
+    pub async fn place_limit_order_with_client_order_id(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        size: f64,
+        price: Option<f64>,
+        mid_price_offset_pct: f64,
+        current_bid: Option<f64>,
+        current_ask: Option<f64>,
+        client_order_id: Option<String>,
+    ) -> Result<OrderData> {
         // Get market info and clone the strings we need
         let market_info = self.get_market_info().await?;
         let symbol_info = market_info
@@ -494,7 +539,10 @@ impl PacificaTrading {
 
         info!(
             "[PACIFICA] Placing {} order: {} {} @ ${} (tick: {}, lot: {})",
-            match side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" },
+            match side {
+                OrderSide::Buy => "BUY",
+                OrderSide::Sell => "SELL",
+            },
             rounded_size,
             symbol,
             rounded_price,
@@ -502,8 +550,7 @@ impl PacificaTrading {
             lot_size
         );
 
-        // Generate client order ID
-        let client_order_id = Uuid::new_v4().to_string();
+        let client_order_id = client_order_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         // Build signature
         let timestamp = chrono::Utc::now().timestamp_millis();
@@ -543,15 +590,14 @@ impl PacificaTrading {
             "agent_wallet": self.credentials.agent_wallet
         });
 
-        debug!("[PACIFICA] Order request: {}", serde_json::to_string_pretty(&request_body)?);
+        debug!(
+            "[PACIFICA] Order request: {}",
+            serde_json::to_string_pretty(&request_body)?
+        );
 
         // Send request
         let url = format!("{}/api/v1/orders/create", self.rest_url);
-        let response = self.client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request_body).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
@@ -560,17 +606,16 @@ impl PacificaTrading {
 
         let order_response: OrderResponse = response.json().await?;
 
-        let order_data = order_response.data
-            .context("No order data in response")?;
+        let order_data = order_response.data.context("No order data in response")?;
 
-        let order_id = order_data.order_id
+        let order_id = order_data
+            .order_id
             .or(order_data.i)
             .context("No order ID in response")?;
 
         info!(
             "[PACIFICA] Order placed successfully: ID={}, ClientID={}",
-            order_id,
-            client_order_id
+            order_id, client_order_id
         );
 
         Ok(OrderData {
@@ -578,6 +623,9 @@ impl PacificaTrading {
             i: Some(order_id),
             client_order_id: Some(client_order_id),
             symbol: Some(symbol.to_string()),
+            requested_size: Some(size),
+            submitted_size: Some(rounded_size),
+            submitted_price: Some(rounded_price),
         })
     }
 
@@ -601,7 +649,10 @@ impl PacificaTrading {
 
         info!(
             "[PACIFICA] Placing MARKET {} order: {} {} (lot: {}, slippage: {}%, reduce_only: {})",
-            match side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" },
+            match side {
+                OrderSide::Buy => "BUY",
+                OrderSide::Sell => "SELL",
+            },
             rounded_size,
             symbol,
             lot_size,
@@ -644,14 +695,13 @@ impl PacificaTrading {
             "agent_wallet": self.credentials.agent_wallet
         });
 
-        debug!("[PACIFICA] Market Order request: {}", serde_json::to_string_pretty(&request_body)?);
+        debug!(
+            "[PACIFICA] Market Order request: {}",
+            serde_json::to_string_pretty(&request_body)?
+        );
 
         let url = format!("{}/api/v1/orders/create_market", self.rest_url);
-        let response = self.client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request_body).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
@@ -659,9 +709,12 @@ impl PacificaTrading {
         }
 
         let order_response: OrderResponse = response.json().await?;
-        
+
         let order_data = order_response.data.context("No order data in response")?;
-        let order_id = order_data.order_id.or(order_data.i).context("No order ID in response")?;
+        let order_id = order_data
+            .order_id
+            .or(order_data.i)
+            .context("No order ID in response")?;
 
         info!("[PACIFICA] Market Order placed: ID={}", order_id);
 
@@ -670,16 +723,18 @@ impl PacificaTrading {
             i: Some(order_id),
             client_order_id: Some(client_order_id),
             symbol: Some(symbol.to_string()),
+            requested_size: Some(size),
+            submitted_size: Some(rounded_size),
+            submitted_price: None,
         })
     }
 
     /// Cancel an order by client order ID
-    pub async fn cancel_order(
-        &self,
-        symbol: &str,
-        client_order_id: &str,
-    ) -> Result<()> {
-        info!("[PACIFICA] Cancelling order: {} (ClientID: {})", symbol, client_order_id);
+    pub async fn cancel_order(&self, symbol: &str, client_order_id: &str) -> Result<()> {
+        info!(
+            "[PACIFICA] Cancelling order: {} (ClientID: {})",
+            symbol, client_order_id
+        );
 
         // Build signature
         let timestamp = chrono::Utc::now().timestamp_millis();
@@ -711,18 +766,17 @@ impl PacificaTrading {
 
         // Send request
         let url = format!("{}/api/v1/orders/cancel", self.rest_url);
-        let response = self.client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request_body).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
             anyhow::bail!("Order cancellation failed: {}", error_text);
         }
 
-        info!("[PACIFICA] Order cancelled successfully: {}", client_order_id);
+        info!(
+            "[PACIFICA] Order cancelled successfully: {}",
+            client_order_id
+        );
 
         Ok(())
     }
@@ -745,9 +799,7 @@ impl PacificaTrading {
 
         info!(
             "[PACIFICA] Cancelling all orders (all_symbols: {}, symbol: {:?}, exclude_reduce_only: {})",
-            all_symbols,
-            symbol,
-            exclude_reduce_only
+            all_symbols, symbol, exclude_reduce_only
         );
 
         // Build signature
@@ -790,11 +842,7 @@ impl PacificaTrading {
 
         // Send request
         let url = format!("{}/api/v1/orders/cancel_all", self.rest_url);
-        let response = self.client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request_body).send().await?;
 
         // Get response text for debugging
         let response_text = response.text().await?;
@@ -817,7 +865,9 @@ impl PacificaTrading {
             .with_context(|| format!("Failed to parse response: {}", response_text))?;
 
         if !cancel_response.success {
-            let error_msg = cancel_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = cancel_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("Cancel all orders failed: {}", error_msg);
         }
 
@@ -851,9 +901,9 @@ impl PacificaTrading {
         start_time: Option<u64>,
         end_time: Option<u64>,
     ) -> Result<Vec<TradeHistoryItem>> {
-        let mut url = format!("{}/api/v1/positions/history?account={}",
-            self.rest_url,
-            self.credentials.account
+        let mut url = format!(
+            "{}/api/v1/positions/history?account={}",
+            self.rest_url, self.credentials.account
         );
 
         if let Some(sym) = symbol {
@@ -874,7 +924,8 @@ impl PacificaTrading {
 
         info!("[PACIFICA] Fetching trade history from {}", url);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -886,16 +937,23 @@ impl PacificaTrading {
         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if let Some(data) = json_value.get("data").and_then(|d| d.as_array()) {
                 if !data.is_empty() {
-                    info!("[PACIFICA] Sample trade history item (raw JSON): {}", serde_json::to_string_pretty(&data[0]).unwrap_or_default());
+                    info!(
+                        "[PACIFICA] Sample trade history item (raw JSON): {}",
+                        serde_json::to_string_pretty(&data[0]).unwrap_or_default()
+                    );
                 }
             }
         }
 
         let history_response: TradeHistoryResponse = serde_json::from_str(&response_text)
-            .with_context(|| format!("Failed to parse trade history response: {}", response_text))?;
+            .with_context(|| {
+                format!("Failed to parse trade history response: {}", response_text)
+            })?;
 
         if !history_response.success {
-            let error_msg = history_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = history_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             anyhow::bail!("Get trade history failed: {}", error_msg);
         }
 
@@ -907,14 +965,15 @@ impl PacificaTrading {
     /// # Returns
     /// Vector of open orders
     pub async fn get_open_orders(&self) -> Result<Vec<OpenOrderItem>> {
-        let url = format!("{}/api/v1/orders?account={}",
-            self.rest_url,
-            self.credentials.account
+        let url = format!(
+            "{}/api/v1/orders?account={}",
+            self.rest_url, self.credentials.account
         );
 
         debug!("[PACIFICA] Fetching open orders from {}", url);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -932,10 +991,14 @@ impl PacificaTrading {
             .with_context(|| format!("Failed to parse open orders response: {}", response_text))?;
 
         if !orders_response.success {
-            let error_msg = orders_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = orders_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
 
             // Check for rate limit error messages
-            if error_msg.to_lowercase().contains("rate limit") || error_msg.to_lowercase().contains("too many requests") {
+            if error_msg.to_lowercase().contains("rate limit")
+                || error_msg.to_lowercase().contains("too many requests")
+            {
                 anyhow::bail!("Rate limit exceeded: {}", error_msg);
             }
 
@@ -950,14 +1013,15 @@ impl PacificaTrading {
     /// # Returns
     /// Vector of position items
     pub async fn get_positions(&self) -> Result<Vec<PositionItem>> {
-        let url = format!("{}/api/v1/positions?account={}",
-            self.rest_url,
-            self.credentials.account
+        let url = format!(
+            "{}/api/v1/positions?account={}",
+            self.rest_url, self.credentials.account
         );
 
         debug!("[PACIFICA] Fetching positions from {}", url);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header("Accept", "*/*")
             .send()
@@ -981,10 +1045,14 @@ impl PacificaTrading {
             .with_context(|| format!("Failed to parse positions response: {}", response_text))?;
 
         if !position_response.success {
-            let error_msg = position_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = position_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
 
             // Check for rate limit error messages
-            if error_msg.to_lowercase().contains("rate limit") || error_msg.to_lowercase().contains("too many requests") {
+            if error_msg.to_lowercase().contains("rate limit")
+                || error_msg.to_lowercase().contains("too many requests")
+            {
                 anyhow::bail!("Rate limit exceeded: {}", error_msg);
             }
 

@@ -77,13 +77,9 @@ pub struct TopOfBook {
 impl OrderbookData {
     /// Extract the top of book (best bid and ask)
     pub fn get_top_of_book(&self) -> TopOfBook {
-        let best_bid = self.levels.get(0)
-            .and_then(|bids| bids.first())
-            .cloned();
+        let best_bid = self.levels.get(0).and_then(|bids| bids.first()).cloned();
 
-        let best_ask = self.levels.get(1)
-            .and_then(|asks| asks.first())
-            .cloned();
+        let best_ask = self.levels.get(1).and_then(|asks| asks.first()).cloned();
 
         TopOfBook {
             symbol: self.symbol.clone(),
@@ -271,14 +267,14 @@ pub enum FillEvent {
     /// Fill detected from position change (redundancy layer)
     PositionFill {
         symbol: String,
-        side: String,              // "buy" or "sell" (derived from position delta)
-        filled_amount: String,     // Absolute value of position delta
-        avg_price: String,         // Entry price from position
+        side: String,          // "buy" or "sell" (derived from position delta)
+        filled_amount: String, // Absolute value of position delta
+        avg_price: String,     // Entry price from position
         timestamp: u64,
-        position_delta: String,    // Signed position change for diagnostics
-        prev_position: String,     // Previous position size
-        new_position: String,      // New position size
-        cross_validated: bool,     // Whether fill was also detected by order updates
+        position_delta: String, // Signed position change for diagnostics
+        prev_position: String,  // Previous position size
+        new_position: String,   // New position size
+        cross_validated: bool,  // Whether fill was also detected by order updates
     },
 }
 
@@ -324,23 +320,23 @@ impl OrderUpdate {
                     reason: reason.to_string(),
                     timestamp: self.updated_at,
                 })
-            },
+            }
             _ => None,
         }
     }
 }
 
-// ═══════════════════════════════════════════════════
+// ===================================================
 // WebSocket Trading Operations
-// ═══════════════════════════════════════════════════
+// ===================================================
 
 // NOTE: the old strongly-typed WS trading request/response structs were
 // removed when `ws_trading.rs` was refactored to build payloads inline
 // against a persistent connection.
 
-// ═══════════════════════════════════════════════════
+// ===================================================
 // Account Positions WebSocket
-// ═══════════════════════════════════════════════════
+// ===================================================
 
 /// Account positions subscription parameters
 #[derive(Debug, Serialize)]
@@ -374,19 +370,19 @@ pub struct PositionData {
     #[serde(rename = "s")]
     pub symbol: String,
     #[serde(rename = "a")]
-    pub amount: String,         // Position size (always positive)
+    pub amount: String, // Position size (always positive)
     #[serde(rename = "p")]
-    pub entry_price: String,    // Average entry price
+    pub entry_price: String, // Average entry price
     #[serde(rename = "t")]
-    pub timestamp: u64,         // Timestamp in milliseconds
+    pub timestamp: u64, // Timestamp in milliseconds
     #[serde(rename = "d")]
-    pub side: String,           // "bid" (long) or "ask" (short)
+    pub side: String, // "bid" (long) or "ask" (short)
     #[serde(rename = "m")]
-    pub margin: String,         // Position margin
+    pub margin: String, // Position margin
     #[serde(rename = "f")]
-    pub funding: String,        // Funding fee
+    pub funding: String, // Funding fee
     #[serde(rename = "i")]
-    pub isolated: bool,         // Is isolated position
+    pub isolated: bool, // Is isolated position
 }
 
 /// Account positions response

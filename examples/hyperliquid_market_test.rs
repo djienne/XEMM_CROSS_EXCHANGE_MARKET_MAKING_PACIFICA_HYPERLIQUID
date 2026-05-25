@@ -1,9 +1,9 @@
-use xemm_rust::connector::hyperliquid::{
-    OrderbookClient, OrderbookConfig, HyperliquidTrading, HyperliquidCredentials,
-};
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::info;
+use xemm_rust::connector::hyperliquid::{
+    HyperliquidCredentials, HyperliquidTrading, OrderbookClient, OrderbookConfig,
+};
 
 /// Test script for Hyperliquid market orders
 ///
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     use ethers::signers::Signer;
     let wallet: ethers::signers::LocalWallet = credentials.private_key.parse()?;
     let wallet_address = format!("{:?}", wallet.address());
-    info!("✓ Loaded credentials for wallet: {}", wallet_address);
+    info!("OK Loaded credentials for wallet: {}", wallet_address);
 
     // Shared state for current prices
     let prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
@@ -52,18 +52,20 @@ async fn main() -> anyhow::Result<()> {
         coin: "ENA".to_string(),
         reconnect_attempts: 5,
         ping_interval_secs: 30,
-        request_interval_ms: 100,
     };
 
     let mut orderbook_client = OrderbookClient::new(orderbook_config)?;
 
     // Spawn orderbook client in background
     tokio::spawn(async move {
-        orderbook_client.start(move |bid, ask, _coin, _timestamp| {
-            let bid_price: f64 = bid.parse().unwrap_or(0.0);
-            let ask_price: f64 = ask.parse().unwrap_or(0.0);
-            *prices_clone.lock().unwrap() = (bid_price, ask_price);
-        }).await.ok();
+        orderbook_client
+            .start(move |bid, ask, _coin, _timestamp| {
+                let bid_price: f64 = bid.parse().unwrap_or(0.0);
+                let ask_price: f64 = ask.parse().unwrap_or(0.0);
+                *prices_clone.lock().unwrap() = (bid_price, ask_price);
+            })
+            .await
+            .ok();
     });
 
     // Wait for initial price data
@@ -77,7 +79,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mid = (bid + ask) / 2.0;
-    info!("Current prices - Bid: ${:.2}, Ask: ${:.2}, Mid: ${:.2}", bid, ask, mid);
+    info!(
+        "Current prices - Bid: ${:.2}, Ask: ${:.2}, Mid: ${:.2}",
+        bid, ask, mid
+    );
 
     // Create trading client
     let mut trading_client = HyperliquidTrading::new(credentials, false)?;
@@ -96,16 +101,16 @@ async fn main() -> anyhow::Result<()> {
     let long_open_result = trading_client
         .place_market_order(
             "ENA",
-            true,          // is_buy = true
-            50.0,          // size
-            0.05,          // 5% slippage
-            false,         // reduce_only = false
+            true,  // is_buy = true
+            50.0,  // size
+            0.05,  // 5% slippage
+            false, // reduce_only = false
             Some(bid),
             Some(ask),
         )
         .await?;
 
-    info!("✓ Long position opened: {:?}", long_open_result);
+    info!("OK Long position opened: {:?}", long_open_result);
     info!("");
 
     // Wait 10 seconds
@@ -125,16 +130,16 @@ async fn main() -> anyhow::Result<()> {
     let long_close_result = trading_client
         .place_market_order(
             "ENA",
-            false,         // is_buy = false
-            50.0,          // size
-            0.05,          // 5% slippage
-            false,         // reduce_only = false (NEVER true on Hyperliquid)
+            false, // is_buy = false
+            50.0,  // size
+            0.05,  // 5% slippage
+            false, // reduce_only = false (NEVER true on Hyperliquid)
             Some(bid),
             Some(ask),
         )
         .await?;
 
-    info!("✓ Long position closed: {:?}", long_close_result);
+    info!("OK Long position closed: {:?}", long_close_result);
     info!("");
 
     // Small delay before opening short
@@ -155,16 +160,16 @@ async fn main() -> anyhow::Result<()> {
     let short_open_result = trading_client
         .place_market_order(
             "ENA",
-            false,         // is_buy = false
-            50.0,          // size
-            0.05,          // 5% slippage
-            false,         // reduce_only = false
+            false, // is_buy = false
+            50.0,  // size
+            0.05,  // 5% slippage
+            false, // reduce_only = false
             Some(bid),
             Some(ask),
         )
         .await?;
 
-    info!("✓ Short position opened: {:?}", short_open_result);
+    info!("OK Short position opened: {:?}", short_open_result);
     info!("");
 
     // Wait 10 seconds
@@ -184,16 +189,16 @@ async fn main() -> anyhow::Result<()> {
     let short_close_result = trading_client
         .place_market_order(
             "ENA",
-            true,          // is_buy = true
-            50.0,          // size
-            0.05,          // 5% slippage
-            false,         // reduce_only = false (NEVER true on Hyperliquid)
+            true,  // is_buy = true
+            50.0,  // size
+            0.05,  // 5% slippage
+            false, // reduce_only = false (NEVER true on Hyperliquid)
             Some(bid),
             Some(ask),
         )
         .await?;
 
-    info!("✓ Short position closed: {:?}", short_close_result);
+    info!("OK Short position closed: {:?}", short_close_result);
     info!("");
 
     info!("════════════════════════════════════════════════");

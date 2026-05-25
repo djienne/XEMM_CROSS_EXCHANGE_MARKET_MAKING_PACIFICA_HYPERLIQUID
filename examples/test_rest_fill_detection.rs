@@ -15,20 +15,19 @@
 /// ```
 /// cargo run --example test_rest_fill_detection --release
 /// ```
-
 use anyhow::{Context, Result};
+use colored::Colorize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{info, debug};
-use colored::Colorize;
+use tracing::{debug, info};
 
 use xemm_rust::config::Config;
+use xemm_rust::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
 use xemm_rust::connector::pacifica::{
     OpenOrderItem, PacificaCredentials, PacificaTrading, PacificaWsTrading,
 };
-use xemm_rust::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
 use xemm_rust::strategy::OrderSide;
 
 #[tokio::main]
@@ -44,40 +43,58 @@ async fn main() -> Result<()> {
     println!();
 
     // Load configuration
-    let config = Config::load().context("Failed to load configuration")?;
-    println!("{} Configuration loaded: symbol={}, notional=${}",
+    let config = Config::load_default().context("Failed to load configuration")?;
+    println!(
+        "{} Configuration loaded: symbol={}, notional=${}",
         "[TEST]".bright_yellow().bold(),
         config.symbol.bright_white().bold(),
         config.order_notional_usd
     );
 
     // Load credentials
-    let pacifica_credentials = PacificaCredentials::from_env()
-        .context("Failed to load Pacifica credentials")?;
-    let hyperliquid_credentials = HyperliquidCredentials::from_env()
-        .context("Failed to load Hyperliquid credentials")?;
+    let pacifica_credentials =
+        PacificaCredentials::from_env().context("Failed to load Pacifica credentials")?;
+    let hyperliquid_credentials =
+        HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials")?;
 
     println!("{} Credentials loaded", "[TEST]".bright_yellow().bold());
 
     // Initialize trading clients
-    let pacifica_trading = Arc::new(tokio::sync::Mutex::new(
-        PacificaTrading::new(pacifica_credentials.clone())
-    ));
-    let pacifica_ws_trading = Arc::new(
-        PacificaWsTrading::new(pacifica_credentials.clone())
-    );
-    let hyperliquid_trading = Arc::new(
-        HyperliquidTrading::new(hyperliquid_credentials, false)?
-    );
+    let pacifica_trading = Arc::new(tokio::sync::Mutex::new(PacificaTrading::new(
+        pacifica_credentials.clone(),
+    )?));
+    let pacifica_ws_trading = Arc::new(PacificaWsTrading::new(pacifica_credentials.clone(), false));
+    let hyperliquid_trading = Arc::new(HyperliquidTrading::new(hyperliquid_credentials, false)?);
 
-    println!("{} Trading clients initialized", "[TEST]".bright_yellow().bold());
+    println!(
+        "{} Trading clients initialized",
+        "[TEST]".bright_yellow().bold()
+    );
     println!();
 
     // Cancel all existing orders first
-    println!("{} Cancelling all existing orders...", "[TEST]".bright_yellow().bold());
-    match pacifica_trading.lock().await.cancel_all_orders(false, Some(&config.symbol), false).await {
-        Ok(count) => println!("{} {} Cancelled {} order(s)", "[TEST]".bright_yellow().bold(), "✓".green().bold(), count),
-        Err(e) => println!("{} {} Failed to cancel: {}", "[TEST]".bright_yellow().bold(), "⚠".yellow().bold(), e),
+    println!(
+        "{} Cancelling all existing orders...",
+        "[TEST]".bright_yellow().bold()
+    );
+    match pacifica_trading
+        .lock()
+        .await
+        .cancel_all_orders(false, Some(&config.symbol), false)
+        .await
+    {
+        Ok(count) => println!(
+            "{} {} Cancelled {} order(s)",
+            "[TEST]".bright_yellow().bold(),
+            "OK".green().bold(),
+            count
+        ),
+        Err(e) => println!(
+            "{} {} Failed to cancel: {}",
+            "[TEST]".bright_yellow().bold(),
+            "WARN".yellow().bold(),
+            e
+        ),
     }
     println!();
 
@@ -85,11 +102,13 @@ async fn main() -> Result<()> {
     // CRITICAL: Simulating WebSocket Failure
     // We deliberately DO NOT start WebSocket fill detection
     // ═════════════════════════════════════════════════════
-    println!("{} {} WebSocket fill detection DISABLED (simulating failure)",
+    println!(
+        "{} {} WebSocket fill detection DISABLED (simulating failure)",
         "[TEST]".bright_yellow().bold(),
-        "⚠".red().bold()
+        "WARN".red().bold()
     );
-    println!("{} REST API is the ONLY fill detection mechanism",
+    println!(
+        "{} REST API is the ONLY fill detection mechanism",
         "[TEST]".bright_yellow().bold()
     );
     println!();
@@ -98,7 +117,9 @@ async fn main() -> Result<()> {
     // REST API Fill Detection (Task 5)
     // ═════════════════════════════════════════════════════
 
-    let processed_fills = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<String>::new()));
+    let processed_fills = Arc::new(tokio::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
     let fill_detected = Arc::new(Mutex::new(false));
     let fill_detected_clone = fill_detected.clone();
 
@@ -160,9 +181,10 @@ async fn main() -> Result<()> {
                             let new_fill_amount = filled_amount - last_known_filled_amount;
                             let notional_value = new_fill_amount * price;
 
-                            println!("{} {} FILL DETECTED via REST API: {} -> {} (new: {}) | Notional: ${:.2}",
+                            println!(
+                                "{} {} FILL DETECTED via REST API: {} -> {} (new: {}) | Notional: ${:.2}",
                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),
-                                "✓".green().bold(),
+                                "OK".green().bold(),
                                 last_known_filled_amount,
                                 filled_amount,
                                 new_fill_amount,
@@ -180,7 +202,9 @@ async fn main() -> Result<()> {
                                 // Check duplicate
                                 let mut processed = processed_fills_rest.lock().await;
                                 if processed.contains(&fill_id) {
-                                    debug!("[REST_FILL_DETECTION] Fill already processed, skipping");
+                                    debug!(
+                                        "[REST_FILL_DETECTION] Fill already processed, skipping"
+                                    );
                                     continue;
                                 }
                                 processed.insert(fill_id);
@@ -188,9 +212,10 @@ async fn main() -> Result<()> {
 
                                 *fill_detected_clone.lock().unwrap() = true;
 
-                                println!("{} {} {} FILL: {} {} | Notional: ${}",
+                                println!(
+                                    "{} {} {} FILL: {} {} | Notional: ${}",
                                     "[REST_FILL_DETECTION]".bright_cyan().bold(),
-                                    "✓".green().bold(),
+                                    "OK".green().bold(),
                                     if is_full_fill { "FULL" } else { "PARTIAL" },
                                     order.side.bright_yellow(),
                                     filled_amount,
@@ -198,8 +223,14 @@ async fn main() -> Result<()> {
                                 );
 
                                 // Trigger hedge
-                                println!("{} Triggering hedge...", "[REST_FILL_DETECTION]".bright_cyan().bold());
-                                hedge_tx_rest.send((order_side, filled_amount, price)).await.ok();
+                                println!(
+                                    "{} Triggering hedge...",
+                                    "[REST_FILL_DETECTION]".bright_cyan().bold()
+                                );
+                                hedge_tx_rest
+                                    .send((order_side, filled_amount, price))
+                                    .await
+                                    .ok();
                             }
                         }
                     } else {
@@ -218,7 +249,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    println!("{} REST API fill detection started (polling every 500ms)",
+    println!(
+        "{} REST API fill detection started (polling every 500ms)",
         "[TEST]".bright_yellow().bold()
     );
     println!();
@@ -228,7 +260,11 @@ async fn main() -> Result<()> {
     // ═════════════════════════════════════════════════════
 
     println!("{}", "═".repeat(80).bright_cyan());
-    println!("{} {} Place a limit order on Pacifica", "[TEST]".bright_yellow().bold(), "STEP 1:".bright_white().bold());
+    println!(
+        "{} {} Place a limit order on Pacifica",
+        "[TEST]".bright_yellow().bold(),
+        "STEP 1:".bright_white().bold()
+    );
     println!("{}", "═".repeat(80).bright_cyan());
     println!();
 
@@ -238,18 +274,36 @@ async fn main() -> Result<()> {
     drop(trading);
 
     // For testing, we'll use a buy order at current bid (likely to fill quickly)
-    println!("{} This test requires MANUAL interaction:", "[TEST]".bright_yellow().bold());
-    println!("{} 1. The bot will place a LIMIT order", "[TEST]".bright_yellow().bold());
-    println!("{} 2. You need to FILL the order manually (use another account)", "[TEST]".bright_yellow().bold());
-    println!("{} 3. Or wait for the market to fill it", "[TEST]".bright_yellow().bold());
+    println!(
+        "{} This test requires MANUAL interaction:",
+        "[TEST]".bright_yellow().bold()
+    );
+    println!(
+        "{} 1. The bot will place a LIMIT order",
+        "[TEST]".bright_yellow().bold()
+    );
+    println!(
+        "{} 2. You need to FILL the order manually (use another account)",
+        "[TEST]".bright_yellow().bold()
+    );
+    println!(
+        "{} 3. Or wait for the market to fill it",
+        "[TEST]".bright_yellow().bold()
+    );
     println!();
-    println!("{} Press ENTER when ready to place order...", "[TEST]".bright_yellow().bold());
+    println!(
+        "{} Press ENTER when ready to place order...",
+        "[TEST]".bright_yellow().bold()
+    );
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).unwrap();
 
     // Simplified: Just place a small order and let user fill it
-    println!("{} Order placement not implemented in this test stub", "[TEST]".bright_yellow().bold());
+    println!(
+        "{} Order placement not implemented in this test stub",
+        "[TEST]".bright_yellow().bold()
+    );
     println!("{} To complete this test:", "[TEST]".bright_yellow().bold());
     println!("  1. Run the main bot with a modified version that has a WebSocket kill switch");
     println!("  2. Place an order normally");
@@ -260,7 +314,10 @@ async fn main() -> Result<()> {
 
     println!("{}", "═".repeat(80).bright_cyan());
     println!("{} Test stub complete", "[TEST]".bright_yellow().bold());
-    println!("{} Implement full test by adding kill switch to main bot", "[TEST]".bright_yellow().bold());
+    println!(
+        "{} Implement full test by adding kill switch to main bot",
+        "[TEST]".bright_yellow().bold()
+    );
     println!("{}", "═".repeat(80).bright_cyan());
 
     Ok(())

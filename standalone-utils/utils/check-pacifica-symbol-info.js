@@ -114,7 +114,7 @@ async function checkSymbolInfo() {
       padRight('LOT SIZE', 12) +
       padRight('TICK SIZE', 12) +
       padRight('PRICE', 12) +
-      padRight('LOT×PRICE', 13) +
+      padRight('LOTxPRICE', 13) +
       padRight('MIN ORDER $', 13) +
       padRight('MIN ORDER QTY', 15) +
       padRight('BID', 12) +
@@ -137,16 +137,16 @@ async function checkSymbolInfo() {
     }
 
     console.log('='.repeat(160));
-    console.log('\n⚠️  WARNING: API lot_size values may NOT be accurate!');
+    console.log('\nWARN  WARNING: API lot_size values may NOT be accurate!');
     console.log('  - API reports SOL lot_size = 0.01, but actual minimum partial fill is 0.1');
     console.log('  - API reports BTC lot_size = 0.00001, but actual minimum is much higher');
     console.log('  - XPL lot_size = 1 appears to be correct');
-    console.log('  ➜ Verify actual minimum fills through trading before relying on these values!\n');
+    console.log('  -> Verify actual minimum fills through trading before relying on these values!\n');
     console.log('Legend:');
-    console.log('  LOT SIZE: Minimum partial fill increment from API (⚠️ MAY BE INACCURATE)');
+    console.log('  LOT SIZE: Minimum partial fill increment from API (WARN MAY BE INACCURATE)');
     console.log('  TICK SIZE: Minimum price increment');
     console.log('  PRICE: Current mid price');
-    console.log('  LOT×PRICE: Value of smallest partial fill (based on API lot_size)');
+    console.log('  LOTxPRICE: Value of smallest partial fill (based on API lot_size)');
     console.log('  MIN ORDER $: Minimum order size when placing order (USD)');
     console.log('  MIN ORDER QTY: Minimum quantity when placing order');
     console.log('\n  ** For post-only orders, you can receive partial fills as small as LOT SIZE **');

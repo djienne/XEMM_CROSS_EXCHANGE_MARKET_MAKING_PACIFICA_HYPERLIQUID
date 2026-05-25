@@ -4,15 +4,21 @@ use std::sync::Arc;
 
 /// Canonical fill dedup key.
 ///
-/// The Pacifica exchange-assigned `order_id: u64` is the canonical identifier
-/// because it is always present and immutable across WebSocket / REST /
-/// position-inferred paths. The `cloid` string is used only as a fallback for
-/// events that did not come through Pacifica's order API (e.g. position-only
-/// inference where the order was placed before the bot started).
+/// The pre-generated Pacifica client order ID is the canonical identifier
+/// because it is known before REST placement returns and is shared across
+/// WebSocket, REST, and position-inferred paths.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FillKey {
     OrderId(u64),
+    OrderCumulative {
+        order_id: u64,
+        cumulative_quanta: u64,
+    },
     Cloid(String),
+    CloidCumulative {
+        cloid: String,
+        cumulative_quanta: u64,
+    },
 }
 
 impl FillKey {
@@ -23,6 +29,25 @@ impl FillKey {
     pub fn from_cloid(cloid: impl Into<String>) -> Self {
         FillKey::Cloid(cloid.into())
     }
+
+    pub fn from_order_cumulative(id: u64, cumulative_size: f64) -> Self {
+        FillKey::OrderCumulative {
+            order_id: id,
+            cumulative_quanta: quantize_size(cumulative_size),
+        }
+    }
+
+    pub fn from_cloid_cumulative(cloid: impl Into<String>, cumulative_size: f64) -> Self {
+        FillKey::CloidCumulative {
+            cloid: cloid.into(),
+            cumulative_quanta: quantize_size(cumulative_size),
+        }
+    }
+}
+
+#[inline]
+fn quantize_size(size: f64) -> u64 {
+    (size.max(0.0) * 1_000_000_000.0).round() as u64
 }
 
 /// Bounded fill-dedup set.
@@ -133,6 +158,14 @@ mod tests {
         assert!(d.insert_if_new(FillKey::OrderId(100)));
         assert!(d.insert_if_new(FillKey::Cloid("100".to_string())));
         assert_eq!(d.len(), 2);
+    }
+
+    #[test]
+    fn cumulative_fill_keys_allow_later_residuals() {
+        let d = FillDedup::new(8);
+        assert!(d.insert_if_new(FillKey::from_cloid_cumulative("cloid-42", 0.4)));
+        assert!(!d.insert_if_new(FillKey::from_cloid_cumulative("cloid-42", 0.4)));
+        assert!(d.insert_if_new(FillKey::from_cloid_cumulative("cloid-42", 1.0)));
     }
 
     #[test]

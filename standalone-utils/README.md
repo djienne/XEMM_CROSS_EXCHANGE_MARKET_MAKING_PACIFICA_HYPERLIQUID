@@ -76,7 +76,7 @@ node get-recent-fills.js 20      # Show last 20 fills
 
 **Purpose:** Emergency script to flatten every open position on both exchanges.
 
-**⚠️ WARNING:** This script will close ALL positions immediately. Use with caution!
+**WARN WARNING:** This script will close ALL positions immediately. Use with caution!
 
 **Usage:**
 ```bash
@@ -340,13 +340,13 @@ For issues or questions:
 
 ## Safety Reminders
 
-⚠️ **Before using cleanup-all-positions.js:**
+WARN **Before using cleanup-all-positions.js:**
 - Understand it will close ALL positions
 - Make sure you actually want to flatten everything
 - Check positions first with `node get-recent-fills.js`
 - Consider using the bot's graceful shutdown instead (Ctrl+C)
 
-✅ **Best Practices:**
+OK **Best Practices:**
 - Always check positions before and after operations
 - Keep `.env` secure and never share credentials
 - Test on small positions first if unsure

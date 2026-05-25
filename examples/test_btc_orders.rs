@@ -1,10 +1,10 @@
 use anyhow::Result;
-use xemm_rust::connector::hyperliquid::{
-    OrderbookClient, OrderbookConfig, HyperliquidTrading, HyperliquidCredentials,
-};
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::info;
+use xemm_rust::connector::hyperliquid::{
+    HyperliquidCredentials, HyperliquidTrading, OrderbookClient, OrderbookConfig,
+};
 
 /// Test BTC market orders with $20 notional
 #[tokio::main]
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     use ethers::signers::Signer;
     let wallet: ethers::signers::LocalWallet = credentials.private_key.parse()?;
     let wallet_address = format!("{:?}", wallet.address());
-    info!("✓ Loaded credentials for wallet: {}", wallet_address);
+    info!("OK Loaded credentials for wallet: {}", wallet_address);
 
     // Shared state for current prices
     let prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
@@ -40,18 +40,20 @@ async fn main() -> Result<()> {
         coin: "BTC".to_string(),
         reconnect_attempts: 5,
         ping_interval_secs: 30,
-        request_interval_ms: 100,
     };
 
     let mut orderbook_client = OrderbookClient::new(orderbook_config)?;
 
     // Spawn orderbook client in background
     tokio::spawn(async move {
-        orderbook_client.start(move |bid, ask, _coin, _timestamp| {
-            let bid_price: f64 = bid.parse().unwrap_or(0.0);
-            let ask_price: f64 = ask.parse().unwrap_or(0.0);
-            *prices_clone.lock().unwrap() = (bid_price, ask_price);
-        }).await.ok();
+        orderbook_client
+            .start(move |bid, ask, _coin, _timestamp| {
+                let bid_price: f64 = bid.parse().unwrap_or(0.0);
+                let ask_price: f64 = ask.parse().unwrap_or(0.0);
+                *prices_clone.lock().unwrap() = (bid_price, ask_price);
+            })
+            .await
+            .ok();
     });
 
     // Wait for initial price data
@@ -65,7 +67,10 @@ async fn main() -> Result<()> {
     }
 
     let mid = (bid + ask) / 2.0;
-    info!("Current BTC prices - Bid: ${:.2}, Ask: ${:.2}, Mid: ${:.2}", bid, ask, mid);
+    info!(
+        "Current BTC prices - Bid: ${:.2}, Ask: ${:.2}, Mid: ${:.2}",
+        bid, ask, mid
+    );
 
     // Use minimum size 0.001 BTC (minimum notional requirement)
     let size = 0.001;
@@ -86,16 +91,16 @@ async fn main() -> Result<()> {
     let buy_result = trading_client
         .place_market_order(
             "BTC",
-            true,          // is_buy = true
-            size,          // size
-            0.05,          // 5% slippage
-            false,         // reduce_only = false (NEVER true on Hyperliquid)
+            true,  // is_buy = true
+            size,  // size
+            0.05,  // 5% slippage
+            false, // reduce_only = false (NEVER true on Hyperliquid)
             Some(bid),
             Some(ask),
         )
         .await?;
 
-    info!("✓ BUY order result: {:?}", buy_result);
+    info!("OK BUY order result: {:?}", buy_result);
     info!("");
 
     // Wait 5 seconds
@@ -113,16 +118,16 @@ async fn main() -> Result<()> {
     let sell_result = trading_client
         .place_market_order(
             "BTC",
-            false,         // is_buy = false
-            size,          // size
-            0.05,          // 5% slippage
-            false,         // reduce_only = false (NEVER true on Hyperliquid)
+            false, // is_buy = false
+            size,  // size
+            0.05,  // 5% slippage
+            false, // reduce_only = false (NEVER true on Hyperliquid)
             Some(bid),
             Some(ask),
         )
         .await?;
 
-    info!("✓ SELL order result: {:?}", sell_result);
+    info!("OK SELL order result: {:?}", sell_result);
     info!("");
 
     info!("════════════════════════════════════════════════");

@@ -26,12 +26,14 @@ async fn main() -> Result<()> {
     let ena_found = meta.universe.iter().any(|asset| asset.name == "ENA");
 
     if ena_found {
-        println!("✓ ENA is available on Hyperliquid");
+        println!("OK ENA is available on Hyperliquid");
     } else {
-        println!("✗ ENA is NOT available on Hyperliquid");
+        println!("FAIL ENA is NOT available on Hyperliquid");
         println!("\nSearching for similar symbols...");
 
-        let similar: Vec<_> = meta.universe.iter()
+        let similar: Vec<_> = meta
+            .universe
+            .iter()
             .filter(|asset| asset.name.contains("EN") || asset.name.starts_with("E"))
             .map(|asset| &asset.name)
             .collect();
@@ -56,9 +58,9 @@ async fn main() -> Result<()> {
     for symbol in test_symbols {
         let found = meta.universe.iter().any(|asset| asset.name == symbol);
         if found {
-            println!("✓ {} is available", symbol);
+            println!("OK {} is available", symbol);
         } else {
-            println!("✗ {} is NOT available", symbol);
+            println!("FAIL {} is NOT available", symbol);
         }
     }
 

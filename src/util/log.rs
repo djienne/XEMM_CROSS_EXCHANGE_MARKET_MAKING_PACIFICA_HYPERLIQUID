@@ -1,4 +1,4 @@
-//! Small logging helpers. Scope is deliberately narrow — we don't wrap the
+//! Small logging helpers. Scope is deliberately narrow - we don't wrap the
 //! whole `tracing`/`colored` API, only the repetitive `[SYMBOL TAG]` prefix
 //! pattern that otherwise appears in ~70 places across the codebase.
 

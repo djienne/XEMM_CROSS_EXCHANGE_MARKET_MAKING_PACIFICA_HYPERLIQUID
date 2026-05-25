@@ -1,8 +1,8 @@
-use xemm_rust::connector::pacifica::{OrderbookClient, OrderbookConfig};
-use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
-use tracing::{info, warn};
+use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
+use tracing::{info, warn};
+use xemm_rust::connector::pacifica::{OrderbookClient, OrderbookConfig};
 
 /// Example showing advanced usage with price tracking and statistics
 #[tokio::main]
@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -43,28 +43,30 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start client with callback
-    client.start(move |best_bid, best_ask, symbol, timestamp| {
-        let bid_price: f64 = best_bid.parse().unwrap_or(0.0);
-        let ask_price: f64 = best_ask.parse().unwrap_or(0.0);
-        let mid_price = (bid_price + ask_price) / 2.0;
-        let spread = ask_price - bid_price;
-        let spread_bps = if bid_price > 0.0 {
-            (spread / bid_price) * 10000.0
-        } else {
-            0.0
-        };
+    client
+        .start(move |best_bid, best_ask, symbol, timestamp| {
+            let bid_price: f64 = best_bid.parse().unwrap_or(0.0);
+            let ask_price: f64 = best_ask.parse().unwrap_or(0.0);
+            let mid_price = (bid_price + ask_price) / 2.0;
+            let spread = ask_price - bid_price;
+            let spread_bps = if bid_price > 0.0 {
+                (spread / bid_price) * 10000.0
+            } else {
+                0.0
+            };
 
-        // Update price history
-        {
-            let mut tracker = history_clone.lock().unwrap();
-            tracker.add_update(bid_price, ask_price, mid_price, spread_bps, timestamp);
-        }
+            // Update price history
+            {
+                let mut tracker = history_clone.lock().unwrap();
+                tracker.add_update(bid_price, ask_price, mid_price, spread_bps, timestamp);
+            }
 
-        info!(
-            "{} | Bid: ${:.2} | Ask: ${:.2} | Mid: ${:.2} | Spread: {:.2} bps",
-            symbol, bid_price, ask_price, mid_price, spread_bps
-        );
-    }).await?;
+            info!(
+                "{} | Bid: ${:.2} | Ask: ${:.2} | Mid: ${:.2} | Spread: {:.2} bps",
+                symbol, bid_price, ask_price, mid_price, spread_bps
+            );
+        })
+        .await?;
 
     Ok(())
 }
@@ -115,15 +117,37 @@ impl PriceTracker {
         let avg_mid: f64 = self.updates.iter().map(|u| u.mid).sum::<f64>() / count as f64;
         let avg_spread: f64 = self.updates.iter().map(|u| u.spread_bps).sum::<f64>() / count as f64;
 
-        let min_mid = self.updates.iter().map(|u| u.mid).fold(f64::INFINITY, f64::min);
-        let max_mid = self.updates.iter().map(|u| u.mid).fold(f64::NEG_INFINITY, f64::max);
+        let min_mid = self
+            .updates
+            .iter()
+            .map(|u| u.mid)
+            .fold(f64::INFINITY, f64::min);
+        let max_mid = self
+            .updates
+            .iter()
+            .map(|u| u.mid)
+            .fold(f64::NEG_INFINITY, f64::max);
 
-        let min_spread = self.updates.iter().map(|u| u.spread_bps).fold(f64::INFINITY, f64::min);
-        let max_spread = self.updates.iter().map(|u| u.spread_bps).fold(f64::NEG_INFINITY, f64::max);
+        let min_spread = self
+            .updates
+            .iter()
+            .map(|u| u.spread_bps)
+            .fold(f64::INFINITY, f64::min);
+        let max_spread = self
+            .updates
+            .iter()
+            .map(|u| u.spread_bps)
+            .fold(f64::NEG_INFINITY, f64::max);
 
         info!("=== Statistics (last {} updates) ===", count);
-        info!("Mid Price  -> Avg: ${:.2} | Min: ${:.2} | Max: ${:.2}", avg_mid, min_mid, max_mid);
-        info!("Spread     -> Avg: {:.2} bps | Min: {:.2} bps | Max: {:.2} bps", avg_spread, min_spread, max_spread);
+        info!(
+            "Mid Price  -> Avg: ${:.2} | Min: ${:.2} | Max: ${:.2}",
+            avg_mid, min_mid, max_mid
+        );
+        info!(
+            "Spread     -> Avg: {:.2} bps | Min: {:.2} bps | Max: {:.2} bps",
+            avg_spread, min_spread, max_spread
+        );
         info!("========================================");
     }
 }

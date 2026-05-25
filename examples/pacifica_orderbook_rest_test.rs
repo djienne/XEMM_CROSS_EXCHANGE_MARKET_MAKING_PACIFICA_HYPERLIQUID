@@ -1,5 +1,5 @@
-use xemm_rust::connector::pacifica::trading::PacificaTrading;
 use anyhow::Result;
+use xemm_rust::connector::pacifica::trading::PacificaTrading;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,10 +19,11 @@ async fn main() -> Result<()> {
     // Load credentials from environment
     // Note: Credentials are only needed for authenticated endpoints
     // For public orderbook data, credentials don't need to be valid
-    let credentials = match xemm_rust::connector::pacifica::trading::PacificaCredentials::from_env() {
+    let credentials = match xemm_rust::connector::pacifica::trading::PacificaCredentials::from_env()
+    {
         Ok(creds) => creds,
         Err(_) => {
-            println!("⚠️  Warning: No credentials found in .env file");
+            println!("WARN  Warning: No credentials found in .env file");
             println!("   Using dummy credentials (OK for public endpoints)");
             xemm_rust::connector::pacifica::trading::PacificaCredentials {
                 account: "dummy".to_string(),
@@ -32,13 +33,16 @@ async fn main() -> Result<()> {
         }
     };
 
-    let trading = PacificaTrading::new(credentials);
+    let trading = PacificaTrading::new(credentials)?;
 
     // Test symbols to fetch
     let test_symbols = vec!["SOL", "BTC", "ETH"];
     let agg_level = 1; // Top of book
 
-    println!("[TEST] Fetching orderbook data for {} symbols", test_symbols.len());
+    println!(
+        "[TEST] Fetching orderbook data for {} symbols",
+        test_symbols.len()
+    );
     println!();
 
     for symbol in &test_symbols {
@@ -49,7 +53,7 @@ async fn main() -> Result<()> {
         // Test 1: Get full orderbook snapshot
         match trading.get_orderbook_rest(symbol, agg_level).await {
             Ok(snapshot) => {
-                println!("✓ Orderbook snapshot retrieved");
+                println!("OK Orderbook snapshot retrieved");
                 println!("  Bids: {} levels", snapshot.bids.len());
                 println!("  Asks: {} levels", snapshot.asks.len());
 
@@ -70,7 +74,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                println!("✗ Failed to get orderbook: {}", e);
+                println!("FAIL Failed to get orderbook: {}", e);
             }
         }
 
@@ -83,17 +87,17 @@ async fn main() -> Result<()> {
                 let spread = ask - bid;
                 let spread_bps = (spread / mid) * 10000.0;
 
-                println!("✓ Best bid/ask retrieved");
+                println!("OK Best bid/ask retrieved");
                 println!("  Best Bid: ${:.4}", bid);
                 println!("  Best Ask: ${:.4}", ask);
                 println!("  Mid Price: ${:.4}", mid);
                 println!("  Spread: ${:.4} ({:.2} bps)", spread, spread_bps);
             }
             Ok(None) => {
-                println!("✗ No bid/ask available (empty orderbook)");
+                println!("FAIL No bid/ask available (empty orderbook)");
             }
             Err(e) => {
-                println!("✗ Failed to get bid/ask: {}", e);
+                println!("FAIL Failed to get bid/ask: {}", e);
             }
         }
 

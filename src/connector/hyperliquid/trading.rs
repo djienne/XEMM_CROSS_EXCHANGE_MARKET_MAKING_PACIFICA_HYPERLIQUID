@@ -30,17 +30,15 @@ impl HyperliquidCredentials {
         let private_key = std::env::var("HL_PRIVATE_KEY")
             .context("HL_PRIVATE_KEY environment variable not set")?;
 
-        Ok(Self {
-            private_key,
-        })
+        Ok(Self { private_key })
     }
 }
 
-    /// Hyperliquid trading client
-    pub struct HyperliquidTrading {
-        credentials: HyperliquidCredentials,
-        info_url: String,
-        exchange_url: String,
+/// Hyperliquid trading client
+pub struct HyperliquidTrading {
+    credentials: HyperliquidCredentials,
+    info_url: String,
+    exchange_url: String,
     client: Client,
     wallet: LocalWallet,
     meta_cache: Arc<RwLock<Option<MetaResponse>>>,
@@ -55,9 +53,15 @@ impl HyperliquidTrading {
     /// * `is_testnet` - Whether to use testnet (false = mainnet)
     pub fn new(credentials: HyperliquidCredentials, is_testnet: bool) -> Result<Self> {
         let (info_url, exchange_url) = if is_testnet {
-            (TESTNET_INFO_URL.to_string(), TESTNET_EXCHANGE_URL.to_string())
+            (
+                TESTNET_INFO_URL.to_string(),
+                TESTNET_EXCHANGE_URL.to_string(),
+            )
         } else {
-            (MAINNET_INFO_URL.to_string(), MAINNET_EXCHANGE_URL.to_string())
+            (
+                MAINNET_INFO_URL.to_string(),
+                MAINNET_EXCHANGE_URL.to_string(),
+            )
         };
 
         // Create wallet from private key
@@ -108,12 +112,15 @@ impl HyperliquidTrading {
             .await
             .context("Failed to read response text")?;
 
-        debug!("[HYPERLIQUID] Meta response (first 500 chars): {}",
-            &response_text.chars().take(500).collect::<String>());
+        debug!(
+            "[HYPERLIQUID] Meta response (first 500 chars): {}",
+            &response_text.chars().take(500).collect::<String>()
+        );
 
-        let meta: MetaResponse = serde_json::from_str(&response_text)
-            .context(format!("Failed to parse meta response. First 200 chars: {}",
-                &response_text.chars().take(200).collect::<String>()))?;
+        let meta: MetaResponse = serde_json::from_str(&response_text).context(format!(
+            "Failed to parse meta response. First 200 chars: {}",
+            &response_text.chars().take(200).collect::<String>()
+        ))?;
 
         // Cache the result
         {
@@ -158,7 +165,8 @@ impl HyperliquidTrading {
             "coin": coin
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(&self.info_url)
             .json(&request_body)
             .send()
@@ -169,16 +177,20 @@ impl HyperliquidTrading {
             anyhow::bail!("L2 snapshot request failed: {}", response.status());
         }
 
-        let response_text = response.text().await.context("Failed to read L2 response")?;
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read L2 response")?;
 
         // Parse response to extract levels
-        let data: serde_json::Value = serde_json::from_str(&response_text)
-            .context("Failed to parse L2 response")?;
+        let data: serde_json::Value =
+            serde_json::from_str(&response_text).context("Failed to parse L2 response")?;
 
         // Extract best bid and ask from levels
         // levels[0] = array of bid levels [{px, sz, n}, ...]
         // levels[1] = array of ask levels [{px, sz, n}, ...]
-        let levels = data.get("levels")
+        let levels = data
+            .get("levels")
             .and_then(|v| v.as_array())
             .context("Missing levels array in L2 response")?;
 
@@ -187,7 +199,8 @@ impl HyperliquidTrading {
         }
 
         // Get best bid (first element of bids array)
-        let best_bid = levels.get(0)
+        let best_bid = levels
+            .get(0)
             .and_then(|bids| bids.as_array())
             .and_then(|bids| bids.first())
             .and_then(|bid| bid.get("px"))
@@ -195,7 +208,8 @@ impl HyperliquidTrading {
             .and_then(|s| s.parse::<f64>().ok());
 
         // Get best ask (first element of asks array)
-        let best_ask = levels.get(1)
+        let best_ask = levels
+            .get(1)
             .and_then(|asks| asks.as_array())
             .and_then(|asks| asks.first())
             .and_then(|ask| ask.get("px"))
@@ -204,7 +218,10 @@ impl HyperliquidTrading {
 
         match (best_bid, best_ask) {
             (Some(bid), Some(ask)) => {
-                debug!("[HYPERLIQUID] L2 snapshot: bid=${:.6}, ask=${:.6}", bid, ask);
+                debug!(
+                    "[HYPERLIQUID] L2 snapshot: bid=${:.6}, ask=${:.6}",
+                    bid, ask
+                );
                 Ok(Some((bid, ask)))
             }
             _ => Ok(None),
@@ -216,7 +233,13 @@ impl HyperliquidTrading {
     /// Max decimals = MAX_DECIMALS - szDecimals (6 for perps, 8 for spot)
     ///
     /// Reference: hyperliquid.js roundPrice() - EXACT MATCH
-    fn round_price(price: f64, sz_decimals: i32, is_spot: bool, _is_buy: bool, _aggressive: bool) -> String {
+    fn round_price(
+        price: f64,
+        sz_decimals: i32,
+        is_spot: bool,
+        _is_buy: bool,
+        _aggressive: bool,
+    ) -> String {
         let max_decimals = (if is_spot { 8 } else { 6 }) - sz_decimals;
 
         // Step 1: Round to 5 significant figures
@@ -247,7 +270,10 @@ impl HyperliquidTrading {
 
         // Step 4: Remove trailing zeros (like JavaScript's toString())
         if result.contains('.') {
-            result.trim_end_matches('0').trim_end_matches('.').to_string()
+            result
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
         } else {
             result
         }
@@ -363,13 +389,39 @@ impl HyperliquidTrading {
         bid: Option<f64>,
         ask: Option<f64>,
     ) -> Result<OrderRequest> {
+        self.build_market_order_request_with_cloid(
+            coin,
+            is_buy,
+            size,
+            slippage,
+            reduce_only,
+            bid,
+            ask,
+            None,
+        )
+        .await
+    }
+
+    pub async fn build_market_order_request_with_cloid(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        size: f64,
+        slippage: f64,
+        reduce_only: bool,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        cloid: Option<String>,
+    ) -> Result<OrderRequest> {
         // Get asset ID and metadata
         let asset_id = self.get_asset_id(coin).await?;
         let asset_info = self.get_asset_info(coin).await?;
 
         // Check if we have bid/ask prices
         if bid.is_none() || ask.is_none() {
-            anyhow::bail!("Bid and ask prices are required. Please provide them from the orderbook client.");
+            anyhow::bail!(
+                "Bid and ask prices are required. Please provide them from the orderbook client."
+            );
         }
 
         let bid_price = bid.unwrap();
@@ -387,7 +439,8 @@ impl HyperliquidTrading {
 
         // Round price and size
         let is_spot = asset_id >= 10000;
-        let limit_price_str = Self::round_price(limit_price, asset_info.sz_decimals, is_spot, is_buy, true); // aggressive=true for market orders
+        let limit_price_str =
+            Self::round_price(limit_price, asset_info.sz_decimals, is_spot, is_buy, true); // aggressive=true for market orders
         let size_str = Self::round_size(size, asset_info.sz_decimals);
 
         info!(
@@ -413,7 +466,7 @@ impl HyperliquidTrading {
                     tif: TimeInForce::Ioc,
                 },
             },
-            c: None,
+            c: cloid,
         };
 
         // Construct action
@@ -463,9 +516,42 @@ impl HyperliquidTrading {
         bid: Option<f64>,
         ask: Option<f64>,
     ) -> Result<OrderResponse> {
+        self.place_market_order_with_cloid(
+            coin,
+            is_buy,
+            size,
+            slippage,
+            reduce_only,
+            bid,
+            ask,
+            None,
+        )
+        .await
+    }
+
+    pub async fn place_market_order_with_cloid(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        size: f64,
+        slippage: f64,
+        reduce_only: bool,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        cloid: Option<String>,
+    ) -> Result<OrderResponse> {
         // Build signed order payload (shared with WebSocket execution path)
         let payload = self
-            .build_market_order_request(coin, is_buy, size, slippage, reduce_only, bid, ask)
+            .build_market_order_request_with_cloid(
+                coin,
+                is_buy,
+                size,
+                slippage,
+                reduce_only,
+                bid,
+                ask,
+                cloid,
+            )
             .await?;
 
         // Send order via REST API
@@ -489,12 +575,16 @@ impl HyperliquidTrading {
             .await
             .context("Failed to read response text")?;
 
-        debug!("[HYPERLIQUID] Order response (first 500 chars): {}",
-            &response_text.chars().take(500).collect::<String>());
+        debug!(
+            "[HYPERLIQUID] Order response (first 500 chars): {}",
+            &response_text.chars().take(500).collect::<String>()
+        );
 
-        let order_response: OrderResponse = serde_json::from_str(&response_text)
-            .context(format!("Failed to parse order response. Response text: {}",
-                &response_text.chars().take(300).collect::<String>()))?;
+        let order_response: OrderResponse =
+            serde_json::from_str(&response_text).context(format!(
+                "Failed to parse order response. Response text: {}",
+                &response_text.chars().take(300).collect::<String>()
+            ))?;
 
         // Check if response indicates error
         match &order_response.response {
@@ -518,8 +608,15 @@ impl HyperliquidTrading {
     ///
     /// # Returns
     /// Vector of user fills (up to 2000 most recent fills)
-    pub async fn get_user_fills(&self, user: &str, aggregate_by_time: bool) -> Result<Vec<UserFill>> {
-        info!("[HYPERLIQUID] Fetching user fills for {} (aggregate: {})", user, aggregate_by_time);
+    pub async fn get_user_fills(
+        &self,
+        user: &str,
+        aggregate_by_time: bool,
+    ) -> Result<Vec<UserFill>> {
+        info!(
+            "[HYPERLIQUID] Fetching user fills for {} (aggregate: {})",
+            user, aggregate_by_time
+        );
 
         let payload = json!({
             "type": "userFills",
@@ -570,13 +667,18 @@ impl HyperliquidTrading {
             .context("Failed to fetch user state")?;
 
         let response_text = response.text().await?;
-        debug!("[HYPERLIQUID] User state response (first 500 chars): {}",
-            &response_text.chars().take(500).collect::<String>());
+        debug!(
+            "[HYPERLIQUID] User state response (first 500 chars): {}",
+            &response_text.chars().take(500).collect::<String>()
+        );
 
         let user_state: UserState = serde_json::from_str(&response_text)
             .with_context(|| format!("Failed to parse user state response: {}", response_text))?;
 
-        debug!("[HYPERLIQUID] Retrieved {} position(s)", user_state.asset_positions.len());
+        debug!(
+            "[HYPERLIQUID] Retrieved {} position(s)",
+            user_state.asset_positions.len()
+        );
 
         Ok(user_state)
     }

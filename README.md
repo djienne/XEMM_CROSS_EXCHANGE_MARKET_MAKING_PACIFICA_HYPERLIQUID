@@ -5,7 +5,7 @@ The main rationale is to use Hyperliquid's better liquidity, namely lower spread
 
 ## Architecture Overview
 
-The diagram below illustrates the bot’s trading idea. We arbitrage the fact that the bid–ask spread is often tighter on Hyperliquid than on Pacifica because Hyperliquid has better liquidity. This is better than classical taker-to-taker arbitrage because:
+The diagram below illustrates the bot's trading idea. We arbitrage the fact that the bid-ask spread is often tighter on Hyperliquid than on Pacifica because Hyperliquid has better liquidity. This is better than classical taker-to-taker arbitrage because:
 * there are more such opportunities
 * in taker-to-taker arbitrage, it is very hard or even impossible to compete on latency with professionals and exchanges
 * you are arbitraging your own limit order price, so you may have a latency advantage
@@ -17,7 +17,7 @@ Here, `profit_rate_bps` is actually a safety margin on top of a theoretically pr
 
 This bot is Inspired by Hummingbot's XEMM Strategy.
 
-**💰 Support this project**:
+**$ Support this project**:
 - **Hyperliquid**: Sign up with [this referral link](https://app.hyperliquid.xyz/join/FREQTRADE) for 10% fee reduction
 - **Pacifica**: Sign up at [app.pacifica.fi](https://app.pacifica.fi/) and use one of the following referral codes when registering (if one is already taken, try another):
   ```
@@ -32,12 +32,12 @@ This bot is Inspired by Hummingbot's XEMM Strategy.
 ## Features
 
 ### Core Trading
-- ✅ **Real-time Arbitrage Detection** - Monitors both exchanges simultaneously
-- ✅ **Automatic Order Placement** - Places limit orders on Pacifica when profitable
-- ✅ **Instant Hedging** - Executes market orders on Hyperliquid after fills
-- ✅ **Profit Monitoring** - Tracks and cancels orders if profit deviates
-- ✅ **Order Refresh** - Auto-cancels stale orders based on age
-- ✅ **Single-cycle Mode** - Exits after one successful arbitrage cycle
+- OK **Real-time Arbitrage Detection** - Monitors both exchanges simultaneously
+- OK **Automatic Order Placement** - Places limit orders on Pacifica when profitable
+- OK **Instant Hedging** - Executes market orders on Hyperliquid after fills
+- OK **Profit Monitoring** - Tracks and cancels orders if profit deviates
+- OK **Order Refresh** - Auto-cancels stale orders based on age
+- OK **Single-cycle Mode** - Exits after one successful arbitrage cycle
 
 ### Fill Detection (5 Layers)
 
@@ -70,7 +70,7 @@ All methods deduplicate via shared HashSet to ensure only one hedge executes per
 - REST API positions (clearinghouse state for position verification)
 - EIP-712 authenticated trading (market orders)
 - Automatic slippage protection
-- **WebSocket trading for hedges (default)** – Hedge market orders are sent as signed `post` actions over the Hyperliquid WebSocket for minimal latency, with REST fallback on error.
+- **WebSocket trading for hedges (default)** - Hedge market orders are sent as signed `post` actions over the Hyperliquid WebSocket for minimal latency, with REST fallback on error.
 
 ### Hedge Execution Architecture
 
@@ -92,23 +92,23 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 
 - **Config toggle: WS vs REST**  
   - `Config.hyperliquid_use_ws_for_hedge` (default: `true`) controls the execution path:  
-    - `true` → use WebSocket for hedging, with REST fallback on error.  
-    - `false` → use REST-only hedging (original behavior).
+    - `true` -> use WebSocket for hedging, with REST fallback on error.  
+    - `false` -> use REST-only hedging (original behavior).
 
 ### Performance & Reliability
-- ✅ **Multi-source Orderbook** - WebSocket primary, REST API fallback
-- ✅ **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
-- ✅ **Auto-reconnect** - Exponential backoff on connection failures
-- ✅ **Concurrent Tasks** - 10 async tasks running in parallel
-- ✅ **High-frequency Monitoring** - 25ms profit checks, 100ms opportunity evaluation
-- ✅ **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
-- ✅ **Graceful Shutdown** - Cancels orders on Ctrl+C
+- OK **Multi-source Orderbook** - WebSocket primary, REST API fallback
+- OK **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
+- OK **Auto-reconnect** - Exponential backoff on connection failures
+- OK **Concurrent Tasks** - 10 async tasks running in parallel
+- OK **High-frequency Monitoring** - 25ms profit checks, 100ms opportunity evaluation
+- OK **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
+- OK **Graceful Shutdown** - Cancels orders on Ctrl+C
 
 ### User Interface
-- ✅ **Colorized Terminal Output** - Easy-to-read colored logs with section labels
-- ✅ **Visual Status Indicators** - Green ✓ for success, Red ✗ for errors, Yellow ⚠ for warnings
-- ✅ **Real-time Profit Display** - Color-coded profit changes (green = increasing, red = decreasing)
-- ✅ **Comprehensive Trade Summary** - Beautiful formatted summary with emojis and colors on completion
+- OK **Colorized Terminal Output** - Easy-to-read colored logs with section labels
+- OK **Visual Status Indicators** - Green OK for success, Red FAIL for errors, Yellow WARN for warnings
+- OK **Real-time Profit Display** - Color-coded profit changes (green = increasing, red = decreasing)
+- OK **Comprehensive Trade Summary** - Beautiful formatted summary with emojis and colors on completion
 
 ## Quick Start
 
@@ -248,7 +248,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
 | `profit_rate_bps` | 15.0 | Target profit in basis points (0.15%), should overcome fees, slippage, and latency |
 | `order_notional_usd` | 20.0 | Order size in USD |
-| `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates ±3 bps |
+| `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates +/-3 bps |
 | `order_refresh_interval_secs` | 60 | Auto-cancel orders older than 60s |
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
 | `hyperliquid_use_ws_for_hedge` | true | Use WebSocket for hedge execution (faster) vs REST |
@@ -558,9 +558,9 @@ The bot features colorized terminal output for easy monitoring:
   - `[SHUTDOWN]` - Yellow (cleanup)
 
 - **Status Indicators**:
-  - ✓ Green - Success
-  - ✗ Red - Error/Failure
-  - ⚠ Yellow - Warning
+  - OK Green - Success
+  - FAIL Red - Error/Failure
+  - WARN Yellow - Warning
 
 - **Trading Data**:
   - Prices: Cyan
@@ -573,12 +573,12 @@ The bot features colorized terminal output for easy monitoring:
 
 ### Example Output
 ```
-[INIT] ✓ Credentials loaded successfully
-[OPPORTUNITY] BUY @ $156.12 → HL $156.35 | Profit: 12.50 bps
-[ORDER] ✓ Placed BUY #12345 @ $156.12 | cloid: abc123...xyz9
-[FILL_DETECTION] ✓ FULL FILL: buy 0.1281 SOL @ $156.12
+[INIT] OK Credentials loaded successfully
+[OPPORTUNITY] BUY @ $156.12 -> HL $156.35 | Profit: 12.50 bps
+[ORDER] OK Placed BUY #12345 @ $156.12 | cloid: abc123...xyz9
+[FILL_DETECTION] OK FULL FILL: buy 0.1281 SOL @ $156.12
 [SOL HEDGE] Executing SELL 0.1281 on Hyperliquid
-[SOL HEDGE] ✓ Hedge executed successfully
+[SOL HEDGE] OK Hedge executed successfully
 ═══════════════════════════════════════════════════
   BOT CYCLE COMPLETE!
 ═══════════════════════════════════════════════════

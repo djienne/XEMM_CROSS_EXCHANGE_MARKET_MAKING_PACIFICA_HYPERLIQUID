@@ -273,7 +273,7 @@ function formatNumber(num, decimals = 2) {
 const Header = ({ lastUpdate, hlConnected, hlReconnecting, pacConnected, pacReconnecting, errorCount }) => {
   const StatusBadge = ({ label, connected, reconnecting }) => {
     const color = reconnecting ? 'yellow' : connected ? 'green' : 'red';
-    const icon = reconnecting ? '🔄' : connected ? '●' : '○';
+    const icon = reconnecting ? '' : connected ? '*' : 'o';
     return h(Text, { color }, `${icon} ${label} `);
   };
 
@@ -287,7 +287,7 @@ const Header = ({ lastUpdate, hlConnected, hlReconnecting, pacConnected, pacReco
       h(Text, { color: 'gray' }, '| '),
       h(StatusBadge, { label: 'Pacifica', connected: pacConnected, reconnecting: pacReconnecting }),
       h(Spacer),
-      errorCount > 0 && h(Text, { color: 'red', bold: true }, `⚠️ Errors: ${errorCount}`)
+      errorCount > 0 && h(Text, { color: 'red', bold: true }, `WARN Errors: ${errorCount}`)
     )
   );
 };

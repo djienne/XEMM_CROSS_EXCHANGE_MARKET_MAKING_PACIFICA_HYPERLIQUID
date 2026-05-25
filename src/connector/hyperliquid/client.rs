@@ -80,10 +80,7 @@ impl OrderbookClient {
                     } else {
                         std::cmp::min(2_u64.pow(reconnect_count - 1), 30)
                     };
-                    warn!(
-                        "[HYPERLIQUID] Reconnecting in {} seconds...",
-                        backoff_secs
-                    );
+                    warn!("[HYPERLIQUID] Reconnecting in {} seconds...", backoff_secs);
                     sleep(Duration::from_secs(backoff_secs)).await;
                 }
             }
@@ -118,7 +115,10 @@ impl OrderbookClient {
         let subscribe_json = serde_json::to_string(&subscribe_msg)?;
         debug!("[HYPERLIQUID] Sending subscription: {}", subscribe_json);
         write.send(Message::Text(subscribe_json)).await?;
-        info!("[HYPERLIQUID] Subscribed to l2Book for {}", self.config.coin);
+        info!(
+            "[HYPERLIQUID] Subscribed to l2Book for {}",
+            self.config.coin
+        );
 
         // Create interval for ping
         let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
@@ -222,7 +222,10 @@ impl OrderbookClient {
 
 impl Drop for OrderbookClient {
     fn drop(&mut self) {
-        info!("[HYPERLIQUID] OrderbookClient dropped for coin: {}", self.config.coin);
+        info!(
+            "[HYPERLIQUID] OrderbookClient dropped for coin: {}",
+            self.config.coin
+        );
     }
 }
 
@@ -235,6 +238,7 @@ impl crate::services::price_source::PriceStream for OrderbookClient {
         &mut self,
         mut cb: crate::services::price_source::BookCallback,
     ) -> anyhow::Result<()> {
-        self.start(move |bid, ask, coin, ts| cb(bid, ask, coin, ts)).await
+        self.start(move |bid, ask, coin, ts| cb(bid, ask, coin, ts))
+            .await
     }
 }

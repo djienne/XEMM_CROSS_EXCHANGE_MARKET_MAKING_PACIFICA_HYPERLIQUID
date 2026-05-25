@@ -31,7 +31,7 @@ fi
 
 # Check if xemm_rust is already running
 if pgrep -f "xemm_rust" > /dev/null 2>&1; then
-    echo -e "${YELLOW}⚠️  WARNING: xemm_rust process is already running!${NC}"
+    echo -e "${YELLOW}WARN  WARNING: xemm_rust process is already running!${NC}"
     echo "Please stop the existing process before starting a new loop."
     echo ""
     echo "To view running processes:"
@@ -46,7 +46,7 @@ fi
 SCRIPT_NAME=$(basename "$0")
 RUNNING_INSTANCES=$(pgrep -f "$SCRIPT_NAME" | grep -v $$ | wc -l)
 if [ "$RUNNING_INSTANCES" -gt 0 ]; then
-    echo -e "${YELLOW}⚠️  WARNING: Another instance of $SCRIPT_NAME is already running!${NC}"
+    echo -e "${YELLOW}WARN  WARNING: Another instance of $SCRIPT_NAME is already running!${NC}"
     echo "Please stop the existing loop before starting a new one."
     echo ""
     echo "To view running loop processes:"
@@ -82,11 +82,11 @@ while true; do
     # Run the bot with cargo run
     if cargo run $BUILD_FLAG; then
         echo ""
-        echo -e "${GREEN}✓ Cycle #${CYCLE} completed successfully${NC}"
+        echo -e "${GREEN}OK Cycle #${CYCLE} completed successfully${NC}"
     else
         EXIT_CODE=$?
         echo ""
-        echo -e "${RED}✗ Cycle #${CYCLE} failed with exit code ${EXIT_CODE}${NC}"
+        echo -e "${RED}FAIL Cycle #${CYCLE} failed with exit code ${EXIT_CODE}${NC}"
         echo -e "${YELLOW}Continuing to next cycle after delay...${NC}"
     fi
 

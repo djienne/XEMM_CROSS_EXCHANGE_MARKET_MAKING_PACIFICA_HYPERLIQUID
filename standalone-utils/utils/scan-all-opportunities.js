@@ -320,7 +320,7 @@ async function main() {
     console.log('[1/5] Connecting to exchanges...');
     await hyperliquid.connect();
     await pacifica.connect();
-    console.log('✅ Connected to Hyperliquid and Pacifica\n');
+    console.log('OK Connected to Hyperliquid and Pacifica\n');
 
     // Step 2: Fetch available symbols from both exchanges
     console.log('[2/5] Fetching available symbols...');
@@ -337,10 +337,10 @@ async function main() {
 
     // Find common symbols
     const commonSymbols = [...hlSymbols].filter(s => pacSymbols.has(s));
-    console.log(`✅ Found ${commonSymbols.length} common symbols\n`);
+    console.log(`OK Found ${commonSymbols.length} common symbols\n`);
 
     if (commonSymbols.length === 0) {
-      console.error('❌ No common symbols found between exchanges');
+      console.error('ERROR No common symbols found between exchanges');
       process.exit(1);
     }
 
@@ -364,14 +364,14 @@ async function main() {
         await hyperliquid.subscribeOrderbook(symbol);
         await pacifica.subscribeOrderbook(symbol);
       } catch (error) {
-        console.error(`  ⚠️  Failed to subscribe to ${symbol}: ${error.message}`);
+        console.error(`  WARN  Failed to subscribe to ${symbol}: ${error.message}`);
       }
     }
 
     // Wait for initial orderbook data
     console.log('Waiting 3 seconds for orderbook data...');
     await new Promise(resolve => setTimeout(resolve, 3000));
-    console.log('✅ Subscriptions complete\n');
+    console.log('OK Subscriptions complete\n');
 
     // Step 5: Scan for opportunities
     console.log('[5/5] Scanning for opportunities...');
@@ -415,9 +415,9 @@ async function main() {
     const summary = stats.getSummary();
 
     if (summary.length === 0) {
-      console.log('\n❌ No opportunities found during scan period\n');
+      console.log('\nERROR No opportunities found during scan period\n');
     } else {
-      console.log(`\n✅ Found opportunities in ${summary.length} symbols\n`);
+      console.log(`\nOK Found opportunities in ${summary.length} symbols\n`);
 
       // Top 10 symbols by opportunity count
       console.log('─'.repeat(80));
@@ -495,21 +495,21 @@ async function main() {
     if (summary.length > 0) {
       try {
         const reportFile = saveMarkdownReport(summary, evaluationCount, symbolsToScan.length, SCAN_DURATION_MINUTES);
-        console.log(`📄 Report saved: ${reportFile}\n`);
+        console.log(`REPORT Report saved: ${reportFile}\n`);
       } catch (error) {
-        console.error(`⚠️  Failed to save report: ${error.message}`);
+        console.error(`WARN  Failed to save report: ${error.message}`);
       }
     }
 
   } catch (error) {
-    console.error('\n❌ Error:', error.message);
+    console.error('\nERROR Error:', error.message);
     console.error(error.stack);
   } finally {
     // Cleanup
     console.log('Disconnecting...');
     hyperliquid.disconnect();
     pacifica.disconnect();
-    console.log('✅ Done\n');
+    console.log('OK Done\n');
   }
 }
 

@@ -14,7 +14,6 @@
 ///   --symbol <SYMBOL> - Symbol to check (default: all positions)
 ///   --threshold <USD> - Minimum notional value to rebalance (default: 13.0)
 ///   --dry-run - Check positions without executing rebalance
-
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::env;
@@ -33,9 +32,19 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!("{}", "  Position Rebalancer".bright_cyan().bold());
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!();
 
     // Parse command-line arguments
@@ -58,8 +67,7 @@ async fn main() -> Result<()> {
             }
             "--threshold" => {
                 if i + 1 < args.len() {
-                    threshold_usd = args[i + 1].parse()
-                        .context("Invalid threshold value")?;
+                    threshold_usd = args[i + 1].parse().context("Invalid threshold value")?;
                     i += 2;
                 } else {
                     eprintln!("Error: --threshold requires a value");
@@ -72,53 +80,83 @@ async fn main() -> Result<()> {
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
-                eprintln!("Usage: cargo run --example rebalancer [--symbol SYMBOL] [--threshold USD] [--dry-run]");
+                eprintln!(
+                    "Usage: cargo run --example rebalancer [--symbol SYMBOL] [--threshold USD] [--dry-run]"
+                );
                 std::process::exit(1);
             }
         }
     }
 
-    println!("{} Threshold: {}", "[CONFIG]".blue().bold(), format!("${:.2}", threshold_usd).bright_white());
+    println!(
+        "{} Threshold: {}",
+        "[CONFIG]".blue().bold(),
+        format!("${:.2}", threshold_usd).bright_white()
+    );
     if let Some(ref symbol) = target_symbol {
-        println!("{} Target Symbol: {}", "[CONFIG]".blue().bold(), symbol.bright_white().bold());
+        println!(
+            "{} Target Symbol: {}",
+            "[CONFIG]".blue().bold(),
+            symbol.bright_white().bold()
+        );
     } else {
-        println!("{} Target: {}", "[CONFIG]".blue().bold(), "All positions".bright_white());
+        println!(
+            "{} Target: {}",
+            "[CONFIG]".blue().bold(),
+            "All positions".bright_white()
+        );
     }
     if dry_run {
-        println!("{} Mode: {}", "[CONFIG]".blue().bold(), "DRY RUN (no trades)".yellow().bold());
+        println!(
+            "{} Mode: {}",
+            "[CONFIG]".blue().bold(),
+            "DRY RUN (no trades)".yellow().bold()
+        );
     }
     println!();
 
     // Load credentials
     dotenv::dotenv().ok();
-    let hl_credentials = HyperliquidCredentials::from_env()
-        .context("Failed to load Hyperliquid credentials")?;
-    let hl_wallet = env::var("HL_WALLET")
-        .context("HL_WALLET environment variable not set")?;
+    let hl_credentials =
+        HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials")?;
+    let hl_wallet = env::var("HL_WALLET").context("HL_WALLET environment variable not set")?;
 
-    println!("{} Hyperliquid wallet: {}", "[INIT]".cyan().bold(), hl_wallet.bright_white());
+    println!(
+        "{} Hyperliquid wallet: {}",
+        "[INIT]".cyan().bold(),
+        hl_wallet.bright_white()
+    );
 
     // Initialize trading client
     let hl_trading = HyperliquidTrading::new(hl_credentials, false)
         .context("Failed to create Hyperliquid trading client")?;
 
-    println!("{} {} Trading client initialized", "[INIT]".cyan().bold(), "✓".green().bold());
+    println!(
+        "{} {} Trading client initialized",
+        "[INIT]".cyan().bold(),
+        "OK".green().bold()
+    );
     println!();
 
     // Fetch user state (positions)
     println!("{} Fetching positions...", "[CHECK]".magenta().bold());
-    let user_state = hl_trading.get_user_state(&hl_wallet).await
+    let user_state = hl_trading
+        .get_user_state(&hl_wallet)
+        .await
         .context("Failed to fetch user state")?;
 
-    println!("{} {} Found {} position(s)",
+    println!(
+        "{} {} Found {} position(s)",
         "[CHECK]".magenta().bold(),
-        "✓".green().bold(),
+        "OK".green().bold(),
         user_state.asset_positions.len()
     );
     println!();
 
     // Filter positions by symbol if specified
-    let positions_to_check: Vec<_> = user_state.asset_positions.iter()
+    let positions_to_check: Vec<_> = user_state
+        .asset_positions
+        .iter()
         .filter(|pos| {
             if let Some(ref symbol) = target_symbol {
                 &pos.position.coin == symbol
@@ -131,7 +169,10 @@ async fn main() -> Result<()> {
     if positions_to_check.is_empty() {
         println!("{} No positions found", "[RESULT]".bright_green().bold());
         if let Some(ref symbol) = target_symbol {
-            println!("  Symbol {} has no open position", symbol.bright_white().bold());
+            println!(
+                "  Symbol {} has no open position",
+                symbol.bright_white().bold()
+            );
         }
         return Ok(());
     }
@@ -147,23 +188,41 @@ async fn main() -> Result<()> {
         let position_value: f64 = pos.position_value.parse().unwrap_or(0.0);
         let notional = position_value.abs();
 
-        println!("{}", "─────────────────────────────────────────────────".bright_black());
-        println!("{} {}", "Symbol:".bright_white(), symbol.bright_white().bold());
-        println!("{} {} ({})",
+        println!(
+            "{}",
+            "─────────────────────────────────────────────────".bright_black()
+        );
+        println!(
+            "{} {}",
+            "Symbol:".bright_white(),
+            symbol.bright_white().bold()
+        );
+        println!(
+            "{} {} ({})",
             "Position:".bright_white(),
             format!("{:.4}", position_size).bright_white(),
-            if position_size > 0.0 { "LONG".green() } else { "SHORT".red() }
+            if position_size > 0.0 {
+                "LONG".green()
+            } else {
+                "SHORT".red()
+            }
         );
-        println!("{} {}",
+        println!(
+            "{} {}",
             "Notional:".bright_white(),
             format!("${:.2}", notional).cyan().bold()
         );
 
         if let Some(entry_px) = &pos.entry_px {
-            println!("{} {}", "Entry:".bright_white(), format!("${}", entry_px).cyan());
+            println!(
+                "{} {}",
+                "Entry:".bright_white(),
+                format!("${}", entry_px).cyan()
+            );
         }
 
-        println!("{} {}",
+        println!(
+            "{} {}",
             "Unrealized PnL:".bright_white(),
             if pos.unrealized_pnl.starts_with('-') {
                 pos.unrealized_pnl.red()
@@ -174,17 +233,19 @@ async fn main() -> Result<()> {
 
         // Check if position needs rebalancing
         if position_size == 0.0 {
-            println!("{} {} No position to rebalance",
+            println!(
+                "{} {} No position to rebalance",
                 "[STATUS]".bright_blue().bold(),
-                "○".bright_black()
+                "o".bright_black()
             );
             continue;
         }
 
         if notional < threshold_usd {
-            println!("{} {} Position below threshold (${:.2} < ${:.2})",
+            println!(
+                "{} {} Position below threshold (${:.2} < ${:.2})",
                 "[STATUS]".bright_blue().bold(),
-                "○".bright_black(),
+                "o".bright_black(),
                 notional,
                 threshold_usd
             );
@@ -192,17 +253,19 @@ async fn main() -> Result<()> {
         }
 
         // Position needs rebalancing
-        println!("{} {} Position EXCEEDS threshold (${:.2} > ${:.2})",
+        println!(
+            "{} {} Position EXCEEDS threshold (${:.2} > ${:.2})",
             "[REBALANCE]".bright_yellow().bold(),
-            "⚠".yellow().bold(),
+            "WARN".yellow().bold(),
             notional,
             threshold_usd
         );
 
         if dry_run {
-            println!("{} {} DRY RUN - Would close {} position of {:.4} {}",
+            println!(
+                "{} {} DRY RUN - Would close {} position of {:.4} {}",
                 "[REBALANCE]".bright_yellow().bold(),
-                "◉".yellow(),
+                "*".yellow(),
                 if position_size > 0.0 { "LONG" } else { "SHORT" },
                 position_size.abs(),
                 symbol.bright_white().bold()
@@ -213,7 +276,10 @@ async fn main() -> Result<()> {
         }
 
         // Execute rebalance: close position with market order
-        println!("{} Executing rebalance...", "[REBALANCE]".bright_yellow().bold());
+        println!(
+            "{} Executing rebalance...",
+            "[REBALANCE]".bright_yellow().bold()
+        );
 
         // To close a position:
         // - If LONG (positive position), SELL to close
@@ -231,38 +297,57 @@ async fn main() -> Result<()> {
             println!("  Current market: bid=${:.4}, ask=${:.4}", bid, ask);
         }
 
-        match hl_trading.place_market_order(
-            symbol,
-            is_buy,
-            close_size,
-            0.05, // 5% slippage tolerance
-            false, // not reduce_only (we want to fully close)
-            current_bid,
-            current_ask,
-        ).await {
+        match hl_trading
+            .place_market_order(
+                symbol,
+                is_buy,
+                close_size,
+                0.05,  // 5% slippage tolerance
+                false, // not reduce_only (we want to fully close)
+                current_bid,
+                current_ask,
+            )
+            .await
+        {
             Ok(response) => {
-                println!("{} {} Successfully closed {} position",
+                println!(
+                    "{} {} Successfully closed {} position",
                     "[REBALANCE]".bright_yellow().bold(),
-                    "✓".green().bold(),
+                    "OK".green().bold(),
                     if is_buy { "SHORT" } else { "LONG" }
                 );
 
                 // Extract fill price from response
-                if let Some(status) = response.response.data.statuses.first() {
+                let statuses = match &response.response {
+                    xemm_rust::connector::hyperliquid::OrderResponseContent::Success(data) => {
+                        &data.data.statuses
+                    }
+                    xemm_rust::connector::hyperliquid::OrderResponseContent::Error(error) => {
+                        println!("  Hyperliquid response error: {}", error);
+                        continue;
+                    }
+                };
+                if let Some(status) = statuses.first() {
                     match status {
                         xemm_rust::connector::hyperliquid::OrderStatus::Filled { filled } => {
-                            let avg_px: f64 = filled.avgPx.parse().unwrap_or(0.0);
-                            let total_sz: f64 = filled.totalSz.parse().unwrap_or(0.0);
-                            println!("  Fill: {} {} @ ${:.4}",
-                                if is_buy { "BOUGHT".green() } else { "SOLD".red() },
+                            let avg_px: f64 = filled.avg_px.parse().unwrap_or(0.0);
+                            let total_sz: f64 = filled.total_sz.parse().unwrap_or(0.0);
+                            println!(
+                                "  Fill: {} {} @ ${:.4}",
+                                if is_buy {
+                                    "BOUGHT".green()
+                                } else {
+                                    "SOLD".red()
+                                },
                                 format!("{:.4}", total_sz).bright_white(),
                                 avg_px
                             );
                         }
                         xemm_rust::connector::hyperliquid::OrderStatus::Error { error } => {
-                            println!("{} {} Order failed: {}",
+                            println!(
+                                "{} {} Order failed: {}",
                                 "[REBALANCE]".bright_yellow().bold(),
-                                "✗".red().bold(),
+                                "FAIL".red().bold(),
                                 error.red()
                             );
                         }
@@ -274,9 +359,10 @@ async fn main() -> Result<()> {
                 total_rebalanced_notional += notional;
             }
             Err(e) => {
-                println!("{} {} Failed to close position: {}",
+                println!(
+                    "{} {} Failed to close position: {}",
                     "[REBALANCE]".bright_yellow().bold(),
-                    "✗".red().bold(),
+                    "FAIL".red().bold(),
                     e.to_string().red()
                 );
             }
@@ -285,30 +371,44 @@ async fn main() -> Result<()> {
 
     // Summary
     println!();
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!("{}", "  Rebalancing Summary".bright_cyan().bold());
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!();
 
     if rebalanced_count == 0 {
-        println!("{} {} No positions required rebalancing",
+        println!(
+            "{} {} No positions required rebalancing",
             "[SUMMARY]".bright_green().bold(),
-            "✓".green().bold()
+            "OK".green().bold()
         );
     } else {
-        println!("{} {} Rebalanced {} position(s)",
+        println!(
+            "{} {} Rebalanced {} position(s)",
             "[SUMMARY]".bright_green().bold(),
-            "✓".green().bold(),
+            "OK".green().bold(),
             rebalanced_count
         );
-        println!("  Total notional: {}",
+        println!(
+            "  Total notional: {}",
             format!("${:.2}", total_rebalanced_notional).cyan().bold()
         );
 
         if dry_run {
             println!();
-            println!("{} This was a DRY RUN - no actual trades were executed",
-                "⚠".yellow().bold()
+            println!(
+                "{} This was a DRY RUN - no actual trades were executed",
+                "WARN".yellow().bold()
             );
             println!("  Run without --dry-run to execute rebalancing");
         }

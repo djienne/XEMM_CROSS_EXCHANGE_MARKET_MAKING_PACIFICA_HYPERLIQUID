@@ -1,9 +1,6 @@
-mod connector;
-mod config;
-
-use config::Config;
-use connector::pacifica::{OrderbookClient, OrderbookConfig};
 use tracing::info;
+use xemm_rust::config::Config;
+use xemm_rust::connector::pacifica::{OrderbookClient, OrderbookConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,16 +9,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
     // Load configuration from config.json
-    let config = Config::load_default()
-        .unwrap_or_else(|e| {
-            info!("Failed to load config.json: {}. Using default config.", e);
-            Config::default()
-        });
+    let config = Config::load_default().unwrap_or_else(|e| {
+        info!("Failed to load config.json: {}. Using default config.", e);
+        Config::default()
+    });
 
     // Validate configuration
     if let Err(e) = config.validate() {
@@ -49,7 +45,14 @@ async fn main() -> anyhow::Result<()> {
     info!("  Network: Mainnet");
     info!("  Ping Interval: {}s", config.ping_interval_secs);
     info!("  Max Reconnect Attempts: {}", config.reconnect_attempts);
-    info!("  Low Latency Mode: {}", if config.low_latency_mode { "ENABLED" } else { "DISABLED" });
+    info!(
+        "  Low Latency Mode: {}",
+        if config.low_latency_mode {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
     info!("════════════════════════════════════════════");
     info!("Starting PACIFICA orderbook stream...");
     info!("Press Ctrl+C to stop");
@@ -61,38 +64,46 @@ async fn main() -> anyhow::Result<()> {
     if low_latency {
         // Low-latency mode: minimal processing, log every 100th update
         let mut update_count = 0u64;
-        client.start(move |best_bid, best_ask, symbol, timestamp| {
-            update_count += 1;
+        client
+            .start(
+                move |best_bid: String, best_ask: String, symbol: String, timestamp: u64| {
+                    update_count += 1;
 
-            // Only log every 100th update to reduce I/O overhead
-            if update_count % 100 == 0 {
-                info!(
-                    "[PACIFICA] {} | Bid: ${} | Ask: ${} | TS: {} | Updates: {}",
-                    symbol, best_bid, best_ask, timestamp, update_count
-                );
-            }
+                    // Only log every 100th update to reduce I/O overhead
+                    if update_count % 100 == 0 {
+                        info!(
+                            "[PACIFICA] {} | Bid: ${} | Ask: ${} | TS: {} | Updates: {}",
+                            symbol, best_bid, best_ask, timestamp, update_count
+                        );
+                    }
 
-            // In production, you would send data to a channel or store for processing
-            // instead of logging every update
-        }).await?;
+                    // In production, you would send data to a channel or store for processing
+                    // instead of logging every update
+                },
+            )
+            .await?;
     } else {
         // Normal mode: full logging with spread calculations
-        client.start(|best_bid, best_ask, symbol, timestamp| {
-            // Calculate spread
-            let bid_price: f64 = best_bid.parse().unwrap_or(0.0);
-            let ask_price: f64 = best_ask.parse().unwrap_or(0.0);
-            let spread = ask_price - bid_price;
-            let spread_bps = if bid_price > 0.0 {
-                (spread / bid_price) * 10000.0
-            } else {
-                0.0
-            };
+        client
+            .start(
+                |best_bid: String, best_ask: String, symbol: String, timestamp: u64| {
+                    // Calculate spread
+                    let bid_price: f64 = best_bid.parse().unwrap_or(0.0);
+                    let ask_price: f64 = best_ask.parse().unwrap_or(0.0);
+                    let spread = ask_price - bid_price;
+                    let spread_bps = if bid_price > 0.0 {
+                        (spread / bid_price) * 10000.0
+                    } else {
+                        0.0
+                    };
 
-            info!(
-                "[PACIFICA] {} | Bid: ${} | Ask: ${} | Spread: ${:.2} ({:.2} bps) | TS: {}",
-                symbol, best_bid, best_ask, spread, spread_bps, timestamp
-            );
-        }).await?;
+                    info!(
+                        "[PACIFICA] {} | Bid: ${} | Ask: ${} | Spread: ${:.2} ({:.2} bps) | TS: {}",
+                        symbol, best_bid, best_ask, spread, spread_bps, timestamp
+                    );
+                },
+            )
+            .await?;
     }
 
     Ok(())

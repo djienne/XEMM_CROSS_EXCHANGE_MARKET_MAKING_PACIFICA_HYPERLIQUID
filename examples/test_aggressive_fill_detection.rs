@@ -24,7 +24,6 @@
 /// - One or more detection methods trigger
 /// - Only ONE hedge executes (deduplication works)
 /// - Position returns to flat after hedge
-
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashSet;
@@ -34,18 +33,18 @@ use tokio::time::{interval, sleep, Duration, Instant};
 use tracing::{debug, info, warn};
 
 use xemm_rust::config::Config;
-use xemm_rust::connector::pacifica::{
-    FillDetectionClient, FillDetectionConfig, FillEvent,
-    OpenOrderItem, OrderSide as PacificaOrderSide, PacificaCredentials, PacificaTrading, PacificaWsTrading,
-};
 use xemm_rust::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
+use xemm_rust::connector::pacifica::{
+    FillDetectionClient, FillDetectionConfig, FillEvent, OpenOrderItem,
+    OrderSide as PacificaOrderSide, PacificaCredentials, PacificaTrading, PacificaWsTrading,
+};
 use xemm_rust::strategy::OrderSide;
 
 /// Track which detection method found the fill first
 #[derive(Debug, Clone)]
 enum DetectionMethod {
     WebSocket,
-    WebSocketPosition,  // Position-based fill detection via WebSocket
+    WebSocketPosition, // Position-based fill detection via WebSocket
     RestOrderPoll,
     PositionMonitor,
     MonitorPreCancel,
@@ -68,7 +67,12 @@ async fn main() -> Result<()> {
         .init();
 
     println!("{}", "═".repeat(80).bright_cyan());
-    println!("{}", "  Test Aggressive Fill Detection - All 5 Methods".bright_white().bold());
+    println!(
+        "{}",
+        "  Test Aggressive Fill Detection - All 5 Methods"
+            .bright_white()
+            .bold()
+    );
     println!("{}", "═".repeat(80).bright_cyan());
     println!();
 
@@ -78,17 +82,18 @@ async fn main() -> Result<()> {
     // Override notional for test (use $15 to ensure reasonable size)
     config.order_notional_usd = 15.0;
 
-    info!("{} Symbol: {}, Notional: ${}",
+    info!(
+        "{} Symbol: {}, Notional: ${}",
         "[CONFIG]".blue().bold(),
         config.symbol.bright_white().bold(),
         config.order_notional_usd.to_string().bright_white()
     );
 
     // Load credentials
-    let pacifica_creds = PacificaCredentials::from_env()
-        .context("Failed to load Pacifica credentials")?;
-    let hyperliquid_creds = HyperliquidCredentials::from_env()
-        .context("Failed to load Hyperliquid credentials")?;
+    let pacifica_creds =
+        PacificaCredentials::from_env().context("Failed to load Pacifica credentials")?;
+    let hyperliquid_creds =
+        HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials")?;
 
     info!("{} Credentials loaded", "[INIT]".cyan().bold());
 
@@ -102,15 +107,27 @@ async fn main() -> Result<()> {
     info!("{} Clients initialized", "[INIT]".cyan().bold());
 
     // Cancel all existing orders first
-    info!("{} Cancelling all existing orders...", "[INIT]".cyan().bold());
-    let cancelled = pacifica_trading.cancel_all_orders(false, Some(&config.symbol), false).await?;
-    info!("{} Cancelled {} existing order(s)", "[INIT]".green().bold(), cancelled);
+    info!(
+        "{} Cancelling all existing orders...",
+        "[INIT]".cyan().bold()
+    );
+    let cancelled = pacifica_trading
+        .cancel_all_orders(false, Some(&config.symbol), false)
+        .await?;
+    info!(
+        "{} Cancelled {} existing order(s)",
+        "[INIT]".green().bold(),
+        cancelled
+    );
 
     // Wait a moment for cancellations to settle
     sleep(Duration::from_secs(1)).await;
 
     // Fetch current market price
-    info!("{} Fetching current market price...", "[INIT]".cyan().bold());
+    info!(
+        "{} Fetching current market price...",
+        "[INIT]".cyan().bold()
+    );
     let (best_bid, best_ask) = pacifica_trading
         .get_best_bid_ask_rest(&config.symbol, 1)
         .await?
@@ -119,7 +136,8 @@ async fn main() -> Result<()> {
     let mid_price = (best_bid + best_ask) / 2.0;
     let spread_bps = ((best_ask - best_bid) / mid_price) * 10000.0;
 
-    info!("{} Market: Bid ${:.4}, Ask ${:.4}, Mid ${:.4}, Spread {:.2} bps",
+    info!(
+        "{} Market: Bid ${:.4}, Ask ${:.4}, Mid ${:.4}, Spread {:.2} bps",
         "[MARKET]".magenta().bold(),
         best_bid,
         best_ask,
@@ -157,7 +175,8 @@ async fn main() -> Result<()> {
     let size = config.order_notional_usd / rounded_price;
     let rounded_size = (size / lot_size).floor() * lot_size;
 
-    info!("{} Order: {} {} @ ${:.4} (notional: ${:.2})",
+    info!(
+        "{} Order: {} {} @ ${:.4} (notional: ${:.2})",
         "[ORDER]".bright_yellow().bold(),
         side.as_str().to_uppercase().green().bold(),
         rounded_size,
@@ -166,10 +185,15 @@ async fn main() -> Result<()> {
     );
 
     let price_vs_mid_bps = ((rounded_price - mid_price) / mid_price) * 10000.0;
-    info!("{} Price is {:.2} bps {} mid (aggressive for quick fill)",
+    info!(
+        "{} Price is {:.2} bps {} mid (aggressive for quick fill)",
         "[STRATEGY]".bright_green().bold(),
         price_vs_mid_bps.abs(),
-        if price_vs_mid_bps < 0.0 { "below" } else { "above" }
+        if price_vs_mid_bps < 0.0 {
+            "below"
+        } else {
+            "above"
+        }
     );
 
     // Shared state for tracking detections
@@ -191,25 +215,37 @@ async fn main() -> Result<()> {
                 let amount: f64 = pos.amount.parse().unwrap_or(0.0);
                 let signed_amount = if pos.side == "bid" { amount } else { -amount };
                 *baseline_position.lock().await = Some((signed_amount, pos.side.clone()));
-                info!("{} Baseline position: {} {} (signed: {:.4})",
+                info!(
+                    "{} Baseline position: {} {} (signed: {:.4})",
                     "[POSITION]".magenta().bold(),
                     amount,
                     pos.side.bright_white(),
                     signed_amount
                 );
             } else {
-                info!("{} No existing position for {}", "[POSITION]".magenta().bold(), config.symbol);
+                info!(
+                    "{} No existing position for {}",
+                    "[POSITION]".magenta().bold(),
+                    config.symbol
+                );
                 *baseline_position.lock().await = Some((0.0, "none".to_string()));
             }
         }
         Err(e) => {
-            warn!("{} Failed to fetch baseline position: {}", "[POSITION]".yellow().bold(), e);
+            warn!(
+                "{} Failed to fetch baseline position: {}",
+                "[POSITION]".yellow().bold(),
+                e
+            );
             *baseline_position.lock().await = Some((0.0, "none".to_string()));
         }
     }
 
     println!();
-    info!("{} Starting fill detection monitors...", "[INIT]".cyan().bold());
+    info!(
+        "{} Starting fill detection monitors...",
+        "[INIT]".cyan().bold()
+    );
     println!();
 
     // ═══════════════════════════════════════════════════
@@ -226,7 +262,7 @@ async fn main() -> Result<()> {
         account: pacifica_creds.account.clone(),
         reconnect_attempts: 3,
         ping_interval_secs: 15,
-        enable_position_fill_detection: true,  // Enable position-based fill detection
+        enable_position_fill_detection: true, // Enable position-based fill detection
     };
 
     let mut fill_client = FillDetectionClient::new(fill_config, false)?;
@@ -267,7 +303,7 @@ async fn main() -> Result<()> {
 
                                     info!("{} {} DETECTED: {} {} @ {}",
                                         "[WS_FILL]".bright_magenta().bold(),
-                                        "✓".green().bold(),
+                                        "OK".green().bold(),
                                         side.bright_white(),
                                         fill_size,
                                         avg_price.cyan()
@@ -321,9 +357,9 @@ async fn main() -> Result<()> {
                                     let fill_size: f64 = filled_amount.parse().unwrap_or(0.0);
 
                                     if cross_validated {
-                                        info!("{} {} POSITION FILL (cross-validated): {} {} @ {} | Δ: {} → {}",
+                                        info!("{} {} POSITION FILL (cross-validated): {} {} @ {} | delta: {} -> {}",
                                             "[WS_POS_FILL]".bright_blue().bold(),
-                                            "✓".green().bold(),
+                                            "OK".green().bold(),
                                             side.bright_white(),
                                             fill_size,
                                             avg_price.cyan(),
@@ -331,9 +367,9 @@ async fn main() -> Result<()> {
                                             new_position
                                         );
                                     } else {
-                                        warn!("{} {} POSITION FILL (MISSED BY PRIMARY!): {} {} @ {} | Δ: {} → {}",
+                                        warn!("{} {} POSITION FILL (MISSED BY PRIMARY!): {} {} @ {} | delta: {} -> {}",
                                             "[WS_POS_FILL]".bright_yellow().bold(),
-                                            "⚠".yellow().bold(),
+                                            "WARN".yellow().bold(),
                                             side.bright_white(),
                                             fill_size,
                                             avg_price.cyan(),
@@ -412,9 +448,10 @@ async fn main() -> Result<()> {
                                 processed.insert(fill_id);
                                 drop(processed);
 
-                                info!("{} {} DETECTED: fill delta {:.4} (total {:.4})",
+                                info!(
+                                    "{} {} DETECTED: fill delta {:.4} (total {:.4})",
                                     "[REST_POLL]".bright_cyan().bold(),
-                                    "✓".green().bold(),
+                                    "OK".green().bold(),
                                     delta,
                                     current_filled
                                 );
@@ -434,7 +471,10 @@ async fn main() -> Result<()> {
                                     OrderSide::Sell
                                 };
 
-                                hedge_tx_rest.send((order_side, delta, cloid.clone())).await.ok();
+                                hedge_tx_rest
+                                    .send((order_side, delta, cloid.clone()))
+                                    .await
+                                    .ok();
                             }
 
                             last_filled_amount = current_filled;
@@ -487,7 +527,11 @@ async fn main() -> Result<()> {
                     let current_position = positions.iter().find(|p| p.symbol == symbol_pos);
                     let current_signed = if let Some(pos) = current_position {
                         let amount: f64 = pos.amount.parse().unwrap_or(0.0);
-                        if pos.side == "bid" { amount } else { -amount }
+                        if pos.side == "bid" {
+                            amount
+                        } else {
+                            -amount
+                        }
                     } else {
                         0.0
                     };
@@ -502,9 +546,10 @@ async fn main() -> Result<()> {
                             processed.insert(fill_id);
                             drop(processed);
 
-                            info!("{} {} DETECTED: position delta {:.4} ({:.4} → {:.4})",
+                            info!(
+                                "{} {} DETECTED: position delta {:.4} ({:.4} -> {:.4})",
                                 "[POSITION]".bright_cyan().bold(),
-                                "✓".green().bold(),
+                                "OK".green().bold(),
                                 delta.abs(),
                                 baseline_signed,
                                 current_signed
@@ -525,7 +570,10 @@ async fn main() -> Result<()> {
                                 OrderSide::Sell
                             };
 
-                            hedge_tx_pos.send((order_side, delta.abs(), cloid.clone())).await.ok();
+                            hedge_tx_pos
+                                .send((order_side, delta.abs(), cloid.clone()))
+                                .await
+                                .ok();
                         }
                     }
                 }
@@ -541,7 +589,10 @@ async fn main() -> Result<()> {
 
     println!();
     info!("{}", "═".repeat(80).bright_cyan());
-    info!("{} PLACING AGGRESSIVE ORDER", "[TEST]".bright_yellow().bold());
+    info!(
+        "{} PLACING AGGRESSIVE ORDER",
+        "[TEST]".bright_yellow().bold()
+    );
     info!("{}", "═".repeat(80).bright_cyan());
     println!();
 
@@ -551,43 +602,49 @@ async fn main() -> Result<()> {
             &config.symbol,
             side,
             rounded_size,
-            Some(rounded_price),  // Explicit price
-            1.0,                   // mid_price_offset_pct (not used since price is Some)
-            Some(best_bid),        // current_bid
-            Some(best_ask),        // current_ask
+            Some(rounded_price), // Explicit price
+            1.0,                 // mid_price_offset_pct (not used since price is Some)
+            Some(best_bid),      // current_bid
+            Some(best_ask),      // current_ask
         )
         .await?;
 
-    let client_order_id = result.client_order_id.clone()
+    let client_order_id = result
+        .client_order_id
+        .clone()
         .context("No client_order_id in response")?;
     *placed_order_id.write().await = Some(client_order_id.clone());
 
-    info!("{} {} Order placed successfully!",
+    info!(
+        "{} {} Order placed successfully!",
         "[ORDER]".bright_yellow().bold(),
-        "✓".green().bold()
+        "OK".green().bold()
     );
     if let Some(oid) = result.order_id {
-        info!("{} Order ID: {}",
+        info!(
+            "{} Order ID: {}",
             "[ORDER]".bright_yellow().bold(),
             oid.to_string().bright_white()
         );
     }
-    info!("{} Client Order ID: {}",
+    info!(
+        "{} Client Order ID: {}",
         "[ORDER]".bright_yellow().bold(),
         client_order_id.bright_white()
     );
 
     println!();
-    info!("{} Waiting for fill detection... (max 5 minutes)", "[TEST]".bright_cyan().bold());
+    info!(
+        "{} Waiting for fill detection... (max 5 minutes)",
+        "[TEST]".bright_cyan().bold()
+    );
     println!();
 
     // Wait for hedge trigger (with timeout)
     let test_start = Instant::now();
     let max_wait = Duration::from_secs(300); // 5 minutes
 
-    let hedge_result = tokio::time::timeout(max_wait, async {
-        hedge_rx.recv().await
-    }).await;
+    let hedge_result = tokio::time::timeout(max_wait, async { hedge_rx.recv().await }).await;
 
     match hedge_result {
         Ok(Some((hedge_side, hedge_size, hedge_cloid))) => {
@@ -601,7 +658,8 @@ async fn main() -> Result<()> {
             info!("{}", "═".repeat(80).bright_green());
             println!();
 
-            info!("{} Side: {}, Size: {:.4}, Time: {:.3}s",
+            info!(
+                "{} Side: {}, Size: {:.4}, Time: {:.3}s",
                 "[HEDGE]".bright_magenta().bold(),
                 hedge_side.as_str().to_uppercase().bright_white(),
                 hedge_size,
@@ -614,24 +672,30 @@ async fn main() -> Result<()> {
             let events = detection_events.lock().await;
 
             println!();
-            info!("{} Detection Methods Summary:", "[ANALYSIS]".bright_yellow().bold());
+            info!(
+                "{} Detection Methods Summary:",
+                "[ANALYSIS]".bright_yellow().bold()
+            );
             info!("{}", "─".repeat(60).bright_black());
 
             if events.is_empty() {
-                warn!("{} No detection events recorded (might have hedge triggered before tracking)",
-                    "⚠".yellow().bold());
+                warn!(
+                    "{} No detection events recorded (might have hedge triggered before tracking)",
+                    "WARN".yellow().bold()
+                );
             } else {
                 for (i, event) in events.iter().enumerate() {
                     let method_name = format!("{:?}", event.method);
                     let time_from_start = event.timestamp.duration_since(test_start);
 
                     let marker = if i == 0 {
-                        "🥇 FIRST".green().bold()
+                        "FIRST FIRST".green().bold()
                     } else {
                         format!("   #{}", i + 1).bright_black()
                     };
 
-                    info!("{} {} detected fill at {:.3}s",
+                    info!(
+                        "{} {} detected fill at {:.3}s",
                         marker,
                         method_name.bright_white(),
                         time_from_start.as_secs_f64()
@@ -641,18 +705,27 @@ async fn main() -> Result<()> {
 
             let hedge_was_triggered = *hedge_triggered.lock().await;
             println!();
-            info!("{} Hedge triggered: {}",
+            info!(
+                "{} Hedge triggered: {}",
                 "[RESULT]".bright_green().bold(),
-                if hedge_was_triggered { "YES ✓".green().bold() } else { "NO ✗".red().bold() }
+                if hedge_was_triggered {
+                    "YES OK".green().bold()
+                } else {
+                    "NO FAIL".red().bold()
+                }
             );
-            info!("{} Detection methods that fired: {}",
+            info!(
+                "{} Detection methods that fired: {}",
                 "[RESULT]".bright_green().bold(),
                 events.len().to_string().bright_white()
             );
 
             // Execute hedge on Hyperliquid
             println!();
-            info!("{} Executing hedge on Hyperliquid...", "[HEDGE]".bright_magenta().bold());
+            info!(
+                "{} Executing hedge on Hyperliquid...",
+                "[HEDGE]".bright_magenta().bold()
+            );
 
             let hl_side = match hedge_side {
                 OrderSide::Buy => OrderSide::Sell,
@@ -660,10 +733,14 @@ async fn main() -> Result<()> {
             };
 
             // Fetch current Hyperliquid prices for market order
-            info!("{} Fetching current Hyperliquid prices...", "[HEDGE]".bright_magenta().bold());
+            info!(
+                "{} Fetching current Hyperliquid prices...",
+                "[HEDGE]".bright_magenta().bold()
+            );
             let (hl_bid, hl_ask) = match hyperliquid_trading.get_l2_snapshot(&config.symbol).await {
                 Ok(Some((bid, ask))) => {
-                    info!("{} Hyperliquid prices: Bid ${:.4}, Ask ${:.4}",
+                    info!(
+                        "{} Hyperliquid prices: Bid ${:.4}, Ask ${:.4}",
                         "[HEDGE]".bright_magenta().bold(),
                         bid,
                         ask
@@ -671,13 +748,15 @@ async fn main() -> Result<()> {
                     (Some(bid), Some(ask))
                 }
                 Ok(None) => {
-                    warn!("{} No Hyperliquid prices available, using None (may fail)",
+                    warn!(
+                        "{} No Hyperliquid prices available, using None (may fail)",
                         "[HEDGE]".yellow().bold()
                     );
                     (None, None)
                 }
                 Err(e) => {
-                    warn!("{} Failed to fetch Hyperliquid prices: {}, using None",
+                    warn!(
+                        "{} Failed to fetch Hyperliquid prices: {}, using None",
                         "[HEDGE]".yellow().bold(),
                         e
                     );
@@ -686,21 +765,35 @@ async fn main() -> Result<()> {
             };
 
             let is_buy = matches!(hl_side, OrderSide::Buy);
-            match hyperliquid_trading.place_market_order(&config.symbol, is_buy, hedge_size, config.hyperliquid_slippage, false, hl_bid, hl_ask).await {
+            match hyperliquid_trading
+                .place_market_order(
+                    &config.symbol,
+                    is_buy,
+                    hedge_size,
+                    config.hyperliquid_slippage,
+                    false,
+                    hl_bid,
+                    hl_ask,
+                )
+                .await
+            {
                 Ok(hl_result) => {
-                    info!("{} {} Hedge executed on Hyperliquid",
+                    info!(
+                        "{} {} Hedge executed on Hyperliquid",
                         "[HEDGE]".bright_magenta().bold(),
-                        "✓".green().bold()
+                        "OK".green().bold()
                     );
-                    info!("{} Hyperliquid status: {:?}",
+                    info!(
+                        "{} Hyperliquid status: {:?}",
                         "[HEDGE]".bright_magenta().bold(),
                         hl_result.status
                     );
                 }
                 Err(e) => {
-                    warn!("{} {} Hedge failed: {}",
+                    warn!(
+                        "{} {} Hedge failed: {}",
                         "[HEDGE]".bright_magenta().bold(),
-                        "✗".red().bold(),
+                        "FAIL".red().bold(),
                         e
                     );
                 }
@@ -709,10 +802,16 @@ async fn main() -> Result<()> {
             // Verify positions after hedge (both exchanges)
             // Wait longer for positions to propagate to both APIs
             println!();
-            info!("{} Waiting 8 seconds for positions to propagate...", "[VERIFY]".cyan().bold());
+            info!(
+                "{} Waiting 8 seconds for positions to propagate...",
+                "[VERIFY]".cyan().bold()
+            );
             sleep(Duration::from_secs(8)).await;
 
-            info!("{} Verifying final positions on both exchanges...", "[VERIFY]".cyan().bold());
+            info!(
+                "{} Verifying final positions on both exchanges...",
+                "[VERIFY]".cyan().bold()
+            );
 
             // Check Pacifica position
             let pacifica_position = match pacifica_trading_position.get_positions().await {
@@ -721,7 +820,8 @@ async fn main() -> Result<()> {
                         let amount: f64 = pos.amount.parse().unwrap_or(0.0);
                         let signed_amount = if pos.side == "bid" { amount } else { -amount };
 
-                        info!("{} Pacifica: {} {} (signed: {:.4})",
+                        info!(
+                            "{} Pacifica: {} {} (signed: {:.4})",
                             "[VERIFY]".cyan().bold(),
                             amount,
                             pos.side.bright_white(),
@@ -734,7 +834,11 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    warn!("{} Failed to fetch Pacifica position: {}", "[VERIFY]".yellow().bold(), e);
+                    warn!(
+                        "{} Failed to fetch Pacifica position: {}",
+                        "[VERIFY]".yellow().bold(),
+                        e
+                    );
                     None
                 }
             };
@@ -745,45 +849,69 @@ async fn main() -> Result<()> {
                 .context("HL_WALLET environment variable not set")
                 .unwrap();
 
-            info!("{} Checking Hyperliquid positions for wallet: {}",
+            info!(
+                "{} Checking Hyperliquid positions for wallet: {}",
                 "[VERIFY]".cyan().bold(),
-                wallet_address.bright_white());
+                wallet_address.bright_white()
+            );
 
             let mut hyperliquid_position: Option<f64> = None;
 
             // Try up to 3 times with delays if position not found
             for retry in 0..3 {
                 if retry > 0 {
-                    info!("{} Retry {} - waiting 3 more seconds for Hyperliquid position...",
-                        "[VERIFY]".cyan().bold(), retry);
+                    info!(
+                        "{} Retry {} - waiting 3 more seconds for Hyperliquid position...",
+                        "[VERIFY]".cyan().bold(),
+                        retry
+                    );
                     sleep(Duration::from_secs(3)).await;
                 }
 
                 match hyperliquid_trading.get_user_state(&wallet_address).await {
                     Ok(user_state) => {
-                        info!("{} Hyperliquid returned {} position(s)",
+                        info!(
+                            "{} Hyperliquid returned {} position(s)",
                             "[VERIFY]".cyan().bold(),
-                            user_state.asset_positions.len());
+                            user_state.asset_positions.len()
+                        );
 
-                        if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == config.symbol) {
+                        if let Some(asset_pos) = user_state
+                            .asset_positions
+                            .iter()
+                            .find(|ap| ap.position.coin == config.symbol)
+                        {
                             let szi: f64 = asset_pos.position.szi.parse().unwrap_or(0.0);
-                            info!("{} Hyperliquid: {} (signed: {:.4})",
+                            info!(
+                                "{} Hyperliquid: {} (signed: {:.4})",
                                 "[VERIFY]".cyan().bold(),
-                                if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
+                                if szi > 0.0 {
+                                    "LONG".green()
+                                } else if szi < 0.0 {
+                                    "SHORT".red()
+                                } else {
+                                    "FLAT".bright_white()
+                                },
                                 szi
                             );
                             hyperliquid_position = Some(szi);
                             break;
                         } else if retry == 2 {
-                            info!("{} Hyperliquid: No position for {} found after 3 attempts",
+                            info!(
+                                "{} Hyperliquid: No position for {} found after 3 attempts",
                                 "[VERIFY]".cyan().bold(),
-                                config.symbol);
+                                config.symbol
+                            );
                             hyperliquid_position = Some(0.0);
                         }
                     }
                     Err(e) => {
-                        warn!("{} Failed to fetch Hyperliquid position (attempt {}): {}",
-                            "[VERIFY]".yellow().bold(), retry + 1, e);
+                        warn!(
+                            "{} Failed to fetch Hyperliquid position (attempt {}): {}",
+                            "[VERIFY]".yellow().bold(),
+                            retry + 1,
+                            e
+                        );
                         if retry == 2 {
                             hyperliquid_position = None;
                         }
@@ -796,7 +924,8 @@ async fn main() -> Result<()> {
                 let net_position = pac_pos + hl_pos;
 
                 info!("{}", "─".repeat(60).bright_black());
-                info!("{} Net Position: {:.4} (Pacifica: {:.4} + Hyperliquid: {:.4})",
+                info!(
+                    "{} Net Position: {:.4} (Pacifica: {:.4} + Hyperliquid: {:.4})",
                     "[VERIFY]".cyan().bold(),
                     net_position,
                     pac_pos,
@@ -808,63 +937,84 @@ async fn main() -> Result<()> {
 
                 // Check if net position is close to baseline
                 if net_position.abs() < 0.01 {
-                    info!("{} {} Net position is FLAT (properly hedged across both exchanges)",
+                    info!(
+                        "{} {} Net position is FLAT (properly hedged across both exchanges)",
                         "[VERIFY]".cyan().bold(),
-                        "✓".green().bold()
+                        "OK".green().bold()
                     );
                 } else {
-                    warn!("{} {} Net position NOT flat! Delta: {:.4}",
+                    warn!(
+                        "{} {} Net position NOT flat! Delta: {:.4}",
                         "[VERIFY]".cyan().bold(),
-                        "⚠".yellow().bold(),
+                        "WARN".yellow().bold(),
                         net_position
                     );
 
                     if (pac_pos - baseline_signed).abs() < 0.01 && hl_pos.abs() < 0.01 {
-                        info!("{} {} Both exchanges individually flat (hedge executed but may have closed old position)",
+                        info!(
+                            "{} {} Both exchanges individually flat (hedge executed but may have closed old position)",
                             "[VERIFY]".cyan().bold(),
-                            "ℹ".bright_blue().bold()
+                            "INFO".bright_blue().bold()
                         );
                     }
                 }
             } else {
-                warn!("{} Could not verify net position (failed to fetch from one or both exchanges)",
+                warn!(
+                    "{} Could not verify net position (failed to fetch from one or both exchanges)",
                     "[VERIFY]".yellow().bold()
                 );
             }
 
             println!();
             info!("{}", "═".repeat(80).bright_green());
-            info!("{} TEST PASSED ✓", "[SUCCESS]".bright_green().bold());
+            info!("{} TEST PASSED OK", "[SUCCESS]".bright_green().bold());
             info!("{}", "═".repeat(80).bright_green());
         }
         Ok(None) => {
-            warn!("{} Hedge channel closed unexpectedly", "[ERROR]".red().bold());
+            warn!(
+                "{} Hedge channel closed unexpectedly",
+                "[ERROR]".red().bold()
+            );
         }
         Err(_) => {
-            warn!("{} Timeout waiting for fill ({}s)",
+            warn!(
+                "{} Timeout waiting for fill ({}s)",
                 "[TIMEOUT]".yellow().bold(),
                 max_wait.as_secs()
             );
 
-            info!("{} Checking if order is still open...", "[CHECK]".cyan().bold());
+            info!(
+                "{} Checking if order is still open...",
+                "[CHECK]".cyan().bold()
+            );
             match pacifica_trading.get_open_orders().await {
                 Ok(orders) => {
-                    if let Some(order) = orders.iter().find(|o| o.client_order_id == client_order_id) {
+                    if let Some(order) =
+                        orders.iter().find(|o| o.client_order_id == client_order_id)
+                    {
                         let filled: f64 = order.filled_amount.parse().unwrap_or(0.0);
-                        warn!("{} Order still open. Filled: {}/{}",
+                        warn!(
+                            "{} Order still open. Filled: {}/{}",
                             "[CHECK]".yellow().bold(),
                             filled,
                             order.initial_amount
                         );
 
                         info!("{} Cancelling order...", "[CLEANUP]".cyan().bold());
-                        pacifica_trading.cancel_order(&client_order_id, &config.symbol).await.ok();
+                        pacifica_trading
+                            .cancel_order(&client_order_id, &config.symbol)
+                            .await
+                            .ok();
                     } else {
                         info!("{} Order no longer in open orders", "[CHECK]".cyan().bold());
                     }
                 }
                 Err(e) => {
-                    warn!("{} Failed to check orders: {}", "[CHECK]".yellow().bold(), e);
+                    warn!(
+                        "{} Failed to check orders: {}",
+                        "[CHECK]".yellow().bold(),
+                        e
+                    );
                 }
             }
         }

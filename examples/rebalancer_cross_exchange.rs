@@ -17,7 +17,6 @@
 ///   --symbol <SYMBOL> - Symbol to check (default: all positions)
 ///   --threshold <USD> - Minimum notional value to rebalance (default: 13.0)
 ///   --dry-run - Check positions without executing rebalance
-
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashMap;
@@ -38,9 +37,22 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
-    println!("{}", "  Cross-Exchange Position Rebalancer".bright_cyan().bold());
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        "  Cross-Exchange Position Rebalancer".bright_cyan().bold()
+    );
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!();
 
     // Parse command-line arguments
@@ -63,8 +75,7 @@ async fn main() -> Result<()> {
             }
             "--threshold" => {
                 if i + 1 < args.len() {
-                    threshold_usd = args[i + 1].parse()
-                        .context("Invalid threshold value")?;
+                    threshold_usd = args[i + 1].parse().context("Invalid threshold value")?;
                     i += 2;
                 } else {
                     eprintln!("Error: --threshold requires a value");
@@ -77,60 +88,104 @@ async fn main() -> Result<()> {
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
-                eprintln!("Usage: cargo run --example rebalancer_cross_exchange [--symbol SYMBOL] [--threshold USD] [--dry-run]");
+                eprintln!(
+                    "Usage: cargo run --example rebalancer_cross_exchange [--symbol SYMBOL] [--threshold USD] [--dry-run]"
+                );
                 std::process::exit(1);
             }
         }
     }
 
-    println!("{} Threshold: {}", "[CONFIG]".blue().bold(), format!("${:.2}", threshold_usd).bright_white());
+    println!(
+        "{} Threshold: {}",
+        "[CONFIG]".blue().bold(),
+        format!("${:.2}", threshold_usd).bright_white()
+    );
     if let Some(ref symbol) = target_symbol {
-        println!("{} Target Symbol: {}", "[CONFIG]".blue().bold(), symbol.bright_white().bold());
+        println!(
+            "{} Target Symbol: {}",
+            "[CONFIG]".blue().bold(),
+            symbol.bright_white().bold()
+        );
     } else {
-        println!("{} Target: {}", "[CONFIG]".blue().bold(), "All positions".bright_white());
+        println!(
+            "{} Target: {}",
+            "[CONFIG]".blue().bold(),
+            "All positions".bright_white()
+        );
     }
     if dry_run {
-        println!("{} Mode: {}", "[CONFIG]".blue().bold(), "DRY RUN (no trades)".yellow().bold());
+        println!(
+            "{} Mode: {}",
+            "[CONFIG]".blue().bold(),
+            "DRY RUN (no trades)".yellow().bold()
+        );
     }
     println!();
 
     // Load credentials
     dotenv::dotenv().ok();
 
-    let pac_credentials = PacificaCredentials::from_env()
-        .context("Failed to load Pacifica credentials")?;
-    let hl_credentials = HyperliquidCredentials::from_env()
-        .context("Failed to load Hyperliquid credentials")?;
-    let hl_wallet = env::var("HL_WALLET")
-        .context("HL_WALLET environment variable not set")?;
+    let pac_credentials =
+        PacificaCredentials::from_env().context("Failed to load Pacifica credentials")?;
+    let hl_credentials =
+        HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials")?;
+    let hl_wallet = env::var("HL_WALLET").context("HL_WALLET environment variable not set")?;
 
-    println!("{} Pacifica account: {}", "[INIT]".cyan().bold(), pac_credentials.account.bright_white());
-    println!("{} Hyperliquid wallet: {}", "[INIT]".cyan().bold(), hl_wallet.bright_white());
+    println!(
+        "{} Pacifica account: {}",
+        "[INIT]".cyan().bold(),
+        pac_credentials.account.bright_white()
+    );
+    println!(
+        "{} Hyperliquid wallet: {}",
+        "[INIT]".cyan().bold(),
+        hl_wallet.bright_white()
+    );
 
     // Initialize trading clients
-    let pac_trading = PacificaTrading::new(pac_credentials);
+    let pac_trading = PacificaTrading::new(pac_credentials)?;
     let hl_trading = HyperliquidTrading::new(hl_credentials, false)
         .context("Failed to create Hyperliquid trading client")?;
 
-    println!("{} {} Trading clients initialized", "[INIT]".cyan().bold(), "✓".green().bold());
+    println!(
+        "{} {} Trading clients initialized",
+        "[INIT]".cyan().bold(),
+        "OK".green().bold()
+    );
     println!();
 
     // Fetch positions from both exchanges
-    println!("{} Fetching positions from Pacifica...", "[CHECK]".magenta().bold());
-    let pac_positions = pac_trading.get_positions(target_symbol.as_deref()).await
+    println!(
+        "{} Fetching positions from Pacifica...",
+        "[CHECK]".magenta().bold()
+    );
+    let mut pac_positions = pac_trading
+        .get_positions()
+        .await
         .context("Failed to fetch Pacifica positions")?;
-    println!("{} {} Found {} Pacifica position(s)",
+    if let Some(symbol) = target_symbol.as_deref() {
+        pac_positions.retain(|position| position.symbol == symbol);
+    }
+    println!(
+        "{} {} Found {} Pacifica position(s)",
         "[CHECK]".magenta().bold(),
-        "✓".green().bold(),
+        "OK".green().bold(),
         pac_positions.len()
     );
 
-    println!("{} Fetching positions from Hyperliquid...", "[CHECK]".magenta().bold());
-    let hl_user_state = hl_trading.get_user_state(&hl_wallet).await
+    println!(
+        "{} Fetching positions from Hyperliquid...",
+        "[CHECK]".magenta().bold()
+    );
+    let hl_user_state = hl_trading
+        .get_user_state(&hl_wallet)
+        .await
         .context("Failed to fetch Hyperliquid positions")?;
-    println!("{} {} Found {} Hyperliquid position(s)",
+    println!(
+        "{} {} Found {} Hyperliquid position(s)",
         "[CHECK]".magenta().bold(),
-        "✓".green().bold(),
+        "OK".green().bold(),
         hl_user_state.asset_positions.len()
     );
     println!();
@@ -146,7 +201,10 @@ async fn main() -> Result<()> {
     for asset_pos in &hl_user_state.asset_positions {
         let pos = &asset_pos.position;
         let szi: f64 = pos.szi.parse().unwrap_or(0.0);
-        hl_positions_map.insert(pos.coin.clone(), (szi, pos.entry_px.clone().unwrap_or_default()));
+        hl_positions_map.insert(
+            pos.coin.clone(),
+            (szi, pos.entry_px.clone().unwrap_or_default()),
+        );
     }
 
     // Combine all symbols from both exchanges
@@ -178,23 +236,52 @@ async fn main() -> Result<()> {
 
     for symbol in &all_symbols {
         let pac_pos = *pac_positions_map.get(symbol).unwrap_or(&0.0);
-        let (hl_pos, hl_entry_px) = hl_positions_map.get(symbol).cloned().unwrap_or((0.0, String::new()));
+        let (hl_pos, hl_entry_px) = hl_positions_map
+            .get(symbol)
+            .cloned()
+            .unwrap_or((0.0, String::new()));
 
         // NET position = HL - Pacifica
         let net_pos = hl_pos - pac_pos;
 
-        println!("{}", "─────────────────────────────────────────────────".bright_black());
-        println!("{} {}", "Symbol:".bright_white(), symbol.bright_white().bold());
-        println!("{} {}", "Pacifica position:".bright_white(), format!("{:.4}", pac_pos).cyan());
-        println!("{} {}", "Hyperliquid position:".bright_white(), format!("{:.4}", hl_pos).cyan());
-        println!("{} {} ({})",
+        println!(
+            "{}",
+            "─────────────────────────────────────────────────".bright_black()
+        );
+        println!(
+            "{} {}",
+            "Symbol:".bright_white(),
+            symbol.bright_white().bold()
+        );
+        println!(
+            "{} {}",
+            "Pacifica position:".bright_white(),
+            format!("{:.4}", pac_pos).cyan()
+        );
+        println!(
+            "{} {}",
+            "Hyperliquid position:".bright_white(),
+            format!("{:.4}", hl_pos).cyan()
+        );
+        println!(
+            "{} {} ({})",
             "NET position:".bright_white(),
             format!("{:.4}", net_pos).bright_yellow().bold(),
-            if net_pos > 0.0 { "LONG".green() } else if net_pos < 0.0 { "SHORT".red() } else { "FLAT".bright_black() }
+            if net_pos > 0.0 {
+                "LONG".green()
+            } else if net_pos < 0.0 {
+                "SHORT".red()
+            } else {
+                "FLAT".bright_black()
+            }
         );
 
         if net_pos == 0.0 {
-            println!("{} {} Position is balanced", "[STATUS]".bright_blue().bold(), "✓".green().bold());
+            println!(
+                "{} {} Position is balanced",
+                "[STATUS]".bright_blue().bold(),
+                "OK".green().bold()
+            );
             continue;
         }
 
@@ -202,9 +289,10 @@ async fn main() -> Result<()> {
         let (current_bid, current_ask) = match hl_trading.get_l2_snapshot(symbol).await {
             Ok(Some((bid, ask))) => (bid, ask),
             _ => {
-                println!("{} {} Cannot fetch current price, skipping",
+                println!(
+                    "{} {} Cannot fetch current price, skipping",
                     "[STATUS]".bright_blue().bold(),
-                    "⚠".yellow().bold()
+                    "WARN".yellow().bold()
                 );
                 continue;
             }
@@ -213,19 +301,22 @@ async fn main() -> Result<()> {
         let mid_price = (current_bid + current_ask) / 2.0;
         let net_notional = net_pos.abs() * mid_price;
 
-        println!("{} {}",
+        println!(
+            "{} {}",
             "Current mid price:".bright_white(),
             format!("${:.4}", mid_price).cyan()
         );
-        println!("{} {}",
+        println!(
+            "{} {}",
             "NET notional:".bright_white(),
             format!("${:.2}", net_notional).bright_yellow().bold()
         );
 
         if net_notional < threshold_usd {
-            println!("{} {} NET position below threshold (${:.2} < ${:.2})",
+            println!(
+                "{} {} NET position below threshold (${:.2} < ${:.2})",
                 "[STATUS]".bright_blue().bold(),
-                "○".bright_black(),
+                "o".bright_black(),
                 net_notional,
                 threshold_usd
             );
@@ -233,9 +324,10 @@ async fn main() -> Result<()> {
         }
 
         // Need to rebalance
-        println!("{} {} NET position EXCEEDS threshold (${:.2} > ${:.2})",
+        println!(
+            "{} {} NET position EXCEEDS threshold (${:.2} > ${:.2})",
             "[REBALANCE]".bright_yellow().bold(),
-            "⚠".yellow().bold(),
+            "WARN".yellow().bold(),
             net_notional,
             threshold_usd
         );
@@ -246,7 +338,8 @@ async fn main() -> Result<()> {
         let is_buy = net_pos < 0.0;
         let close_size = net_pos.abs();
 
-        println!("{} Need to {} {} {} on Hyperliquid to balance",
+        println!(
+            "{} Need to {} {} {} on Hyperliquid to balance",
             "[REBALANCE]".bright_yellow().bold(),
             if is_buy { "BUY".green() } else { "SELL".red() },
             format!("{:.4}", close_size).bright_white(),
@@ -254,9 +347,10 @@ async fn main() -> Result<()> {
         );
 
         if dry_run {
-            println!("{} {} DRY RUN - Would {} {:.4} {}",
+            println!(
+                "{} {} DRY RUN - Would {} {:.4} {}",
                 "[REBALANCE]".bright_yellow().bold(),
-                "◉".yellow(),
+                "*".yellow(),
                 if is_buy { "BUY" } else { "SELL" },
                 close_size,
                 symbol.bright_white().bold()
@@ -267,39 +361,61 @@ async fn main() -> Result<()> {
         }
 
         // Execute rebalance
-        println!("{} Executing rebalance...", "[REBALANCE]".bright_yellow().bold());
+        println!(
+            "{} Executing rebalance...",
+            "[REBALANCE]".bright_yellow().bold()
+        );
 
-        match hl_trading.place_market_order(
-            symbol,
-            is_buy,
-            close_size,
-            0.05, // 5% slippage tolerance
-            false,
-            Some(current_bid),
-            Some(current_ask),
-        ).await {
+        match hl_trading
+            .place_market_order(
+                symbol,
+                is_buy,
+                close_size,
+                0.05, // 5% slippage tolerance
+                false,
+                Some(current_bid),
+                Some(current_ask),
+            )
+            .await
+        {
             Ok(response) => {
-                println!("{} {} Successfully rebalanced NET position",
+                println!(
+                    "{} {} Successfully rebalanced NET position",
                     "[REBALANCE]".bright_yellow().bold(),
-                    "✓".green().bold()
+                    "OK".green().bold()
                 );
 
                 // Extract fill price from response
-                if let Some(status) = response.response.data.statuses.first() {
+                let statuses = match &response.response {
+                    xemm_rust::connector::hyperliquid::OrderResponseContent::Success(data) => {
+                        &data.data.statuses
+                    }
+                    xemm_rust::connector::hyperliquid::OrderResponseContent::Error(error) => {
+                        println!("  Hyperliquid response error: {}", error);
+                        continue;
+                    }
+                };
+                if let Some(status) = statuses.first() {
                     match status {
                         xemm_rust::connector::hyperliquid::OrderStatus::Filled { filled } => {
-                            let avg_px: f64 = filled.avgPx.parse().unwrap_or(0.0);
-                            let total_sz: f64 = filled.totalSz.parse().unwrap_or(0.0);
-                            println!("  Fill: {} {} @ ${:.4}",
-                                if is_buy { "BOUGHT".green() } else { "SOLD".red() },
+                            let avg_px: f64 = filled.avg_px.parse().unwrap_or(0.0);
+                            let total_sz: f64 = filled.total_sz.parse().unwrap_or(0.0);
+                            println!(
+                                "  Fill: {} {} @ ${:.4}",
+                                if is_buy {
+                                    "BOUGHT".green()
+                                } else {
+                                    "SOLD".red()
+                                },
                                 format!("{:.4}", total_sz).bright_white(),
                                 avg_px
                             );
                         }
                         xemm_rust::connector::hyperliquid::OrderStatus::Error { error } => {
-                            println!("{} {} Order failed: {}",
+                            println!(
+                                "{} {} Order failed: {}",
                                 "[REBALANCE]".bright_yellow().bold(),
-                                "✗".red().bold(),
+                                "FAIL".red().bold(),
                                 error.red()
                             );
                         }
@@ -311,9 +427,10 @@ async fn main() -> Result<()> {
                 total_rebalanced_notional += net_notional;
             }
             Err(e) => {
-                println!("{} {} Failed to rebalance: {}",
+                println!(
+                    "{} {} Failed to rebalance: {}",
                     "[REBALANCE]".bright_yellow().bold(),
-                    "✗".red().bold(),
+                    "FAIL".red().bold(),
                     e.to_string().red()
                 );
             }
@@ -322,30 +439,44 @@ async fn main() -> Result<()> {
 
     // Summary
     println!();
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!("{}", "  Rebalancing Summary".bright_cyan().bold());
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!();
 
     if rebalanced_count == 0 {
-        println!("{} {} No NET positions required rebalancing",
+        println!(
+            "{} {} No NET positions required rebalancing",
             "[SUMMARY]".bright_green().bold(),
-            "✓".green().bold()
+            "OK".green().bold()
         );
     } else {
-        println!("{} {} Rebalanced {} NET position(s)",
+        println!(
+            "{} {} Rebalanced {} NET position(s)",
             "[SUMMARY]".bright_green().bold(),
-            "✓".green().bold(),
+            "OK".green().bold(),
             rebalanced_count
         );
-        println!("  Total NET notional: {}",
+        println!(
+            "  Total NET notional: {}",
             format!("${:.2}", total_rebalanced_notional).cyan().bold()
         );
 
         if dry_run {
             println!();
-            println!("{} This was a DRY RUN - no actual trades were executed",
-                "⚠".yellow().bold()
+            println!(
+                "{} This was a DRY RUN - no actual trades were executed",
+                "WARN".yellow().bold()
             );
             println!("  Run without --dry-run to execute rebalancing");
         }

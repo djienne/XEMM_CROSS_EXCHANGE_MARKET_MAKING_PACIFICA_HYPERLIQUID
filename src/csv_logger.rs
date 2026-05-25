@@ -2,7 +2,6 @@
 ///
 /// This module provides functionality to log completed trades to a CSV file
 /// for historical tracking and analysis.
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use csv::Writer;
@@ -113,7 +112,7 @@ impl TradeRecord {
 
 /// Append a trade record to the CSV file (blocking).
 ///
-/// Prefer `log_trade_async` on the hedge hot path — this function is kept
+/// Prefer `log_trade_async` on the hedge hot path - this function is kept
 /// for tests and non-latency-critical call sites. Creates the file if it
 /// doesn't exist, otherwise appends.
 pub fn log_trade(file_path: &str, record: &TradeRecord) -> Result<()> {
@@ -127,7 +126,9 @@ pub fn log_trade(file_path: &str, record: &TradeRecord) -> Result<()> {
         .with_context(|| format!("Failed to open CSV file: {}", file_path))?;
 
     let mut writer = Writer::from_writer(file);
-    writer.serialize(record).context("Failed to write CSV record")?;
+    writer
+        .serialize(record)
+        .context("Failed to write CSV record")?;
     writer.flush().context("Failed to flush CSV writer")?;
     Ok(())
 }
@@ -143,7 +144,7 @@ static CSV_WRITER_TX: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 /// Lazily spawn the dedicated CSV writer thread and return its sender.
 ///
 /// A single `std::thread` (not a tokio task) owns the writing side. Hedge
-/// callers push records via an unbounded `std::sync::mpsc::channel` — sending
+/// callers push records via an unbounded `std::sync::mpsc::channel` - sending
 /// never blocks. If the thread panics (e.g. disk full), subsequent sends
 /// become no-ops so the hedge path is never stalled by I/O.
 fn writer_tx() -> &'static mpsc::Sender<LogMessage> {
@@ -189,7 +190,7 @@ mod tests {
     fn test_trade_record_creation() {
         let record = TradeRecord::new(
             Utc::now(),
-            125.5,  // latency_ms
+            125.5, // latency_ms
             "ENA".to_string(),
             OrderSide::Buy,
             0.3900,
@@ -222,7 +223,7 @@ mod tests {
 
         let record = TradeRecord::new(
             Utc::now(),
-            89.3,  // latency_ms
+            89.3, // latency_ms
             "BTC".to_string(),
             OrderSide::Sell,
             50000.0,

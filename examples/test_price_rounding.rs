@@ -18,7 +18,10 @@ fn round_price(price: f64, sz_decimals: i32, is_spot: bool) -> String {
 
     // Remove trailing zeros after decimal point
     if result.contains('.') {
-        result.trim_end_matches('0').trim_end_matches('.').to_string()
+        result
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     } else {
         result
     }
@@ -43,6 +46,11 @@ fn main() {
 
     for (price, label) in test_cases {
         let rounded = round_price(price, 2, false); // SOL has szDecimals=2, is perp
-        println!("{:12} -> {:12} ({})", format!("{:.6}", price), rounded, label);
+        println!(
+            "{:12} -> {:12} ({})",
+            format!("{:.6}", price),
+            rounded,
+            label
+        );
     }
 }

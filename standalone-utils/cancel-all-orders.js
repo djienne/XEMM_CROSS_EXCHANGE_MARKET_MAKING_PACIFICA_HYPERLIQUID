@@ -37,7 +37,7 @@ async function cancelPacificaOrders(pacifica) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const result = await pacifica.cancelAllOrdersSmart({ allSymbols: true });
-      console.log(`[Pacifica] ✅ Cancel result (attempt ${attempt}/${MAX_ATTEMPTS}):`, JSON.stringify(result));
+      console.log(`[Pacifica] OK Cancel result (attempt ${attempt}/${MAX_ATTEMPTS}):`, JSON.stringify(result));
 
       const cancelledCount = result?.cancelled_count || result?.data?.cancelled_count || 0;
       if (cancelledCount > 0) {
@@ -48,7 +48,7 @@ async function cancelPacificaOrders(pacifica) {
 
       return result;
     } catch (error) {
-      console.error(`[Pacifica] ❌ Failed to cancel orders (attempt ${attempt}/${MAX_ATTEMPTS}):`, error.message);
+      console.error(`[Pacifica] ERROR Failed to cancel orders (attempt ${attempt}/${MAX_ATTEMPTS}):`, error.message);
       if (attempt < MAX_ATTEMPTS) {
         console.log(`[Pacifica] Retrying in ${RETRY_DELAY_MS}ms...`);
         await sleep(RETRY_DELAY_MS);
@@ -56,7 +56,7 @@ async function cancelPacificaOrders(pacifica) {
     }
   }
 
-  console.log('[Pacifica] ⚠️  All cancel attempts failed');
+  console.log('[Pacifica] WARN  All cancel attempts failed');
 }
 
 /**
@@ -111,12 +111,12 @@ async function cancelHyperliquidOrders(hyperliquid) {
       if (result.status === 'ok') {
         const statuses = result.response?.data?.statuses || [];
         const successCount = statuses.filter(s => s === 'success').length;
-        console.log(`[Hyperliquid] ✅ Successfully cancelled ${successCount}/${cancels.length} orders`);
+        console.log(`[Hyperliquid] OK Successfully cancelled ${successCount}/${cancels.length} orders`);
 
         // Log any failures
         statuses.forEach((status, index) => {
           if (status !== 'success') {
-            console.log(`[Hyperliquid] ⚠️  Order ${index} cancel failed:`, status);
+            console.log(`[Hyperliquid] WARN  Order ${index} cancel failed:`, status);
           }
         });
 
@@ -125,7 +125,7 @@ async function cancelHyperliquidOrders(hyperliquid) {
         throw new Error(`Cancel failed: ${JSON.stringify(result)}`);
       }
     } catch (error) {
-      console.error(`[Hyperliquid] ❌ Failed to cancel orders (attempt ${attempt}/${MAX_ATTEMPTS}):`, error.message);
+      console.error(`[Hyperliquid] ERROR Failed to cancel orders (attempt ${attempt}/${MAX_ATTEMPTS}):`, error.message);
       if (attempt < MAX_ATTEMPTS) {
         console.log(`[Hyperliquid] Retrying in ${RETRY_DELAY_MS}ms...`);
         await sleep(RETRY_DELAY_MS);
@@ -133,7 +133,7 @@ async function cancelHyperliquidOrders(hyperliquid) {
     }
   }
 
-  console.log('[Hyperliquid] ⚠️  All cancel attempts failed');
+  console.log('[Hyperliquid] WARN  All cancel attempts failed');
 }
 
 async function main() {
@@ -156,7 +156,7 @@ async function main() {
     console.log('\n[SYS] Connecting to exchanges...');
     await Promise.all([pacifica.connect(), hyperliquid.connect()]);
     await sleep(1000);
-    console.log('[SYS] ✅ Connected to both exchanges');
+    console.log('[SYS] OK Connected to both exchanges');
 
     // Cancel orders on both exchanges concurrently
     console.log('\n[SYS] Cancelling orders on both exchanges...');
@@ -166,10 +166,10 @@ async function main() {
     ]);
 
     console.log('\n' + '='.repeat(80));
-    console.log('✅ Order cancellation complete');
+    console.log('OK Order cancellation complete');
     console.log('='.repeat(80));
   } catch (error) {
-    console.error('\n❌ Cancellation failed:', error.message);
+    console.error('\nERROR Cancellation failed:', error.message);
     console.error(error.stack);
   } finally {
     // Clean disconnect

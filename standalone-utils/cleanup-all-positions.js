@@ -112,7 +112,7 @@ async function closePacificaPositions(pacifica) {
     const actionable = positions.filter(pos => Math.abs(pos.amount) >= MIN_POSITION);
 
     if (actionable.length === 0) {
-      console.log('[Pacifica] ✅ All positions flat.');
+      console.log('[Pacifica] OK All positions flat.');
       return;
     }
 
@@ -127,7 +127,7 @@ async function closePacificaPositions(pacifica) {
       const rounded = lotSize ? pacifica.roundToLotSize(amount, lotSize) : amount;
 
       if (!rounded || rounded < MIN_POSITION) {
-        console.log(`[Pacifica] ⚠️  Skipping ${pos.symbol} (amount ${amount} below lot size ${lotSize})`);
+        console.log(`[Pacifica] WARN  Skipping ${pos.symbol} (amount ${amount} below lot size ${lotSize})`);
         continue;
       }
 
@@ -137,7 +137,7 @@ async function closePacificaPositions(pacifica) {
           await sleep(ORDERBOOK_WARMUP_MS);
           subscribedBooks.add(pos.symbol);
         } catch (error) {
-          console.error(`[Pacifica] ⚠️  Failed to subscribe orderbook ${pos.symbol}: ${error.message}`);
+          console.error(`[Pacifica] WARN  Failed to subscribe orderbook ${pos.symbol}: ${error.message}`);
         }
       }
 
@@ -148,7 +148,7 @@ async function closePacificaPositions(pacifica) {
           tif: 'IOC'
         });
       } catch (error) {
-        console.error(`[Pacifica] ❌ Failed to close ${pos.symbol}: ${error.message}`);
+        console.error(`[Pacifica] ERROR Failed to close ${pos.symbol}: ${error.message}`);
       }
 
       await sleep(SLEEP_AFTER_ORDER_MS);
@@ -160,13 +160,13 @@ async function closePacificaPositions(pacifica) {
   const residual = await pacifica.getPositions();
   const remaining = residual.filter(pos => Math.abs(pos.amount) >= MIN_POSITION);
   if (remaining.length > 0) {
-    console.log('\n[Pacifica] ⚠️  Residual positions still open:');
+    console.log('\n[Pacifica] WARN  Residual positions still open:');
     for (const pos of remaining) {
       const signedQty = pos.side === 'long' ? pos.amount : -pos.amount;
       console.log(`  ${pos.symbol}: ${formatQty(signedQty)} @ ${pos.entryPrice}`);
     }
   } else {
-    console.log('[Pacifica] ✅ Positions closed after retries.');
+    console.log('[Pacifica] OK Positions closed after retries.');
   }
 }
 
@@ -176,7 +176,7 @@ async function closeHyperliquidPositions(hyperliquid) {
   try {
     await hyperliquid.getMeta();
   } catch (error) {
-    console.error('[Hyperliquid] ⚠️  Failed to load asset metadata:', error.message);
+    console.error('[Hyperliquid] WARN  Failed to load asset metadata:', error.message);
   }
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -192,7 +192,7 @@ async function closeHyperliquidPositions(hyperliquid) {
       .filter(p => p.coin && Math.abs(p.qty) >= MIN_POSITION);
 
     if (actionable.length === 0) {
-      console.log('[Hyperliquid] ✅ All positions flat.');
+      console.log('[Hyperliquid] OK All positions flat.');
       return;
     }
 
@@ -206,7 +206,7 @@ async function closeHyperliquidPositions(hyperliquid) {
           await sleep(ORDERBOOK_WARMUP_MS);
           subscribedBooks.add(pos.coin);
         } catch (error) {
-          console.error(`[Hyperliquid] ⚠️  Failed to subscribe orderbook ${pos.coin}: ${error.message}`);
+          console.error(`[Hyperliquid] WARN  Failed to subscribe orderbook ${pos.coin}: ${error.message}`);
         }
       }
 
@@ -216,7 +216,7 @@ async function closeHyperliquidPositions(hyperliquid) {
         console.log(`[Hyperliquid] ${side.toUpperCase()} ${size} ${pos.coin} (reduce-only)`);
         await hyperliquid.createMarketOrder(pos.coin, side, size, { reduceOnly: true });
       } catch (error) {
-        console.error(`[Hyperliquid] ❌ Failed to close ${pos.coin}: ${error.message}`);
+        console.error(`[Hyperliquid] ERROR Failed to close ${pos.coin}: ${error.message}`);
       }
 
       await sleep(SLEEP_AFTER_ORDER_MS);
@@ -237,12 +237,12 @@ async function closeHyperliquidPositions(hyperliquid) {
     .filter(p => p.coin && Math.abs(p.qty) >= MIN_POSITION);
 
   if (remaining.length > 0) {
-    console.log('\n[Hyperliquid] ⚠️  Residual positions still open:');
+    console.log('\n[Hyperliquid] WARN  Residual positions still open:');
     for (const pos of remaining) {
       console.log(`  ${pos.coin}: ${formatQty(pos.qty)}`);
     }
   } else {
-    console.log('[Hyperliquid] ✅ Positions closed after retries.');
+    console.log('[Hyperliquid] OK Positions closed after retries.');
   }
 }
 
@@ -271,7 +271,7 @@ async function main() {
       const cancelResult = await pacifica.cancelAllOrdersSmart({ allSymbols: true });
       console.log('[Pacifica] Cancel result:', JSON.stringify(cancelResult));
     } catch (error) {
-      console.error('[Pacifica] ⚠️  Failed to cancel orders:', error.message);
+      console.error('[Pacifica] WARN  Failed to cancel orders:', error.message);
     }
 
     const [pacBefore, hlBefore] = await Promise.all([
@@ -294,12 +294,12 @@ async function main() {
 
     const stillOpen = new Set([...pacAfter.keys(), ...hlAfter.keys()]);
     if (stillOpen.size > 0) {
-      console.log('\n⚠️  Cleanup complete, but residual positions remain. Review logs above.');
+      console.log('\nWARN  Cleanup complete, but residual positions remain. Review logs above.');
     } else {
-      console.log('\n✅ Cleanup complete. All positions appear flat.');
+      console.log('\nOK Cleanup complete. All positions appear flat.');
     }
   } catch (error) {
-    console.error('\n❌ Cleanup failed:', error.message);
+    console.error('\nERROR Cleanup failed:', error.message);
     console.error(error.stack);
   } finally {
     try {

@@ -1,6 +1,6 @@
+use tracing::info;
 use xemm_rust::connector::hyperliquid::{OrderbookClient, OrderbookConfig};
 use xemm_rust::Config;
-use tracing::info;
 
 /// Example: Subscribe to Hyperliquid orderbook and print top of book
 #[tokio::main]
@@ -9,7 +9,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -35,16 +35,18 @@ async fn main() -> anyhow::Result<()> {
     let mut client = OrderbookClient::new(config)?;
 
     // Start client with callback for top of book updates
-    client.start(|best_bid, best_ask, coin, timestamp| {
-        info!(
-            "[HYPERLIQUID] {} | Bid: {} | Ask: {} | Spread: {:.4} | TS: {}",
-            coin,
-            best_bid,
-            best_ask,
-            best_ask.parse::<f64>().unwrap_or(0.0) - best_bid.parse::<f64>().unwrap_or(0.0),
-            timestamp
-        );
-    }).await?;
+    client
+        .start(|best_bid, best_ask, coin, timestamp| {
+            info!(
+                "[HYPERLIQUID] {} | Bid: {} | Ask: {} | Spread: {:.4} | TS: {}",
+                coin,
+                best_bid,
+                best_ask,
+                best_ask.parse::<f64>().unwrap_or(0.0) - best_bid.parse::<f64>().unwrap_or(0.0),
+                timestamp
+            );
+        })
+        .await?;
 
     Ok(())
 }

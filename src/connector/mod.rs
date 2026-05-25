@@ -1,2 +1,2 @@
-pub mod pacifica;
 pub mod hyperliquid;
+pub mod pacifica;

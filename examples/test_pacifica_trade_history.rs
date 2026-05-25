@@ -21,16 +21,18 @@ async fn main() -> Result<()> {
     println!();
 
     // Create trading client
-    let trading = PacificaTrading::new(credentials);
+    let trading = PacificaTrading::new(credentials)?;
 
     // Get recent trade history for ENA
     println!("Fetching recent ENA trade history...");
-    let trades = trading.get_trade_history(
-        Some("ENA"),  // symbol
-        Some(10),     // limit to 10 most recent trades
-        None,         // no start time filter
-        None,         // no end time filter
-    ).await?;
+    let trades = trading
+        .get_trade_history(
+            Some("ENA"), // symbol
+            Some(10),    // limit to 10 most recent trades
+            None,        // no start time filter
+            None,        // no end time filter
+        )
+        .await?;
 
     println!("Retrieved {} trade(s)\n", trades.len());
 
@@ -54,7 +56,11 @@ async fn main() -> Result<()> {
 
         // Display fee with percentage
         let fee: f64 = trade.fee.parse().unwrap_or(0.0);
-        let fee_bps = if notional > 0.0 { (fee / notional) * 10000.0 } else { 0.0 };
+        let fee_bps = if notional > 0.0 {
+            (fee / notional) * 10000.0
+        } else {
+            0.0
+        };
         println!("  Fee: ${} ({:.2} bps)", trade.fee, fee_bps);
 
         println!("  PnL: ${}", trade.pnl);
@@ -70,23 +76,33 @@ async fn main() -> Result<()> {
 
     // Get all recent trades (no symbol filter)
     println!("\nFetching all recent trades (limit 5)...");
-    let all_trades = trading.get_trade_history(
-        None,     // all symbols
-        Some(5),  // limit to 5
-        None,
-        None,
-    ).await?;
+    let all_trades = trading
+        .get_trade_history(
+            None,    // all symbols
+            Some(5), // limit to 5
+            None,
+            None,
+        )
+        .await?;
 
-    println!("Retrieved {} trade(s) across all symbols\n", all_trades.len());
+    println!(
+        "Retrieved {} trade(s) across all symbols\n",
+        all_trades.len()
+    );
 
     for trade in all_trades.iter() {
         let amount: f64 = trade.amount.parse().unwrap_or(0.0);
         let price: f64 = trade.entry_price.parse().unwrap_or(0.0);
         let notional = amount * price;
         let fee: f64 = trade.fee.parse().unwrap_or(0.0);
-        let fee_bps = if notional > 0.0 { (fee / notional) * 10000.0 } else { 0.0 };
+        let fee_bps = if notional > 0.0 {
+            (fee / notional) * 10000.0
+        } else {
+            0.0
+        };
 
-        println!("  {} - {} {} @ ${} ({}) | Fee: ${} ({:.2} bps)",
+        println!(
+            "  {} - {} {} @ ${} ({}) | Fee: ${} ({:.2} bps)",
             trade.symbol,
             trade.side,
             trade.amount,

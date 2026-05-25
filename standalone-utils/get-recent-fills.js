@@ -145,7 +145,7 @@ function displayFills(exchange, fills) {
 
 // Main function
 async function main() {
-  console.log('\n\x1b[1m📊 Fetching Recent Filled Orders from Both Exchanges...\x1b[0m\n');
+  console.log('\n\x1b[1mREPORT Fetching Recent Filled Orders from Both Exchanges...\x1b[0m\n');
 
   const limit = parseInt(process.argv[2]) || 10; // Allow custom limit via command line argument
 
@@ -160,7 +160,7 @@ async function main() {
   displayFills('pacifica', pacificaFills);
 
   // Summary statistics
-  console.log('\n\x1b[1m📈 Summary\x1b[0m');
+  console.log('\n\x1b[1m Summary\x1b[0m');
   console.log('='.repeat(120));
 
   // Calculate totals for Hyperliquid
@@ -175,10 +175,10 @@ async function main() {
   console.log(`  Pacifica:     ${pacificaFills.length} trades  |  Total PnL: ${colorPnL(pacificaTotalPnL.toFixed(4))}  |  Total Fees: $${pacificaTotalFees.toFixed(4)}`);
   console.log(`  Combined:     ${hlFills.length + pacificaFills.length} trades  |  Net PnL:   ${colorPnL((hlTotalPnL + pacificaTotalPnL).toFixed(4))}  |  Total Fees: $${(hlTotalFees + pacificaTotalFees).toFixed(4)}`);
   console.log('='.repeat(120));
-  console.log('\n✅ Done!\n');
+  console.log('\nOK Done!\n');
 }
 
 main().catch(error => {
-  console.error('\n❌ Error:', error.message);
+  console.error('\nERROR Error:', error.message);
   process.exit(1);
 });

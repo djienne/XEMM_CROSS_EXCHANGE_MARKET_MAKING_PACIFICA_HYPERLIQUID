@@ -4,7 +4,6 @@
 /// Verifies that the REST API method works correctly for getting bid/ask prices.
 ///
 /// Run with: cargo run --example test_hl_l2_snapshot --release
-
 use anyhow::{Context, Result};
 use xemm_rust::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
 
@@ -32,7 +31,7 @@ async fn main() -> Result<()> {
     let hl_trading = HyperliquidTrading::new(hyperliquid_credentials, false)
         .context("Failed to create Hyperliquid trading client")?;
 
-    println!("✓ Trading client initialized");
+    println!("OK Trading client initialized");
     println!();
 
     // Test symbols to fetch
@@ -47,17 +46,17 @@ async fn main() -> Result<()> {
                 let spread = ask - bid;
                 let spread_bps = (spread / mid) * 10000.0;
 
-                println!("  ✓ Success:");
+                println!("  OK Success:");
                 println!("    Bid:    ${:.6}", bid);
                 println!("    Ask:    ${:.6}", ask);
                 println!("    Mid:    ${:.6}", mid);
                 println!("    Spread: ${:.6} ({:.2} bps)", spread, spread_bps);
             }
             Ok(None) => {
-                println!("  ⚠ No orderbook data available");
+                println!("  WARN No orderbook data available");
             }
             Err(e) => {
-                println!("  ✗ Error: {}", e);
+                println!("  FAIL Error: {}", e);
             }
         }
 

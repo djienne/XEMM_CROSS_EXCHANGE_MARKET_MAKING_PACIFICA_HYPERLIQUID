@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use anyhow::Result;
 
 /// Performs dual cancellation (REST + WebSocket) for redundancy
 ///
@@ -19,8 +19,11 @@ pub async fn dual_cancel(
     ws: &PacificaWsTrading,
     symbol: &str,
 ) -> Result<(u32, u32)> {
-    // REST API cancel (fast, reliable)
-    let rest_count = match rest.cancel_all_orders(false, Some(symbol), false).await {
+    let rest_cancel = rest.cancel_all_orders(false, Some(symbol), false);
+    let ws_cancel = ws.cancel_all_orders_ws(false, Some(symbol), false);
+    let (rest_result, ws_result) = tokio::join!(rest_cancel, ws_cancel);
+
+    let rest_count = match rest_result {
         Ok(count) => count,
         Err(e) => {
             tracing::warn!("REST cancel_all_orders failed: {}", e);
@@ -28,8 +31,7 @@ pub async fn dual_cancel(
         }
     };
 
-    // WebSocket cancel (ultra-fast, no rate limits)
-    let ws_count = match ws.cancel_all_orders_ws(false, Some(symbol), false).await {
+    let ws_count = match ws_result {
         Ok(count) => count,
         Err(e) => {
             tracing::warn!("WS cancel_all_orders_ws failed: {}", e);

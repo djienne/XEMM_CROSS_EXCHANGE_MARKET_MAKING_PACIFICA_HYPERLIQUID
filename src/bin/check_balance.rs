@@ -13,8 +13,8 @@ use xemm_rust::connector::hyperliquid::{
     trading::{HyperliquidCredentials, HyperliquidTrading},
 };
 use xemm_rust::connector::pacifica::{
-    OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
     trading::{PacificaCredentials, PacificaTrading},
+    OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -66,31 +66,37 @@ async fn main() -> Result<()> {
 
     // Spawn orderbook tasks
     tokio::spawn(async move {
-        if let Err(e) = hl_ob_client.start(move |bid, ask, _, _| {
-            let bid_f: f64 = bid.parse().unwrap_or(0.0);
-            let ask_f: f64 = ask.parse().unwrap_or(0.0);
-            if bid_f > 0.0 && ask_f > 0.0 {
-                let mid = (bid_f + ask_f) / 2.0;
-                if let Ok(mut lock) = hl_price_clone.lock() {
-                    *lock = Some(mid);
+        if let Err(e) = hl_ob_client
+            .start(move |bid, ask, _, _| {
+                let bid_f: f64 = bid.parse().unwrap_or(0.0);
+                let ask_f: f64 = ask.parse().unwrap_or(0.0);
+                if bid_f > 0.0 && ask_f > 0.0 {
+                    let mid = (bid_f + ask_f) / 2.0;
+                    if let Ok(mut lock) = hl_price_clone.lock() {
+                        *lock = Some(mid);
+                    }
                 }
-            }
-        }).await {
+            })
+            .await
+        {
             error!("HL Orderbook error: {}", e);
         }
     });
 
     tokio::spawn(async move {
-        if let Err(e) = pac_ob_client.start(move |bid, ask, _, _| {
-            let bid_f: f64 = bid.parse().unwrap_or(0.0);
-            let ask_f: f64 = ask.parse().unwrap_or(0.0);
-            if bid_f > 0.0 && ask_f > 0.0 {
-                let mid = (bid_f + ask_f) / 2.0;
-                if let Ok(mut lock) = pac_price_clone.lock() {
-                    *lock = Some(mid);
+        if let Err(e) = pac_ob_client
+            .start(move |bid, ask, _, _| {
+                let bid_f: f64 = bid.parse().unwrap_or(0.0);
+                let ask_f: f64 = ask.parse().unwrap_or(0.0);
+                if bid_f > 0.0 && ask_f > 0.0 {
+                    let mid = (bid_f + ask_f) / 2.0;
+                    if let Ok(mut lock) = pac_price_clone.lock() {
+                        *lock = Some(mid);
+                    }
                 }
-            }
-        }).await {
+            })
+            .await
+        {
             error!("Pacifica Orderbook error: {}", e);
         }
     });
@@ -121,21 +127,29 @@ async fn check_balance(
     pac_price_store: &Arc<Mutex<Option<f64>>>,
 ) -> Result<()> {
     // 1. Fetch Positions
-    let wallet_address = std::env::var("HL_WALLET").unwrap_or_else(|_| hl_trading.get_wallet_address());
+    let wallet_address =
+        std::env::var("HL_WALLET").unwrap_or_else(|_| hl_trading.get_wallet_address());
     let hl_state = hl_trading.get_user_state(&wallet_address).await?;
     let pac_positions = pac_trading.get_positions().await?;
 
     // Find target positions
-    let hl_pos = hl_state.asset_positions.iter()
+    let hl_pos = hl_state
+        .asset_positions
+        .iter()
         .find(|p| p.position.coin == config.symbol)
         .map(|p| p.position.szi.parse::<f64>().unwrap_or(0.0))
         .unwrap_or(0.0);
 
-    let pac_pos = pac_positions.iter()
+    let pac_pos = pac_positions
+        .iter()
         .find(|p| p.symbol == config.symbol)
         .map(|p| {
             let amt = p.amount.parse::<f64>().unwrap_or(0.0);
-            if p.side == "bid" { amt } else { -amt }
+            if p.side == "bid" {
+                amt
+            } else {
+                -amt
+            }
         })
         .unwrap_or(0.0);
 
@@ -146,23 +160,36 @@ async fn check_balance(
 
     // 3. Calculate Imbalance
     let net_delta = hl_pos + pac_pos;
-    let threshold = 0.005; 
+    let threshold = 0.005;
 
     info!("--------------------------------------------------");
-    info!("📊 POSITION REPORT: {}", config.symbol);
+    info!("REPORT POSITION REPORT: {}", config.symbol);
     info!("--------------------------------------------------");
-    info!("Hyperliquid: {:>10.4} (Value: ${:.2})", hl_pos, hl_pos.abs() * hl_mid);
-    info!("Pacifica:    {:>10.4} (Value: ${:.2})", pac_pos, pac_pos.abs() * pac_mid);
+    info!(
+        "Hyperliquid: {:>10.4} (Value: ${:.2})",
+        hl_pos,
+        hl_pos.abs() * hl_mid
+    );
+    info!(
+        "Pacifica:    {:>10.4} (Value: ${:.2})",
+        pac_pos,
+        pac_pos.abs() * pac_mid
+    );
     info!("--------------------------------------------------");
-    info!("Net Delta:   {:>10.4} (Value: ${:.2})", net_delta, net_delta.abs() * avg_price);
+    info!(
+        "Net Delta:   {:>10.4} (Value: ${:.2})",
+        net_delta,
+        net_delta.abs() * avg_price
+    );
     info!("--------------------------------------------------");
 
     if net_delta.abs() < threshold {
-        info!("✅ STATUS: BALANCED (Delta < {})", threshold);
+        info!("OK STATUS: BALANCED (Delta < {})", threshold);
     } else {
-        warn!("⚠️ STATUS: IMBALANCED");
-        info!("Action Required: {} {:.4} to reach neutral.", 
-            if net_delta > 0.0 { "SELL" } else { "BUY" }, 
+        warn!("WARN STATUS: IMBALANCED");
+        info!(
+            "Action Required: {} {:.4} to reach neutral.",
+            if net_delta > 0.0 { "SELL" } else { "BUY" },
             net_delta.abs()
         );
     }

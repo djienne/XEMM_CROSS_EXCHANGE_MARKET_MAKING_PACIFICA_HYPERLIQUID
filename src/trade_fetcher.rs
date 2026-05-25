@@ -3,13 +3,12 @@
 /// This module contains the logic for fetching actual trade fills from
 /// both exchanges after a hedge execution. This is used by the main bot
 /// for profit calculation and can be tested independently.
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connector::pacifica::trading::{PacificaTrading, TradeHistoryItem};
 use crate::connector::hyperliquid::trading::HyperliquidTrading;
 use crate::connector::hyperliquid::types::UserFill;
+use crate::connector::pacifica::trading::{PacificaTrading, TradeHistoryItem};
 
 /// Result of fetching trade data from an exchange
 #[derive(Debug, Clone)]
@@ -17,7 +16,7 @@ pub struct TradeFetchResult {
     pub fill_price: Option<f64>,
     pub actual_fee: Option<f64>,
     pub total_size: Option<f64>,
-    pub total_notional: Option<f64>,  // Actual total USD value from all fills
+    pub total_notional: Option<f64>, // Actual total USD value from all fills
 }
 
 /// Result of profit calculation
@@ -113,21 +112,21 @@ pub async fn fetch_pacifica_trade(
                 let matching_trades: Vec<_> = trades
                     .iter()
                     .filter(|t| {
-                        t.client_order_id.as_deref() == Some(client_order_id) &&
-                        t.event_type == "fulfill_maker"
+                        t.client_order_id.as_deref() == Some(client_order_id)
+                            && t.event_type == "fulfill_maker"
                     })
                     .collect();
 
                 if !matching_trades.is_empty() {
                     log_fn(&format!(
-                        "✓ Found {} matching Pacifica trade(s)",
+                        "OK Found {} matching Pacifica trade(s)",
                         matching_trades.len()
                     ));
 
                     result = calculate_pacifica_trade_result(&matching_trades);
                     break; // Found the trade, exit retry loop
                 } else {
-                    log_fn("⚠ No matching Pacifica trades found yet");
+                    log_fn("WARN No matching Pacifica trades found yet");
 
                     if attempt < max_attempts {
                         log_fn("Waiting 10 seconds before retry...");
@@ -136,7 +135,10 @@ pub async fn fetch_pacifica_trade(
                 }
             }
             Err(e) => {
-                log_fn(&format!("✗ Failed to fetch Pacifica trade history: {}", e));
+                log_fn(&format!(
+                    "FAIL Failed to fetch Pacifica trade history: {}",
+                    e
+                ));
 
                 if attempt < max_attempts {
                     log_fn("Waiting 10 seconds before retry...");
@@ -251,21 +253,19 @@ pub async fn fetch_hyperliquid_fills(
 
                 let recent_fills: Vec<_> = fills
                     .iter()
-                    .filter(|f| {
-                        f.coin == symbol && now.saturating_sub(f.time) < time_window_ms
-                    })
+                    .filter(|f| f.coin == symbol && now.saturating_sub(f.time) < time_window_ms)
                     .collect();
 
                 if !recent_fills.is_empty() {
                     log_fn(&format!(
-                        "✓ Found {} matching Hyperliquid fill(s)",
+                        "OK Found {} matching Hyperliquid fill(s)",
                         recent_fills.len()
                     ));
 
                     result = calculate_hyperliquid_fill_result(&recent_fills);
                     break; // Found the fills, exit retry loop
                 } else {
-                    log_fn("⚠ No matching Hyperliquid fills found yet");
+                    log_fn("WARN No matching Hyperliquid fills found yet");
 
                     if attempt < max_attempts {
                         log_fn("Waiting 10 seconds before retry...");
@@ -274,7 +274,7 @@ pub async fn fetch_hyperliquid_fills(
                 }
             }
             Err(e) => {
-                log_fn(&format!("✗ Failed to fetch Hyperliquid fills: {}", e));
+                log_fn(&format!("FAIL Failed to fetch Hyperliquid fills: {}", e));
 
                 if attempt < max_attempts {
                     log_fn("Waiting 10 seconds before retry...");

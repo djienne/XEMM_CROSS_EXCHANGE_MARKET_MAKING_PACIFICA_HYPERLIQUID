@@ -85,7 +85,7 @@ class HyperliquidConnector extends EventEmitter {
 
     // REST: max 1200 weight per minute (l2Book has weight 2)
     this.restRateLimiter = new SlidingWindowRateLimiter({
-      maxRequests: 600, // 600 requests × 2 weight = 1200
+      maxRequests: 600, // 600 requests x 2 weight = 1200
       windowMs: 60000 // 1 minute
     });
 
@@ -1159,7 +1159,7 @@ class HyperliquidConnector extends EventEmitter {
     let midPrice;
     if (options.overrideMidPrice && Number.isFinite(options.overrideMidPrice)) {
       midPrice = options.overrideMidPrice;
-      console.log(`[Hyperliquid] ℹ️ Using provided override mid-price: ${midPrice}`);
+      console.log(`[Hyperliquid] INFO Using provided override mid-price: ${midPrice}`);
     } else {
       // Use cached prices from the REST poller
       let bidAsk = this.getBidAsk(coin);
@@ -1173,7 +1173,7 @@ class HyperliquidConnector extends EventEmitter {
         }
       }
       
-      console.log(`[Hyperliquid] ℹ️ Using cached prices (age: ${Date.now() - bidAsk.timestamp}ms): bid=${bidAsk.bid}, ask=${bidAsk.ask}`);
+      console.log(`[Hyperliquid] INFO Using cached prices (age: ${Date.now() - bidAsk.timestamp}ms): bid=${bidAsk.bid}, ask=${bidAsk.ask}`);
 
       // Calculate mid price
       midPrice = (bidAsk.bid + bidAsk.ask) / 2;

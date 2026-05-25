@@ -11,7 +11,6 @@
 /// - PACIFICA_API_KEY
 /// - PACIFICA_SECRET_KEY
 /// - PACIFICA_ACCOUNT
-
 use anyhow::{Context, Result};
 use colored::Colorize;
 use xemm_rust::connector::pacifica::{PacificaCredentials, PacificaTrading};
@@ -32,10 +31,11 @@ async fn main() -> Result<()> {
     println!();
 
     // Load credentials from environment
-    let credentials = PacificaCredentials::from_env()
-        .context("Failed to load Pacifica credentials from .env")?;
+    let credentials =
+        PacificaCredentials::from_env().context("Failed to load Pacifica credentials from .env")?;
 
-    println!("{} {}: {}",
+    println!(
+        "{} {}: {}",
         "[INFO]".cyan().bold(),
         "Account".bright_white(),
         credentials.account.yellow()
@@ -43,22 +43,26 @@ async fn main() -> Result<()> {
     println!();
 
     // Create trading client
-    let trading_client = PacificaTrading::new(credentials)
-        .context("Failed to create Pacifica trading client")?;
+    let trading_client =
+        PacificaTrading::new(credentials).context("Failed to create Pacifica trading client")?;
 
     // Fetch current positions
-    println!("{} Fetching positions...", "→".cyan().bold());
-    let positions = trading_client.get_positions().await
+    println!("{} Fetching positions...", "->".cyan().bold());
+    let positions = trading_client
+        .get_positions()
+        .await
         .context("Failed to fetch positions")?;
 
     if positions.is_empty() {
-        println!("{} {}",
-            "✓".green().bold(),
+        println!(
+            "{} {}",
+            "OK".green().bold(),
             "No open positions".bright_white()
         );
     } else {
-        println!("{} Found {} position(s):\n",
-            "✓".green().bold(),
+        println!(
+            "{} Found {} position(s):\n",
+            "OK".green().bold(),
             positions.len().to_string().bright_white().bold()
         );
 
@@ -74,10 +78,7 @@ async fn main() -> Result<()> {
             let funding: f64 = pos.funding.parse().unwrap_or(0.0);
             let notional = amount * entry;
 
-            println!("  {} {}",
-                pos.symbol.bright_white().bold(),
-                side_display
-            );
+            println!("  {} {}", pos.symbol.bright_white().bold(), side_display);
             println!("    Size:     {}", amount.to_string().bright_white());
             println!("    Entry:    ${:.4}", entry.to_string().cyan());
             println!("    Notional: ${:.2}", notional.to_string().bright_white());
@@ -87,7 +88,8 @@ async fn main() -> Result<()> {
         }
 
         // Summary
-        let total_notional: f64 = positions.iter()
+        let total_notional: f64 = positions
+            .iter()
             .map(|p| {
                 let amount: f64 = p.amount.parse().unwrap_or(0.0);
                 let entry: f64 = p.entry_price.parse().unwrap_or(0.0);
@@ -96,11 +98,14 @@ async fn main() -> Result<()> {
             .sum();
 
         println!("{}", "─".repeat(40).bright_black());
-        println!("  Total Notional: ${:.2}", total_notional.to_string().bright_white().bold());
+        println!(
+            "  Total Notional: ${:.2}",
+            total_notional.to_string().bright_white().bold()
+        );
     }
 
     println!();
-    println!("{} Test completed successfully", "✓".green().bold());
+    println!("{} Test completed successfully", "OK".green().bold());
 
     Ok(())
 }

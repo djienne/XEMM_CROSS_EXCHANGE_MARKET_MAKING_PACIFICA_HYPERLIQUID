@@ -92,7 +92,7 @@ Pacifica implements IP and API Config Key based rate limiting.\
 2. any http method except c used will decrement the credit by one (for now all requests have the same weighting)
 3. if user makes request while credit < 0, then return HTTP429
 4. credits reset back to 300 at the end of each 60 second interval
-5. cancellations use ½ credits\\
+5. cancellations use 1/2 credits\\
 
 **For Websocket API:**\\
 

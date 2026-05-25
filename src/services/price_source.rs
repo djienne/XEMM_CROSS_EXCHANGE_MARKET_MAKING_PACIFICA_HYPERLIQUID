@@ -3,7 +3,7 @@
 //! Replaces the four near-identical services in `orderbook.rs` and
 //! `rest_poll.rs` with two generic structs parameterised over a trait per
 //! transport. Adding a third exchange now only requires one trait impl on
-//! the connector side — no new service wrapper.
+//! the connector side - no new service wrapper.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use fast_float::parse;
 use tokio::time::interval;
 use tracing::{debug, error, info};
 
-use crate::util::price::SharedQuote;
+use crate::util::price::{QuoteSource, SharedQuote};
 
 /// Callback the connector pushes (bid, ask, symbol, ts) through. Boxed so
 /// the trait below can stay object-safe across different client types.
@@ -53,7 +53,7 @@ impl<C: PriceStream> PriceStreamService<C> {
         let cb: BookCallback = Box::new(move |bid, ask, _sym, _ts| {
             let b: f64 = parse(&bid).unwrap_or(0.0);
             let a: f64 = parse(&ask).unwrap_or(0.0);
-            prices.store(b, a);
+            prices.store_with_source(b, a, _ts, QuoteSource::Stream);
         });
         if let Err(e) = self.client.run_with(cb).await {
             error!("[{}] Price stream exited: {}", label, e);
@@ -78,7 +78,8 @@ impl<P: PricePoll> PricePollService<P> {
             ticker.tick().await;
             match self.source.fetch().await {
                 Ok(Some((bid, ask))) => {
-                    self.prices.store(bid, ask);
+                    self.prices
+                        .store_with_source(bid, ask, 0, QuoteSource::Rest);
                     debug!(
                         "[{}] Updated prices via REST: bid=${:.4}, ask=${:.4}",
                         label, bid, ask

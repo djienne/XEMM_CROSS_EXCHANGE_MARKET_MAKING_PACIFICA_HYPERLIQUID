@@ -27,7 +27,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Check if they match
     let derived_addr = format!("{:?}", wallet1.address());
-    println!("Match with HL_WALLET: {}", derived_addr.to_lowercase() == hl_wallet.to_lowercase());
+    println!(
+        "Match with HL_WALLET: {}",
+        derived_addr.to_lowercase() == hl_wallet.to_lowercase()
+    );
 
     Ok(())
 }

@@ -21,12 +21,12 @@ async fn main() -> Result<()> {
     let result = trading
         .place_market_order(
             "ENA",
-            true,          // is_buy = true (closes short)
-            50.0,          // size
-            0.10,          // 10% slippage (higher to ensure fill)
-            false,         // reduce_only = false (NEVER true on Hyperliquid)
-            Some(0.39),    // bid
-            Some(0.40),    // ask (manually set to avoid rounding issues)
+            true,       // is_buy = true (closes short)
+            50.0,       // size
+            0.10,       // 10% slippage (higher to ensure fill)
+            false,      // reduce_only = false (NEVER true on Hyperliquid)
+            Some(0.39), // bid
+            Some(0.40), // ask (manually set to avoid rounding issues)
         )
         .await?;
 

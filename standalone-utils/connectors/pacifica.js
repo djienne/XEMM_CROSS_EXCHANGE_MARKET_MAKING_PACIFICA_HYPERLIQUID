@@ -2025,10 +2025,10 @@ class PacificaConnector extends EventEmitter {
     }
 
     console.error('\n' + '='.repeat(80));
-    console.error('🚨 [PACIFICA] RATE LIMIT EXCEEDED (HTTP 429)');
+    console.error('ALERT [PACIFICA] RATE LIMIT EXCEEDED (HTTP 429)');
     console.error('='.repeat(80));
-    console.error('⚠️  Trading HALTED to prevent imbalances');
-    console.error(`⏱️  Cooldown period: ${this.rateLimitCooldownMs / 1000}s`);
+    console.error('WARN  Trading HALTED to prevent imbalances');
+    console.error(`TIME  Cooldown period: ${this.rateLimitCooldownMs / 1000}s`);
     console.error('='.repeat(80) + '\n');
 
     // Set flag to halt trading
@@ -2042,18 +2042,18 @@ class PacificaConnector extends EventEmitter {
 
     // CRITICAL: Try to cancel all orders via WebSocket (doesn't count against REST rate limit!)
     if (this.connected && this.ws) {
-      console.log('🔄 [PACIFICA] Attempting WebSocket order cancellation (safe - no REST API calls)...');
+      console.log(' [PACIFICA] Attempting WebSocket order cancellation (safe - no REST API calls)...');
       try {
         const cancelParams = await this.buildCancelAllParams();
         const result = await this.cancelAllOrdersWebSocket(cancelParams);
-        console.log('✅ [PACIFICA] Orders cancelled via WebSocket:', result);
+        console.log('OK [PACIFICA] Orders cancelled via WebSocket:', result);
       } catch (wsError) {
-        console.error('❌ [PACIFICA] WebSocket cancellation failed:', wsError.message);
-        console.error('⚠️  Open orders may still be active - monitor positions carefully!');
+        console.error('ERROR [PACIFICA] WebSocket cancellation failed:', wsError.message);
+        console.error('WARN  Open orders may still be active - monitor positions carefully!');
       }
     } else {
-      console.error('❌ [PACIFICA] WebSocket not connected - cannot cancel orders safely');
-      console.error('⚠️  Open orders may still be active - monitor positions carefully!');
+      console.error('ERROR [PACIFICA] WebSocket not connected - cannot cancel orders safely');
+      console.error('WARN  Open orders may still be active - monitor positions carefully!');
     }
 
     console.log();
@@ -2066,9 +2066,9 @@ class PacificaConnector extends EventEmitter {
     // Start cooldown timer for auto-recovery
     this.rateLimitCooldownTimer = setTimeout(() => {
       console.log('\n' + '='.repeat(80));
-      console.log('✅ [PACIFICA] Rate limit cooldown complete');
+      console.log('OK [PACIFICA] Rate limit cooldown complete');
       console.log('='.repeat(80));
-      console.log('🔄 Trading RESUMED');
+      console.log(' Trading RESUMED');
       console.log('='.repeat(80) + '\n');
 
       this.rateLimitExceeded = false;
@@ -2143,7 +2143,7 @@ class PacificaConnector extends EventEmitter {
 
     // Use WebSocket if rate limited (doesn't count against REST rate limits)
     if (this.rateLimitExceeded) {
-      console.log('[PACIFICA] 🔄 Using WebSocket cancel (rate limited)');
+      console.log('[PACIFICA]  Using WebSocket cancel (rate limited)');
       return await this.cancelAllOrdersWebSocket(cancelAllParams);
     }
 

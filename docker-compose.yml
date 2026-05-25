@@ -36,7 +36,7 @@ services:
     
     # Health check (optional - checks if process is running)
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "xemm_bot"]
+      test: ["CMD", "pgrep", "-f", "xemm_rust"]
       interval: 30s
       timeout: 10s
       retries: 3

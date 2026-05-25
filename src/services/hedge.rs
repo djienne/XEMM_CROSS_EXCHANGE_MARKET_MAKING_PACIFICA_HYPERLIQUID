@@ -1,44 +1,41 @@
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
 use crate::util::log::{tag, Color};
 use crate::util::price::SharedQuote;
 use colored::Colorize;
-use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::RwLock;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
-use fast_float::parse;
-use tracing::{info, warn, error};
+use tokio::sync::mpsc;
+use tokio_tungstenite::{
+    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
+};
+use tracing::{debug, error, info, warn};
 
 use crate::bot::BotState;
 use crate::config::Config;
+use crate::connector::hyperliquid::types::{
+    FilledOrder, OrderResponse, OrderResponseContent, OrderResponseData, OrderStatus,
+    OrderStatusData, WsPostRequest, WsPostRequestInner, WsPostResponse,
+};
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::hyperliquid::types::{WsPostRequest, WsPostRequestInner, WsPostResponse};
 use crate::connector::pacifica::PacificaTrading;
+use crate::services::fill_aggregator::FillAggregator;
+use crate::services::hedge_store::{self, HedgeIntentStatus, HedgeLifecycleUpdate};
+use crate::services::post_trade_auditor::PostTradeAuditEvent;
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
-use crate::trade_fetcher;
-use crate::csv_logger;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 type WsRead = futures_util::stream::SplitStream<WsStream>;
 
-
-
-/// Hedge execution service
+/// Hot hedge execution service.
 ///
-/// Receives hedge triggers via mpsc channel and executes the hedge flow:
-/// 1. Pre-hedge cancellation of all Pacifica orders
-/// 2. Execute market order on Hyperliquid (opposite direction)
-/// 3. Wait for trade propagation (20s)
-/// 4. Fetch trade history from both exchanges
-/// 5. Calculate actual profit using real fill data and fees
-/// 6. Display comprehensive trade summary
-/// 7. Post-hedge cancellation (safety)
-/// 8. Position verification on both exchanges
-/// 9. Mark cycle complete and signal shutdown
+/// Receives hedge intents, cancels maker exposure in the background, submits
+/// Hyperliquid IOC hedges with deterministic CLOIDs, confirms filled size, and
+/// retries residuals. Slow trade-history, PnL, CSV, and final verification work
+/// is handed to `PostTradeAuditorService`.
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_rx: mpsc::Receiver<HedgeEvent>,
@@ -46,6 +43,8 @@ pub struct HedgeService {
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub pacifica_trading: Arc<PacificaTrading>,
+    pub fill_aggregator: Arc<FillAggregator>,
+    pub audit_tx: mpsc::Sender<PostTradeAuditEvent>,
     pub shutdown_tx: mpsc::Sender<()>,
     /// Fires when the main loop wants the hedge service to stop. The service
     /// drains any events already in `hedge_rx` and then exits cleanly. This
@@ -67,7 +66,7 @@ impl HedgeService {
                     info!(
                         "{} {} Hyperliquid trading WebSocket connected (hedge execution via WS)",
                         tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "✓".green().bold(),
+                        "OK".green().bold(),
                     );
                     ws_write = Some(write);
                     ws_read = Some(read);
@@ -76,7 +75,7 @@ impl HedgeService {
                     warn!(
                         "{} {} Failed to pre-connect Hyperliquid trading WebSocket (using REST until reconnect succeeds): {}",
                         tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "⚠".yellow().bold(),
+                        "WARN".yellow().bold(),
                         e
                     );
                 }
@@ -92,14 +91,14 @@ impl HedgeService {
 
         loop {
             tokio::select! {
-                // Shutdown requested by main loop — stop accepting new events and
+                // Shutdown requested by main loop - stop accepting new events and
                 // process whatever is already queued. One tick later we'll see
                 // hedge_rx return None / empty and exit.
                 _ = shutdown_signal.notified(), if !draining => {
                     info!(
                         "{} {} Shutdown signal received, draining {} pending hedge event(s)",
                         tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "⏳".yellow().bold(),
+                        "WAIT".yellow().bold(),
                         self.hedge_rx.len()
                     );
                     draining = true;
@@ -108,7 +107,7 @@ impl HedgeService {
                         info!(
                             "{} {} Hedge queue already empty, exiting",
                             tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                            "✓".green().bold()
+                            "OK".green().bold()
                         );
                         let _ = self.shutdown_tx.send(()).await;
                         return;
@@ -117,23 +116,46 @@ impl HedgeService {
 
                 // Send periodic pings to keep WebSocket connection warm
                 _ = keepalive_interval.tick() => {
-                    if let Some(write) = ws_write.as_mut() {
+                    if use_ws_for_hedge && (ws_write.is_none() || ws_read.is_none()) {
+                        match self.connect_hyperliquid_ws().await {
+                            Ok((write, read)) => {
+                                info!(
+                                    "{} {} Hyperliquid trading WebSocket restored in background",
+                                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                    "OK".green().bold()
+                                );
+                                ws_write = Some(write);
+                                ws_read = Some(read);
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "{} Hyperliquid background reconnect failed: {}",
+                                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                    e
+                                );
+                            }
+                        }
+                    } else if let Some(write) = ws_write.as_mut() {
                         if let Err(e) = write.send(Message::Ping(vec![])).await {
                             warn!("{} {} Failed to send keepalive ping: {}",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "⚠".yellow().bold(),
+                                "WARN".yellow().bold(),
                                 e
                             );
-                            // Connection likely dead, clear write handle
                             ws_write = None;
+                            ws_read = None;
                         }
                     }
                 }
 
                 // Main hedge event processing
-                Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv() => {
+                Some(event) = self.hedge_rx.recv() => {
+            let side = event.side;
+            let size = event.size;
+            let avg_price = event.avg_price;
+            let fill_timestamp = event.detected_at;
             let reception_latency = fill_timestamp.elapsed();
-            info!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
+            info!("{} FAST HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                 side.as_str().bright_yellow(),
                 size,
@@ -151,7 +173,7 @@ impl HedgeService {
             tokio::spawn(async move {
                 info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
                     tag(&symbol_bg, "HEDGE", Color::BrightMagenta),
-                    "⚡".yellow().bold()
+                    "FAST".yellow().bold()
                 );
 
                 if let Err(e) = pacifica_trading_bg
@@ -160,35 +182,39 @@ impl HedgeService {
                 {
                     warn!("{} {} Failed to cancel orders before hedge: {}",
                         tag(&symbol_bg, "HEDGE", Color::BrightMagenta),
-                        "⚠".yellow().bold(),
+                        "WARN".yellow().bold(),
                         e
                     );
                 } else {
                     info!("{} {} Pre-hedge cancellation complete",
                         tag(&symbol_bg, "HEDGE", Color::BrightMagenta),
-                        "✓".green().bold()
+                        "OK".green().bold()
                     );
                 }
             });
 
             // Update status
             {
-                let mut state = self.bot_state.write().await;
+                let mut state = self.bot_state.write();
                 state.mark_hedging();
             }
 
             // Execute opposite direction on Hyperliquid
             let is_buy = match side {
-                OrderSide::Buy => false, // Filled buy on Pacifica → sell on Hyperliquid
-                OrderSide::Sell => true, // Filled sell on Pacifica → buy on Hyperliquid
+                OrderSide::Buy => false, // Filled buy on Pacifica -> sell on Hyperliquid
+                OrderSide::Sell => true, // Filled sell on Pacifica -> buy on Hyperliquid
             };
 
-            let (mut hl_bid, mut hl_ask) = self.hyperliquid_prices.load();
+            let (mut hl_bid, mut hl_ask) = self
+                .hyperliquid_prices
+                .usable_snapshot(Duration::from_millis(self.config.hedge_quote_max_age_ms))
+                .map(|q| (q.bid, q.ask))
+                .unwrap_or((0.0, 0.0));
 
             if hl_bid <= 0.0 || hl_ask <= 0.0 {
                 warn!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                    "⚠".yellow().bold()
+                    "WARN".yellow().bold()
                 );
 
                 const MAX_ATTEMPTS: usize = 5;
@@ -200,7 +226,7 @@ impl HedgeService {
                             self.hyperliquid_prices.store(bid, ask);
                             info!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "✓".green().bold(),
+                                "OK".green().bold(),
                                 hl_bid,
                                 hl_ask
                             );
@@ -209,7 +235,7 @@ impl HedgeService {
                         Ok(_) => {
                             warn!("{} {} Snapshot missing bid/ask data (attempt {}/{})",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "⚠".yellow().bold(),
+                                "WARN".yellow().bold(),
                                 attempt,
                                 MAX_ATTEMPTS
                             );
@@ -217,7 +243,7 @@ impl HedgeService {
                         Err(err) => {
                             warn!("{} {} Failed to fetch Hyperliquid snapshot (attempt {}/{}): {}",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "⚠".yellow().bold(),
+                                "WARN".yellow().bold(),
                                 attempt,
                                 MAX_ATTEMPTS,
                                 err
@@ -227,13 +253,12 @@ impl HedgeService {
 
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let cached = self.hyperliquid_prices.load();
-                        hl_bid = cached.0;
-                        hl_ask = cached.1;
-                        if hl_bid > 0.0 && hl_ask > 0.0 {
+                        if let Some(cached) = self.hyperliquid_prices.usable_snapshot(Duration::from_millis(self.config.hedge_quote_max_age_ms)) {
+                            hl_bid = cached.bid;
+                            hl_ask = cached.ask;
                             info!("{} {} Hyperliquid prices populated by feed during wait",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "✓".green().bold()
+                                "OK".green().bold()
                             );
                             break;
                         }
@@ -243,14 +268,23 @@ impl HedgeService {
                 if hl_bid <= 0.0 || hl_ask <= 0.0 {
                     error!("{} {} Unable to obtain Hyperliquid prices - aborting hedge for safety",
                         tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "✗".red().bold()
+                        "FAIL".red().bold()
                     );
 
-                    let mut state = self.bot_state.write().await;
-                    state.set_error("Hyperliquid prices unavailable for hedge".to_string());
+                    let mut failed_update =
+                        HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Error);
+                    failed_update.target_qty = Some(size);
+                    failed_update.residual_qty = Some(size);
+                    failed_update.reason =
+                        Some("Hyperliquid prices unavailable for hedge".to_string());
+                    let _ = hedge_store::append_lifecycle_update(failed_update).await;
 
-                    self.shutdown_tx.send(()).await.ok();
-                    return;
+                    {
+                        let mut state = self.bot_state.write();
+                        state.mark_reconciling();
+                    }
+
+                    continue;
                 }
             }
 
@@ -273,7 +307,7 @@ impl HedgeService {
                     warn!(
                         "{} {} Hedge attempt {} failed, retrying in {}ms: {}",
                         tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "↻".yellow().bold(),
+                        "retry".yellow().bold(),
                         attempt,
                         delay_ms,
                         hedge_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
@@ -281,13 +315,27 @@ impl HedgeService {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
                     // Refresh prices in case slippage ceiling would now reject the order.
-                    let cached = self.hyperliquid_prices.load();
-                    if cached.0 > 0.0 && cached.1 > 0.0 {
-                        hl_bid = cached.0;
-                        hl_ask = cached.1;
+                    if let Some(cached) = self.hyperliquid_prices.usable_snapshot(Duration::from_millis(self.config.hedge_quote_max_age_ms)) {
+                        hl_bid = cached.bid;
+                        hl_ask = cached.ask;
                     }
                 }
 
+                let cloid = Self::hedge_cloid(event.source_order_id, event.hedge_seq, attempt as u64);
+                let mut submitted = HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Submitted);
+                submitted.cloid = Some(&cloid);
+                submitted.target_qty = Some(size);
+                submitted.residual_qty = Some(size);
+                submitted.attempt = Some(attempt as u64);
+                if let Err(e) = hedge_store::append_lifecycle_update(submitted).await {
+                    warn!(
+                        "{} Failed to persist hedge submission lifecycle event: {}",
+                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                        e
+                    );
+                }
+
+                let submitted_after_ms = Self::unix_ms();
                 hedge_result = if use_ws_for_hedge {
                     // Ensure we have an active trading WebSocket
                     if ws_write.is_none() || ws_read.is_none() {
@@ -296,7 +344,7 @@ impl HedgeService {
                                 info!(
                                     "{} {} Reconnected Hyperliquid trading WebSocket for hedge execution",
                                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                    "✓".green().bold()
+                                    "OK".green().bold()
                                 );
                                 ws_write = Some(write);
                                 ws_read = Some(read);
@@ -305,7 +353,7 @@ impl HedgeService {
                                 warn!(
                                     "{} {} Failed to connect Hyperliquid trading WebSocket, falling back to REST for this hedge: {}",
                                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                    "⚠".yellow().bold(),
+                                    "WARN".yellow().bold(),
                                     e
                                 );
                             }
@@ -313,39 +361,67 @@ impl HedgeService {
                     }
 
                     if let (Some(write), Some(read)) = (ws_write.as_mut(), ws_read.as_mut()) {
-                        match self
-                            .place_market_order_ws(write, read, &mut ws_request_id, is_buy, size, hl_bid, hl_ask)
-                            .await
+                        match tokio::time::timeout(
+                            Duration::from_millis(self.config.hedge_ws_response_timeout_ms),
+                            self.place_market_order_ws(
+                                write,
+                                read,
+                                &mut ws_request_id,
+                                is_buy,
+                                size,
+                                hl_bid,
+                                hl_ask,
+                                Some(cloid.clone()),
+                            ),
+                        )
+                        .await
                         {
-                            Ok(response) => Ok(response),
-                            Err(e) => {
+                            Ok(Ok(response)) => Ok(response),
+                            Err(_) => {
                                 warn!(
-                                    "{} {} WebSocket hedge execution failed, falling back to REST: {}",
+                                    "{} {} Hyperliquid WebSocket hedge timed out, checking fills before REST fallback",
                                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                    "⚠".yellow().bold(),
+                                    "timeout".yellow().bold()
+                                );
+                                ws_write = None;
+                                ws_read = None;
+
+                                self.confirm_recent_fill_or_place_rest(
+                                    is_buy,
+                                    size,
+                                    hl_bid,
+                                    hl_ask,
+                                    &cloid,
+                                    submitted_after_ms,
+                                )
+                                .await
+                            }
+                            Ok(Err(e)) => {
+                                warn!(
+                                    "{} {} WebSocket hedge execution failed, checking fills before REST fallback: {}",
+                                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                    "WARN".yellow().bold(),
                                     e
                                 );
                                 // Drop WS so next hedge attempts a clean reconnect
                                 ws_write = None;
                                 ws_read = None;
 
-                                self.hyperliquid_trading
-                                    .place_market_order(
-                                        &self.config.symbol,
-                                        is_buy,
-                                        size,
-                                        self.config.hyperliquid_slippage,
-                                        false, // reduce_only
-                                        Some(hl_bid),
-                                        Some(hl_ask),
-                                    )
-                                    .await
+                                self.confirm_recent_fill_or_place_rest(
+                                    is_buy,
+                                    size,
+                                    hl_bid,
+                                    hl_ask,
+                                    &cloid,
+                                    submitted_after_ms,
+                                )
+                                .await
                             }
                         }
                     } else {
-                        // No WS connection available – use REST for this hedge
+                        // No WS connection available - use REST for this hedge
                         self.hyperliquid_trading
-                            .place_market_order(
+                            .place_market_order_with_cloid(
                                 &self.config.symbol,
                                 is_buy,
                                 size,
@@ -353,13 +429,14 @@ impl HedgeService {
                                 false, // reduce_only
                                 Some(hl_bid),
                                 Some(hl_ask),
+                                Some(cloid.clone()),
                             )
                             .await
                     }
                 } else {
-                    // WS disabled via config – use REST only
+                    // WS disabled via config - use REST only
                     self.hyperliquid_trading
-                        .place_market_order(
+                        .place_market_order_with_cloid(
                             &self.config.symbol,
                             is_buy,
                             size,
@@ -367,23 +444,108 @@ impl HedgeService {
                             false, // reduce_only
                             Some(hl_bid),
                             Some(hl_ask),
+                            Some(cloid.clone()),
                         )
                         .await
                 };
 
+                if hedge_result.is_err() {
+                    match self
+                        .confirm_recent_hyperliquid_fill(is_buy, submitted_after_ms, size, 100)
+                        .await
+                    {
+                        Ok(Some(response)) => {
+                            warn!(
+                                "{} {} Confirmed hedge fill from recent Hyperliquid fills after submit uncertainty",
+                                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                "OK".green().bold()
+                            );
+                            hedge_result = Ok(response);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(
+                                "{} {} Could not confirm uncertain hedge via recent fills: {}",
+                                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                "WARN".yellow().bold(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                let mut attempt_update = HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Unknown);
+                attempt_update.cloid = Some(&cloid);
+                attempt_update.target_qty = Some(size);
+                attempt_update.attempt = Some(attempt as u64);
+                match &hedge_result {
+                    Ok(resp) => match &resp.response {
+                        OrderResponseContent::Success(data) => match data.data.statuses.first() {
+                            Some(OrderStatus::Filled { .. }) => {
+                                if let Some((_, filled_qty)) = Self::filled_qty_from_response(resp) {
+                                    let residual = (size - filled_qty).max(0.0);
+                                    attempt_update.status =
+                                        if residual <= self.config.neutral_dust_base.max(1e-9) {
+                                            HedgeIntentStatus::Filled
+                                        } else {
+                                            HedgeIntentStatus::PartiallyFilled
+                                        };
+                                    attempt_update.filled_qty = Some(filled_qty);
+                                    attempt_update.residual_qty = Some(residual);
+                                } else {
+                                    attempt_update.reason =
+                                        Some("response fill values were not parseable".to_string());
+                                }
+                            }
+                            Some(OrderStatus::Error { error }) => {
+                                attempt_update.status = HedgeIntentStatus::Error;
+                                attempt_update.reason =
+                                    Some(format!("HL order status error: {}", error));
+                            }
+                            Some(OrderStatus::Resting { resting }) => {
+                                attempt_update.status = HedgeIntentStatus::Error;
+                                attempt_update.reason = Some(format!(
+                                    "HL order unexpectedly resting (oid {})",
+                                    resting.oid
+                                ));
+                            }
+                            None => {
+                                attempt_update.status = HedgeIntentStatus::Error;
+                                attempt_update.reason =
+                                    Some("HL hedge response missing statuses".to_string());
+                            }
+                        },
+                        OrderResponseContent::Error(e) => {
+                            attempt_update.status = HedgeIntentStatus::Error;
+                            attempt_update.reason = Some(format!("HL response error: {}", e));
+                        }
+                    },
+                    Err(e) => {
+                        attempt_update.status = HedgeIntentStatus::Error;
+                        attempt_update.reason = Some(e.to_string());
+                    }
+                }
+                if let Err(e) = hedge_store::append_lifecycle_update(attempt_update).await {
+                    warn!(
+                        "{} Failed to persist hedge attempt lifecycle event: {}",
+                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                        e
+                    );
+                }
+
                 // Only break the retry loop on a true "filled" success. Hyperliquid
-                // returns Ok with an internal OrderStatus::Error for rejections — treat
+                // returns Ok with an internal OrderStatus::Error for rejections - treat
                 // those as retryable.
                 let success_or_retry = match &hedge_result {
                     Ok(resp) => match &resp.response {
-                        crate::connector::hyperliquid::OrderResponseContent::Success(data) => {
+                        OrderResponseContent::Success(data) => {
                             match data.data.statuses.first() {
-                                Some(crate::connector::hyperliquid::OrderStatus::Filled { .. }) => true,
-                                Some(crate::connector::hyperliquid::OrderStatus::Error { error }) => {
+                                Some(OrderStatus::Filled { .. }) => true,
+                                Some(OrderStatus::Error { error }) => {
                                     hedge_result = Err(anyhow::anyhow!("HL order status error: {}", error));
                                     false
                                 }
-                                Some(crate::connector::hyperliquid::OrderStatus::Resting { resting }) => {
+                                Some(OrderStatus::Resting { resting }) => {
                                     hedge_result = Err(anyhow::anyhow!("HL order unexpectedly resting (oid {})", resting.oid));
                                     false
                                 }
@@ -393,7 +555,7 @@ impl HedgeService {
                                 }
                             }
                         }
-                        crate::connector::hyperliquid::OrderResponseContent::Error(e) => {
+                        OrderResponseContent::Error(e) => {
                             hedge_result = Err(anyhow::anyhow!("HL response error: {}", e));
                             false
                         }
@@ -416,16 +578,16 @@ impl HedgeService {
                             // but handle it defensively
                             error!("{} {} Hedge response contains error: {}",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "✗".red().bold(),
+                                "FAIL".red().bold(),
                                 error
                             );
 
-                            let mut state = self.bot_state.write().await;
-                            state.set_error(format!("Hedge failed: {}", error));
-                            drop(state);
+                            {
+                                let mut state = self.bot_state.write();
+                                state.mark_reconciling();
+                            }
 
-                            self.shutdown_tx.send(()).await.ok();
-                            return;
+                            continue;
                         }
                     };
 
@@ -433,479 +595,303 @@ impl HedgeService {
                     let end_to_end_latency = fill_timestamp.elapsed();
 
                     // Validate and extract order status
-                    let hedge_fill_price = if let Some(status) = response_data.data.statuses.first() {
+                    let hedge_fill = if let Some(status) = response_data.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
                                 info!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                    "✓".green().bold(),
+                                    "OK".green().bold(),
                                     filled.total_sz,
                                     filled.avg_px,
                                     end_to_end_latency.as_secs_f64() * 1000.0
                                 );
-                                filled.avg_px.parse::<f64>().ok()
+                                match (filled.avg_px.parse::<f64>().ok(), filled.total_sz.parse::<f64>().ok()) {
+                                    (Some(px), Some(sz)) => Some((px, sz)),
+                                    _ => None,
+                                }
                             }
                             crate::connector::hyperliquid::OrderStatus::Error { error } => {
                                 error!("{} {} Hedge order FAILED: {}",
                                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                    "✗".red().bold(),
+                                    "FAIL".red().bold(),
                                     error
                                 );
 
                                 // Set error state
                                 {
-                                    let mut state = self.bot_state.write().await;
-                                    state.set_error(format!("Hedge order failed: {}", error));
+                                    let mut state = self.bot_state.write();
+                                    state.mark_reconciling();
                                 }
 
-                                // Signal shutdown with error
-                                self.shutdown_tx.send(()).await.ok();
-                                return;  // Exit hedge service immediately
+                                continue;
                             }
                             crate::connector::hyperliquid::OrderStatus::Resting { resting } => {
                                 warn!("{} {} Hedge order is RESTING (oid: {}) - unexpected for IOC market order",
                                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                    "⚠".yellow().bold(),
+                                    "WARN".yellow().bold(),
                                     resting.oid
                                 );
 
                                 // Treat as error - IOC orders should never rest
                                 {
-                                    let mut state = self.bot_state.write().await;
-                                    state.set_error(format!("Hedge order resting (unexpected for IOC): oid {}", resting.oid));
+                                    let mut state = self.bot_state.write();
+                                    state.mark_reconciling();
                                 }
 
-                                self.shutdown_tx.send(()).await.ok();
-                                return;
+                                continue;
                             }
                         }
                     } else {
                         warn!("{} {} Hedge response has no statuses - unexpected API response",
                             tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                            "⚠".yellow().bold()
+                            "WARN".yellow().bold()
                         );
                         None
                     };
 
                     // Validate we got a fill price before continuing
-                    let hedge_fill_price = match hedge_fill_price {
-                        Some(price) => price,
+                    let (hedge_fill_price, mut confirmed_hedge_size) = match hedge_fill {
+                        Some(fill) => fill,
                         None => {
                             error!("{} {} No hedge fill price available - hedge may have failed",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "✗".red().bold()
+                                "FAIL".red().bold()
                             );
 
                             {
-                                let mut state = self.bot_state.write().await;
-                                state.set_error("Hedge execution failed - no fill price".to_string());
+                                let mut state = self.bot_state.write();
+                                state.mark_reconciling();
                             }
 
-                            self.shutdown_tx.send(()).await.ok();
-                            return;
+                            continue;
                         }
                     };
 
-                    // Get expected profit from active order before marking complete
-                    let expected_profit_bps = {
-                        let state = self.bot_state.read().await;
-                        state.active_order.as_ref().map(|o| o.initial_profit_bps)
-                    };
-
-                    // Wait for trades to propagate to exchange APIs (20 seconds)
-                    info!("{} Waiting 20 seconds for trades to propagate to APIs...",
-                        tag(&self.config.symbol, "PROFIT", Color::Blue)
-                    );
-                    tokio::time::sleep(Duration::from_secs(20)).await;
-
-                    // Get client_order_id from bot state
-                    let client_order_id = {
-                        let state = self.bot_state.read().await;
-                        state.active_order.as_ref().map(|o| o.client_order_id.clone())
-                    };
-
-                    // Fetch Pacifica trade history with retry logic
-                    let (pacifica_fill_price, pacifica_actual_fee, pacifica_notional): (Option<f64>, Option<f64>, Option<f64>) = if let Some(cloid) = &client_order_id {
-                        let result = trade_fetcher::fetch_pacifica_trade(
-                            self.pacifica_trading.clone(),
-                            &self.config.symbol,
-                            &cloid,
-                            3, // max_attempts
-                            |msg| {
-                                info!("{} {}",
-                                    tag(&self.config.symbol, "PROFIT", Color::Blue),
-                                    msg
-                                );
-                            }
-                        ).await;
-                        (result.fill_price, result.actual_fee, result.total_notional)
-                    } else {
-                        (None, None, None)
-                    };
-
-                    // Fetch Hyperliquid user fills with retry logic
-                    let hl_wallet = std::env::var("HL_WALLET").unwrap_or_default();
-                    let (hl_fill_price, hl_actual_fee, hl_notional): (Option<f64>, Option<f64>, Option<f64>) = {
-                        let result = trade_fetcher::fetch_hyperliquid_fills(
-                            &self.hyperliquid_trading,
-                            &hl_wallet,
-                            &self.config.symbol,
-                            3, // max_attempts
-                            30, // time_window_secs
-                            |msg| {
-                                info!("{} {}",
-                                    tag(&self.config.symbol, "PROFIT", Color::Blue),
-                                    msg
-                                );
-                            }
-                        ).await;
-                        (result.fill_price, result.actual_fee, result.total_notional)
-                    };
-
-                    // Calculate actual profitability using real fill data and actual fees
-                    let (actual_profit_bps, actual_profit_usd, pacifica_actual_price, hl_actual_price, pac_fee_usd, hl_fee_usd) =
-                        match (pacifica_notional, hl_notional, pacifica_fill_price, hl_fill_price) {
-                            (Some(pac_notional), Some(hl_notional), pac_price_opt, hl_price_opt) => {
-                                // Use ACTUAL notional values from exchanges (not recalculated!)
-                                // This handles multi-fill trades correctly and avoids Pacifica API bugs
-
-                                // Use actual fees from trade history, or fall back to theoretical
-                                let pac_fee = pacifica_actual_fee.unwrap_or_else(|| {
-                                    // Fallback: 1.5 bps on notional
-                                    pac_notional * (self.config.pacifica_maker_fee_bps / 10000.0)
-                                });
-
-                                let hl_fee = hl_actual_fee.unwrap_or_else(|| {
-                                    // Fallback: 4 bps on notional
-                                    hl_notional * (self.config.hyperliquid_taker_fee_bps / 10000.0)
-                                });
-
-                                // Use the shared profit calculation function (same as test utility!)
-                                let is_pacifica_buy = matches!(side, OrderSide::Buy);
-                                let profit = trade_fetcher::calculate_hedge_profit(
-                                    pac_notional,
-                                    hl_notional,
-                                    pac_fee,
-                                    hl_fee,
-                                    is_pacifica_buy,
-                                );
-
-                                (profit.profit_bps, profit.net_profit, pac_price_opt, hl_price_opt, pac_fee, hl_fee)
-                            }
-                            _ => {
-                                // Fallback to fill event data if trade history unavailable
-                                warn!("{} {} Using fill event data (trade history unavailable)",
-                                    tag(&self.config.symbol, "PROFIT", Color::Blue),
-                                    "⚠".yellow().bold()
-                                );
-
-                                // Calculate profit using fill event prices and estimated fees
-                                let hl_price = hedge_fill_price;
-                                let pac_price = avg_price;
-
-                                // Estimate fees using configured rates
-                                let pac_fee = pac_price * size * (self.config.pacifica_maker_fee_bps / 10000.0);
-                                let hl_fee = hl_price * size * (self.config.hyperliquid_taker_fee_bps / 10000.0);
-
-                                // Calculate profit
-                                let (profit_usd, cost, _revenue) = match side {
-                                    OrderSide::Buy => {
-                                        // Bought on Pacifica (maker), Sold on Hyperliquid (taker)
-                                        let cost = (pac_price * size) + pac_fee;
-                                        let revenue = (hl_price * size) - hl_fee;
-                                        (revenue - cost, cost, revenue)
-                                    }
-                                    OrderSide::Sell => {
-                                        // Sold on Pacifica (maker), Bought on Hyperliquid (taker)
-                                        let revenue = (pac_price * size) - pac_fee;
-                                        let cost = (hl_price * size) + hl_fee;
-                                        (revenue - cost, cost, revenue)
-                                    }
-                                };
-
-                                let profit_rate = if cost > 0.0 { profit_usd / cost } else { 0.0 };
-                                let profit_bps = profit_rate * 10000.0;
-
-                                (profit_bps, profit_usd, Some(pac_price), Some(hl_price), pac_fee, hl_fee)
-                            }
-                        };
-
-                    // Log trade to CSV file
-                    if let (Some(pac_price), Some(hl_price)) = (pacifica_actual_price, hl_actual_price) {
-                        let trade_record = csv_logger::TradeRecord::new(
-                            Utc::now(),
-                            end_to_end_latency.as_secs_f64() * 1000.0,  // Convert to milliseconds
-                            self.config.symbol.clone(),
-                            side,
-                            pac_price,
-                            size,
-                            pacifica_notional.unwrap_or(pac_price * size),
-                            pac_fee_usd,
-                            hl_price,
-                            size,
-                            hl_notional.unwrap_or(hl_price * size),
-                            hl_fee_usd,
-                            expected_profit_bps.unwrap_or(0.0),
-                            actual_profit_bps,
-                            actual_profit_usd,
-                        );
-
-                        let csv_file = format!("{}_trades.csv", self.config.symbol.to_lowercase());
-                        // Non-blocking: push the record to the dedicated writer thread so a
-                        // slow disk never stalls the hedge service.
-                        csv_logger::log_trade_async(csv_file.clone(), trade_record);
-                        info!("{} {} Trade queued to {}",
-                            tag(&self.config.symbol, "CSV", Color::BrightGreen),
-                            "✓".green().bold(),
-                            csv_file
-                        );
-                    }
-
-                    // Display comprehensive summary
-                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
-                    info!("{}", "  BOT CYCLE COMPLETE!".green().bold());
-                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
-                    info!("");
-                    info!("{}", "📊 TRADE SUMMARY:".bright_white().bold());
-                    if let Some(pac_price) = pacifica_actual_price {
-                        info!("  {}: {} {} {} @ {} {}",
-                            "Pacifica".bright_magenta(),
-                            side.as_str().bright_yellow(),
-                            format!("{:.4}", size).bright_white(),
-                            self.config.symbol.bright_white().bold(),
-                            format!("${:.6}", pac_price).cyan().bold(),
-                            "(actual fill)".bright_black()
-                        );
-                    }
-                    if let Some(hl_price) = hl_actual_price {
-                        info!("  {}: {} {} {} @ {} {}",
-                            "Hyperliquid".bright_magenta(),
-                            if is_buy { "BUY".green() } else { "SELL".red() },
-                            format!("{:.4}", size).bright_white(),
-                            self.config.symbol.bright_white().bold(),
-                            format!("${:.6}", hl_price).cyan().bold(),
-                            "(actual fill)".bright_black()
-                        );
-                    }
-                    info!("");
-                    info!("{}", "💰 PROFITABILITY:".bright_white().bold());
-                    if let Some(expected) = expected_profit_bps {
-                        info!("  Expected: {} bps", format!("{:.2}", expected).bright_white());
-                    }
-                    if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
-                        let profit_color = if actual_profit_bps > 0.0 { format!("{:.2}", actual_profit_bps).green().bold() } else { format!("{:.2}", actual_profit_bps).red().bold() };
-                        let usd_color = if actual_profit_usd > 0.0 { format!("${:.4}", actual_profit_usd).green().bold() } else { format!("${:.4}", actual_profit_usd).red().bold() };
-                        info!("  Actual:   {} bps ({})", profit_color, usd_color);
-                        if let Some(expected) = expected_profit_bps {
-                            let diff = actual_profit_bps - expected;
-                            let diff_sign = if diff >= 0.0 { "+" } else { "" };
-                            let diff_color = if diff >= 0.0 { format!("{}{:.2}", diff_sign, diff).green() } else { format!("{:.2}", diff).red() };
-                            info!("  Difference: {} bps", diff_color);
-                        }
-                    } else {
-                        warn!("  {} Unable to calculate actual profit (trade history unavailable)", "⚠".yellow().bold());
-                    }
-                    info!("");
-                    info!("{}", "📈 FEES:".bright_white().bold());
-                    if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
-                        // Show actual fees paid
-                        info!("  Pacifica: {} {}",
-                            format!("${:.4}", pac_fee_usd).yellow(),
-                            if pacifica_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
-                        );
-                        info!("  Hyperliquid: {} {}",
-                            format!("${:.4}", hl_fee_usd).yellow(),
-                            if hl_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
-                        );
-                        info!("  Total: {}", format!("${:.4}", pac_fee_usd + hl_fee_usd).yellow().bold());
-                    } else {
-                        // Fallback to theoretical fees
-                        info!("  Pacifica (maker): {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps).yellow());
-                        info!("  Hyperliquid (taker): {} bps", format!("{:.2}", self.config.hyperliquid_taker_fee_bps).yellow());
-                        info!("  Total fees: {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps + self.config.hyperliquid_taker_fee_bps).yellow().bold());
-                    }
-                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
-
-                    // *** CRITICAL: FINAL SAFETY CANCELLATION ***
-                    // Cancel all orders one last time before marking complete
-                    // This ensures no stray orders remain active
-                    info!("");
-                    info!("{} {} Post-hedge safety: Final cancellation of all Pacifica orders...",
-                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "⚡".yellow().bold()
-                    );
-
-                    if let Err(e) = self.pacifica_trading
-                        .cancel_all_orders(false, Some(&self.config.symbol), false)
-                        .await
-                    {
-                        warn!("{} {} Failed to cancel orders after hedge completion: {}",
+                    let hedge_dust = self.config.neutral_dust_base.max(1e-9);
+                    if confirmed_hedge_size + hedge_dust < size {
+                        let mut residual = size - confirmed_hedge_size;
+                        warn!(
+                            "{} {} Hyperliquid filled only {} of {}; retrying residual {}",
                             tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                            "⚠".yellow().bold(),
+                            "partial".yellow().bold(),
+                            confirmed_hedge_size,
+                            size,
+                            residual
+                        );
+
+                        for residual_attempt in 0..self.config.max_consecutive_hedge_failures {
+                            if residual <= hedge_dust {
+                                break;
+                            }
+                            let attempt_no =
+                                HEDGE_RETRY_DELAYS_MS.len() as u64 + 1 + residual_attempt as u64;
+                            let cloid =
+                                Self::hedge_cloid(event.source_order_id, event.hedge_seq, attempt_no);
+                            let mut residual_update =
+                                HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Submitted);
+                            residual_update.cloid = Some(&cloid);
+                            residual_update.target_qty = Some(size);
+                            residual_update.residual_qty = Some(residual);
+                            residual_update.attempt = Some(attempt_no);
+                            if let Err(e) =
+                                hedge_store::append_lifecycle_update(residual_update).await
+                            {
+                                warn!(
+                                    "{} Failed to persist residual hedge submission event: {}",
+                                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                    e
+                                );
+                            }
+                            let residual_submitted_after_ms = Self::unix_ms();
+                            let mut residual_response = self
+                                .hyperliquid_trading
+                                .place_market_order_with_cloid(
+                                    &self.config.symbol,
+                                    is_buy,
+                                    residual,
+                                    self.config.hyperliquid_slippage,
+                                    false,
+                                    Some(hl_bid),
+                                    Some(hl_ask),
+                                    Some(cloid.clone()),
+                                )
+                                .await;
+
+                            if residual_response.is_err() {
+                                match self
+                                    .confirm_recent_hyperliquid_fill(
+                                        is_buy,
+                                        residual_submitted_after_ms,
+                                        residual,
+                                        0,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(resp)) => {
+                                        warn!(
+                                            "{} {} Confirmed residual hedge fill from recent Hyperliquid fills after REST uncertainty",
+                                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                            "OK".green().bold()
+                                        );
+                                        residual_response = Ok(resp);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            "{} {} Could not confirm uncertain residual hedge via recent fills: {}",
+                                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                            "WARN".yellow().bold(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
+                            match residual_response {
+                                Ok(resp) => {
+                                    if let Some((_, filled_qty)) = Self::filled_qty_from_response(&resp) {
+                                        confirmed_hedge_size += filled_qty;
+                                        residual = (size - confirmed_hedge_size).max(0.0);
+                                        let mut filled_update = HedgeLifecycleUpdate::new(
+                                            &event,
+                                            if residual <= hedge_dust {
+                                                HedgeIntentStatus::Filled
+                                            } else {
+                                                HedgeIntentStatus::PartiallyFilled
+                                            },
+                                        );
+                                        filled_update.cloid = Some(&cloid);
+                                        filled_update.target_qty = Some(size);
+                                        filled_update.filled_qty = Some(filled_qty);
+                                        filled_update.residual_qty = Some(residual);
+                                        filled_update.attempt = Some(attempt_no);
+                                        let _ =
+                                            hedge_store::append_lifecycle_update(filled_update).await;
+                                        continue;
+                                    }
+                                    warn!("{} Residual hedge response did not confirm a fill", tag(&self.config.symbol, "HEDGE", Color::BrightMagenta));
+                                    let mut unknown_update = HedgeLifecycleUpdate::new(
+                                        &event,
+                                        HedgeIntentStatus::Unknown,
+                                    );
+                                    unknown_update.cloid = Some(&cloid);
+                                    unknown_update.target_qty = Some(size);
+                                    unknown_update.residual_qty = Some(residual);
+                                    unknown_update.attempt = Some(attempt_no);
+                                    unknown_update.reason =
+                                        Some("residual response did not confirm fill".to_string());
+                                    let _ =
+                                        hedge_store::append_lifecycle_update(unknown_update).await;
+                                }
+                                Err(e) => {
+                                    warn!("{} Residual hedge attempt failed: {}", tag(&self.config.symbol, "HEDGE", Color::BrightMagenta), e);
+                                    let mut failed_update =
+                                        HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Error);
+                                    failed_update.cloid = Some(&cloid);
+                                    failed_update.target_qty = Some(size);
+                                    failed_update.residual_qty = Some(residual);
+                                    failed_update.attempt = Some(attempt_no);
+                                    failed_update.reason = Some(e.to_string());
+                                    let _ =
+                                        hedge_store::append_lifecycle_update(failed_update).await;
+                                }
+                            }
+                        }
+
+                        if confirmed_hedge_size + hedge_dust < size {
+                            let mut failed_update =
+                                HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Error);
+                            failed_update.target_qty = Some(size);
+                            failed_update.filled_qty = Some(confirmed_hedge_size);
+                            failed_update.residual_qty = Some(size - confirmed_hedge_size);
+                            failed_update.reason = Some("hedge residual remained unfilled".to_string());
+                            let _ = hedge_store::append_lifecycle_update(failed_update).await;
+                            {
+                                let mut state = self.bot_state.write();
+                                state.mark_reconciling();
+                            }
+                            warn!(
+                                "{} {} Hedge residual still unfilled (target {}, confirmed {}); leaving bot in Reconciling for slow retry",
+                                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                "WARN".yellow().bold(),
+                                size,
+                                confirmed_hedge_size
+                            );
+                            continue;
+                        }
+                    }
+
+                    self.fill_aggregator
+                        .mark_hedge_confirmed(event.source_order_id, confirmed_hedge_size);
+
+                    let mut complete_update =
+                        HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Complete);
+                    complete_update.target_qty = Some(size);
+                    complete_update.filled_qty = Some(confirmed_hedge_size);
+                    complete_update.residual_qty = Some((size - confirmed_hedge_size).max(0.0));
+                    if let Err(e) = hedge_store::append_lifecycle_update(complete_update).await {
+                        warn!(
+                            "{} Failed to persist hedge completion lifecycle event: {}",
+                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                             e
                         );
-                    } else {
-                        info!("{} {} Final cancellation complete",
-                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                            "✓".green().bold()
-                        );
                     }
 
-                    // *** POST-HEDGE POSITION VERIFICATION ***
-                    // Wait for positions to propagate and verify net position is neutral
-                    info!("");
-                    info!("{} {} Post-hedge verification: Waiting 8 seconds for positions to propagate...",
-                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "⏱".cyan().bold()
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-
-                    info!("{} Verifying final positions on both exchanges...",
-                        tag(&self.config.symbol, "VERIFY", Color::Cyan)
-                    );
-
-                    // Check Pacifica position
-                    let pacifica_position = match self.pacifica_trading.get_positions().await {
-                        Ok(positions) => {
-                            if let Some(pos) = positions.iter().find(|p| p.symbol == self.config.symbol) {
-                                let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
-                                let signed_amount = if pos.side == "bid" { amount } else { -amount };
-
-                                info!("{} Pacifica: {} {} (signed: {:.4})",
-                                    tag(&self.config.symbol, "VERIFY", Color::Cyan),
-                                    amount,
-                                    pos.side,
-                                    signed_amount
-                                );
-                                Some(signed_amount)
-                            } else {
-                                info!("{} Pacifica: No position (flat)",
-                                    tag(&self.config.symbol, "VERIFY", Color::Cyan)
-                                );
-                                Some(0.0)
-                            }
+                    if !event.terminal {
+                        let mut state = self.bot_state.write();
+                        if state.active_order.is_some() {
+                            state.status = crate::bot::BotStatus::OrderPlaced;
+                            state.store_status();
+                        } else {
+                            state.mark_reconciling();
                         }
-                        Err(e) => {
-                            warn!("{} {} Failed to fetch Pacifica position: {}",
-                                tag(&self.config.symbol, "VERIFY", Color::Yellow),
-                                "⚠".yellow().bold(),
-                                e
-                            );
-                            None
-                        }
+                        continue;
+                    }
+
+                    let (expected_profit_bps, client_order_id) = {
+                        let state = self.bot_state.read();
+                        state.active_order.as_ref().map_or((None, None), |order| {
+                            (Some(order.initial_profit_bps), Some(order.client_order_id.clone()))
+                        })
                     };
 
-                    // Check Hyperliquid position
-                    let hl_wallet = std::env::var("HL_WALLET").unwrap_or_default();
-                    let mut hyperliquid_position: Option<f64> = None;
+                    let audit_event = PostTradeAuditEvent {
+                        source_order_id: event.source_order_id,
+                        hedge_seq: event.hedge_seq,
+                        side,
+                        size,
+                        maker_avg_price: avg_price,
+                        hedge_fill_price,
+                        confirmed_hedge_size,
+                        latency_ms: end_to_end_latency.as_secs_f64() * 1000.0,
+                        expected_profit_bps,
+                        client_order_id,
+                    };
 
-                    // Try up to 3 times with delays if position not found
-                    for retry in 0..3 {
-                        if retry > 0 {
-                            info!("{} Retry {} - waiting 3 more seconds for Hyperliquid position...",
-                                tag(&self.config.symbol, "VERIFY", Color::Cyan),
-                                retry
-                            );
-                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    if let Err(e) = self.audit_tx.try_send(audit_event) {
+                        let mut failed_update =
+                            HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Error);
+                        failed_update.reason = Some(format!("post-trade audit queue failed: {}", e));
+                        let _ = hedge_store::append_lifecycle_update(failed_update).await;
+                        {
+                            let mut state = self.bot_state.write();
+                            state.set_error(format!("post-trade audit queue failed: {}", e));
                         }
-
-                        match self.hyperliquid_trading.get_user_state(&hl_wallet).await {
-                            Ok(user_state) => {
-                                if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == self.config.symbol) {
-                                    let szi: f64 = parse(&asset_pos.position.szi).unwrap_or(0.0);
-                                    info!("{} Hyperliquid: {} (signed: {:.4})",
-                                        tag(&self.config.symbol, "VERIFY", Color::Cyan),
-                                        if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
-                                        szi
-                                    );
-                                    hyperliquid_position = Some(szi);
-                                    break;
-                                } else if retry == 2 {
-                                    info!("{} Hyperliquid: No position found after 3 attempts (flat)",
-                                        tag(&self.config.symbol, "VERIFY", Color::Cyan)
-                                    );
-                                    hyperliquid_position = Some(0.0);
-                                }
-                            }
-                            Err(e) => {
-                                if retry == 2 {
-                                    warn!("{} {} Failed to fetch Hyperliquid position after 3 attempts: {}",
-                                        tag(&self.config.symbol, "VERIFY", Color::Yellow),
-                                        "⚠".yellow().bold(),
-                                        e
-                                    );
-                                    hyperliquid_position = None;
-                                }
-                            }
-                        }
+                        self.shutdown_tx.send(()).await.ok();
+                        return;
                     }
 
-                    // Calculate net position across both exchanges
-                    if let (Some(pac_pos), Some(hl_pos)) = (pacifica_position, hyperliquid_position) {
-                        let net_position = pac_pos + hl_pos;
-
-                        info!("");
-                        info!("{} Net Position: {:.4} (Pacifica: {:.4} + Hyperliquid: {:.4})",
-                            tag(&self.config.symbol, "VERIFY", Color::Cyan),
-                            net_position,
-                            pac_pos,
-                            hl_pos
-                        );
-
-                        // Check if net position is close to neutral
-                        if net_position.abs() < 0.01 {
-                            info!("{} {} Net position is NEUTRAL (properly hedged across both exchanges)",
-                                tag(&self.config.symbol, "VERIFY", Color::Cyan),
-                                "✓".green().bold()
-                            );
-                        } else {
-                            info!("");
-                            warn!("{}", "⚠".repeat(80).yellow());
-                            warn!("{} {} WARNING: Net position NOT neutral!",
-                                tag(&self.config.symbol, "VERIFY", Color::Red),
-                                "⚠".yellow().bold()
-                            );
-                            warn!("{} Position delta: {:.4} {}",
-                                tag(&self.config.symbol, "VERIFY", Color::Red),
-                                net_position.abs(),
-                                self.config.symbol
-                            );
-                            warn!("{} This indicates a potential hedge failure or partial fill.",
-                                tag(&self.config.symbol, "VERIFY", Color::Red)
-                            );
-                            warn!("{} Please check positions manually and rebalance if needed!",
-                                tag(&self.config.symbol, "VERIFY", Color::Red)
-                            );
-                            warn!("{}", "⚠".repeat(80).yellow());
-                            info!("");
-                        }
-                    } else {
-                        info!("");
-                        warn!("{} {} WARNING: Could not verify net position!",
-                            tag(&self.config.symbol, "VERIFY", Color::Yellow),
-                            "⚠".yellow().bold()
-                        );
-                        warn!("{} Failed to fetch positions from one or both exchanges.",
-                            tag(&self.config.symbol, "VERIFY", Color::Yellow)
-                        );
-                        warn!("{} Please check positions manually!",
-                            tag(&self.config.symbol, "VERIFY", Color::Yellow)
-                        );
-                        info!("");
-                    }
-
-                    // Mark cycle as complete AFTER displaying profit AND final cancellation
-                    let mut state = self.bot_state.write().await;
-                    state.mark_complete();
-                    drop(state);
-
-                    // Signal shutdown
-                    self.shutdown_tx.send(()).await.ok();
+                    info!(
+                        "{} {} Hedge confirmed; terminal audit handed to cold auditor",
+                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                        "OK".green().bold()
+                    );
+                    continue;
                 }
                 Err(e) => {
                     error!("{} {} Hedge failed: {}",
                         tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "✗".red().bold(),
+                        "FAIL".red().bold(),
                         e.to_string().red()
                     );
 
@@ -913,7 +899,7 @@ impl HedgeService {
                     // Even if hedge fails, cancel all orders to prevent stray positions
                     info!("{} {} Error recovery: Cancelling all Pacifica orders...",
                         tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "⚡".yellow().bold()
+                        "FAST".yellow().bold()
                     );
 
                     if let Err(cancel_err) = self.pacifica_trading
@@ -922,32 +908,44 @@ impl HedgeService {
                     {
                         warn!("{} {} Failed to cancel orders after hedge error: {}",
                             tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                            "⚠".yellow().bold(),
+                            "WARN".yellow().bold(),
                             cancel_err
                         );
                     } else {
                         info!("{} {} Error recovery cancellation complete",
                             tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                            "✓".green().bold()
+                            "OK".green().bold()
                         );
                     }
 
-                    let mut state = self.bot_state.write().await;
-                    state.set_error(format!("Hedge failed: {}", e));
+                    {
+                        let mut state = self.bot_state.write();
+                        state.mark_reconciling();
+                    }
 
-                    // Signal shutdown with error
-                    self.shutdown_tx.send(()).await.ok();
+                    let mut failed_update =
+                        HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Error);
+                    failed_update.target_qty = Some(size);
+                    failed_update.residual_qty = Some(size);
+                    failed_update.reason = Some(format!("hedge attempts exhausted: {}", e));
+                    let _ = hedge_store::append_lifecycle_update(failed_update).await;
+
+                    warn!(
+                        "{} {} Hedge attempts exhausted; maker placement is paused while the reconciler retries exposure",
+                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                        "WARN".yellow().bold()
+                    );
                 }
             }
 
             // If we were asked to shut down and the queue is now empty, exit so
             // main can finish cleanup. We intentionally finish the current event
-            // first — dropping a hedge mid-flight is worse than taking ~1s longer.
+            // first - dropping a hedge mid-flight is worse than taking ~1s longer.
             if draining && self.hedge_rx.is_empty() {
                 info!(
                     "{} {} Drain complete, exiting hedge service",
                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                    "✓".green().bold()
+                    "OK".green().bold()
                 );
                 let _ = self.shutdown_tx.send(()).await;
                 return;
@@ -955,6 +953,142 @@ impl HedgeService {
                 } // Close Some((side, size, avg_price, fill_timestamp)) arm
             } // Close tokio::select!
         } // Close loop
+    }
+
+    async fn confirm_recent_fill_or_place_rest(
+        &self,
+        is_buy: bool,
+        size: f64,
+        hl_bid: f64,
+        hl_ask: f64,
+        cloid: &str,
+        submitted_after_ms: u64,
+    ) -> anyhow::Result<OrderResponse> {
+        match self
+            .confirm_recent_hyperliquid_fill(is_buy, submitted_after_ms, size, 100)
+            .await
+        {
+            Ok(Some(response)) => {
+                warn!(
+                    "{} {} Recent Hyperliquid fills confirm the hedge submit; skipping duplicate REST retry",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    "OK".green().bold()
+                );
+                Ok(response)
+            }
+            Ok(None) => {
+                self.hyperliquid_trading
+                    .place_market_order_with_cloid(
+                        &self.config.symbol,
+                        is_buy,
+                        size,
+                        self.config.hyperliquid_slippage,
+                        false,
+                        Some(hl_bid),
+                        Some(hl_ask),
+                        Some(cloid.to_string()),
+                    )
+                    .await
+            }
+            Err(e) => {
+                warn!(
+                    "{} {} Recent-fill confirmation failed before REST fallback: {}",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    "WARN".yellow().bold(),
+                    e
+                );
+                self.hyperliquid_trading
+                    .place_market_order_with_cloid(
+                        &self.config.symbol,
+                        is_buy,
+                        size,
+                        self.config.hyperliquid_slippage,
+                        false,
+                        Some(hl_bid),
+                        Some(hl_ask),
+                        Some(cloid.to_string()),
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn confirm_recent_hyperliquid_fill(
+        &self,
+        is_buy: bool,
+        submitted_after_ms: u64,
+        target_qty: f64,
+        lookback_ms: u64,
+    ) -> anyhow::Result<Option<OrderResponse>> {
+        let fills = self
+            .hyperliquid_trading
+            .get_user_fills(&self.hyperliquid_trading.get_wallet_address(), true)
+            .await?;
+        let expected_side = if is_buy { "B" } else { "A" };
+        let min_time = submitted_after_ms.saturating_sub(lookback_ms);
+        let dust = self.config.neutral_dust_base.max(1e-9);
+        let mut total_size = 0.0;
+        let mut total_notional = 0.0;
+
+        for fill in fills.iter().filter(|fill| {
+            fill.coin == self.config.symbol
+                && fill.time >= min_time
+                && fill.side == expected_side
+                && fill.crossed
+        }) {
+            let Ok(px) = fill.px.parse::<f64>() else {
+                continue;
+            };
+            let Ok(sz) = fill.sz.parse::<f64>() else {
+                continue;
+            };
+            if sz <= 0.0 || px <= 0.0 {
+                continue;
+            }
+
+            total_size += sz;
+            total_notional += px * sz;
+            if total_size + dust >= target_qty {
+                break;
+            }
+        }
+
+        if total_size <= dust || total_notional <= 0.0 {
+            return Ok(None);
+        }
+
+        let confirmed_size = total_size.min(target_qty);
+        let avg_px = total_notional / total_size;
+        Ok(Some(Self::synthetic_filled_response(
+            avg_px,
+            confirmed_size,
+        )))
+    }
+
+    fn synthetic_filled_response(avg_px: f64, total_sz: f64) -> OrderResponse {
+        OrderResponse {
+            status: "ok".to_string(),
+            response: OrderResponseContent::Success(OrderResponseData {
+                type_: Some("order".to_string()),
+                data: OrderStatusData {
+                    statuses: vec![OrderStatus::Filled {
+                        filled: FilledOrder {
+                            total_sz: total_sz.to_string(),
+                            avg_px: avg_px.to_string(),
+                            oid: 0,
+                        },
+                    }],
+                },
+            }),
+        }
+    }
+
+    fn unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
     }
 
     /// Establish a Hyperliquid trading WebSocket connection for hedging.
@@ -970,6 +1104,28 @@ impl HedgeService {
         Ok((write, read))
     }
 
+    fn hedge_cloid(source_order_id: u64, hedge_seq: u64, attempt: u64) -> String {
+        let hi = source_order_id ^ (hedge_seq << 32);
+        format!("0x{:016x}{:016x}", hi, attempt)
+    }
+
+    fn filled_qty_from_response(
+        response: &crate::connector::hyperliquid::OrderResponse,
+    ) -> Option<(f64, f64)> {
+        let crate::connector::hyperliquid::OrderResponseContent::Success(data) = &response.response
+        else {
+            return None;
+        };
+        let status = data.data.statuses.first()?;
+        if let crate::connector::hyperliquid::OrderStatus::Filled { filled } = status {
+            let px = filled.avg_px.parse::<f64>().ok()?;
+            let qty = filled.total_sz.parse::<f64>().ok()?;
+            Some((px, qty))
+        } else {
+            None
+        }
+    }
+
     /// Place a market IOC order over Hyperliquid WebSocket using the shared
     /// REST signing and request-building logic.
     async fn place_market_order_ws(
@@ -981,11 +1137,12 @@ impl HedgeService {
         size: f64,
         bid: f64,
         ask: f64,
+        cloid: Option<String>,
     ) -> anyhow::Result<crate::connector::hyperliquid::OrderResponse> {
         // Build signed order payload (same as REST)
         let payload = self
             .hyperliquid_trading
-            .build_market_order_request(
+            .build_market_order_request_with_cloid(
                 &self.config.symbol,
                 is_buy,
                 size,
@@ -993,6 +1150,7 @@ impl HedgeService {
                 false,
                 Some(bid),
                 Some(ask),
+                cloid,
             )
             .await?;
 
@@ -1030,7 +1188,7 @@ impl HedgeService {
                     };
 
                     if ws_resp.channel != "post" || ws_resp.data.id != request_id {
-                        // Response for another request or channel – ignore
+                        // Response for another request or channel - ignore
                         continue;
                     }
 
@@ -1051,7 +1209,10 @@ impl HedgeService {
                             anyhow::bail!("Hyperliquid WebSocket order error: {}", msg);
                         }
                         other => {
-                            anyhow::bail!("Unexpected Hyperliquid WebSocket response type: {}", other);
+                            anyhow::bail!(
+                                "Unexpected Hyperliquid WebSocket response type: {}",
+                                other
+                            );
                         }
                     };
                 }
@@ -1074,5 +1235,41 @@ impl HedgeService {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hedge_cloid_is_deterministic_and_attempt_scoped() {
+        let first = HedgeService::hedge_cloid(42, 3, 0);
+        let same = HedgeService::hedge_cloid(42, 3, 0);
+        let retry = HedgeService::hedge_cloid(42, 3, 1);
+
+        assert_eq!(first, same);
+        assert_ne!(first, retry);
+        assert!(first.starts_with("0x"));
+    }
+
+    #[test]
+    fn filled_qty_from_response_extracts_actual_filled_size() {
+        let response = HedgeService::synthetic_filled_response(123.45, 0.67);
+        let (px, qty) =
+            HedgeService::filled_qty_from_response(&response).expect("filled response expected");
+
+        assert!((px - 123.45).abs() < 1e-9);
+        assert!((qty - 0.67).abs() < 1e-9);
+    }
+
+    #[test]
+    fn filled_qty_from_response_rejects_error_response() {
+        let response = OrderResponse {
+            status: "ok".to_string(),
+            response: OrderResponseContent::Error("rejected".to_string()),
+        };
+
+        assert!(HedgeService::filled_qty_from_response(&response).is_none());
     }
 }

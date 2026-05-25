@@ -144,7 +144,7 @@ def run_remote_script():
             if result.stdout.strip():
                 print_header("Command Output")
                 # Replace Unicode characters that may not display properly on Windows
-                output = result.stdout.strip().replace('✓', '[OK]').replace('⚠️', '[WARNING]')
+                output = result.stdout.strip().replace('OK', '[OK]').replace('WARN', '[WARNING]')
                 print(output)
                 print("\n" + "=" * 70)
             return True
@@ -152,11 +152,11 @@ def run_remote_script():
             print_error(f"Command failed with return code {result.returncode}")
             if result.stderr:
                 print("Error output:")
-                stderr_safe = result.stderr.replace('✓', '[OK]').replace('⚠️', '[WARNING]')
+                stderr_safe = result.stderr.replace('OK', '[OK]').replace('WARN', '[WARNING]')
                 print(stderr_safe)
             if result.stdout:
                 print("Standard output:")
-                stdout_safe = result.stdout.replace('✓', '[OK]').replace('⚠️', '[WARNING]')
+                stdout_safe = result.stdout.replace('OK', '[OK]').replace('WARN', '[WARNING]')
                 print(stdout_safe)
             return False
 

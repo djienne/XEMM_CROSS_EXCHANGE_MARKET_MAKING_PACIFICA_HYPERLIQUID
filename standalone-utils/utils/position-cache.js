@@ -44,7 +44,7 @@ export default class NetPositionCache {
 
         // Log if there was a significant change
         if (Math.abs(oldHl - actual.hyperliquid) > 0.01 || Math.abs(oldPac - actual.pacifica) > 0.01) {
-          console.log(`[POSITION CACHE] Synced ${symbol}: HL ${oldHl.toFixed(4)} → ${actual.hyperliquid.toFixed(4)}, PAC ${oldPac.toFixed(4)} → ${actual.pacifica.toFixed(4)}`);
+          console.log(`[POSITION CACHE] Synced ${symbol}: HL ${oldHl.toFixed(4)} -> ${actual.hyperliquid.toFixed(4)}, PAC ${oldPac.toFixed(4)} -> ${actual.pacifica.toFixed(4)}`);
         }
       }
     }
@@ -96,7 +96,7 @@ export default class NetPositionCache {
     this.positions[symbol][exchange] += deltaQty;
 
     console.log(
-      `[POSITION] ${symbol} ${exchange}: ${oldPosition.toFixed(4)} → ${this.positions[symbol][exchange].toFixed(4)} (Δ ${deltaQty > 0 ? '+' : ''}${deltaQty.toFixed(4)})`
+      `[POSITION] ${symbol} ${exchange}: ${oldPosition.toFixed(4)} -> ${this.positions[symbol][exchange].toFixed(4)} (delta ${deltaQty > 0 ? '+' : ''}${deltaQty.toFixed(4)})`
     );
   }
 
@@ -116,7 +116,7 @@ export default class NetPositionCache {
 
     if (Math.abs(oldPosition - quantity) > 0.01) {
       console.log(
-        `[POSITION SYNC] ${symbol} ${exchange}: ${oldPosition.toFixed(4)} → ${quantity.toFixed(4)} (REST API)`
+        `[POSITION SYNC] ${symbol} ${exchange}: ${oldPosition.toFixed(4)} -> ${quantity.toFixed(4)} (REST API)`
       );
     }
   }

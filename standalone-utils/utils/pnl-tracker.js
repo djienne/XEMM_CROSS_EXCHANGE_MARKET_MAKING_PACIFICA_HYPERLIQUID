@@ -213,7 +213,7 @@ export default class PnLTracker {
    * Log trade to console
    */
   logTrade(trade) {
-    const profitSign = trade.netProfit >= 0 ? '✅' : '❌';
+    const profitSign = trade.netProfit >= 0 ? 'OK' : 'ERROR';
     const profitColor = trade.netProfit >= 0 ? 'green' : 'red';
 
     console.log('\n' + '='.repeat(80));

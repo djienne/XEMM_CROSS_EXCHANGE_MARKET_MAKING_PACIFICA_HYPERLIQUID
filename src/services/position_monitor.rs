@@ -1,17 +1,18 @@
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn, error};
 use colored::Colorize;
 use fast_float::parse;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::HedgeEvent;
+use crate::services::{enqueue_hedge_intent, HedgeEvent};
 use crate::strategy::OrderSide;
 use crate::util::log::{tag_static, Color};
 
@@ -36,7 +37,7 @@ impl PositionMonitorService {
         loop {
             // Adaptive polling: fast when order active, slow when idle
             let has_active_order = {
-                let state = self.bot_state.read().await;
+                let state = self.bot_state.read();
                 state.has_active_order_fast()
             };
 
@@ -45,7 +46,7 @@ impl PositionMonitorService {
 
             // Only check if we have an active order
             let active_order_info = {
-                let state = self.bot_state.read().await;
+                let state = self.bot_state.read();
                 if matches!(
                     state.status,
                     crate::bot::BotStatus::Complete | crate::bot::BotStatus::Error(_)
@@ -53,12 +54,10 @@ impl PositionMonitorService {
                     continue;
                 }
 
-                state.active_order.as_ref().map(|o| (
-                    o.order_id,
-                    o.client_order_id.clone(),
-                    o.side,
-                    o.size
-                ))
+                state
+                    .active_order
+                    .as_ref()
+                    .map(|o| (o.order_id, o.client_order_id.clone(), o.side, o.size))
             };
 
             if active_order_info.is_none() {
@@ -75,21 +74,27 @@ impl PositionMonitorService {
                                 side: pos.side.clone(),
                                 last_check: std::time::Instant::now(),
                             });
-                            debug!("[POSITION_MONITOR] Updated baseline: {} {} {}",
-                                self.symbol, pos.side, amount);
+                            debug!(
+                                "[POSITION_MONITOR] Updated baseline: {} {} {}",
+                                self.symbol, pos.side, amount
+                            );
                         } else {
                             *snapshot = None;
                             debug!("[POSITION_MONITOR] No position for {}", self.symbol);
                         }
                     }
                     Err(e) => {
-                        debug!("[POSITION_MONITOR] Failed to fetch baseline position: {}", e);
+                        debug!(
+                            "[POSITION_MONITOR] Failed to fetch baseline position: {}",
+                            e
+                        );
                     }
                 }
                 continue;
             }
 
-            let (order_id_opt, client_order_id, order_side, _order_size) = active_order_info.unwrap();
+            let (order_id_opt, client_order_id, order_side, _order_size) =
+                active_order_info.unwrap();
 
             // Fetch current positions
             let positions_result = self.pacifica_trading.get_positions().await;
@@ -137,9 +142,9 @@ impl PositionMonitorService {
                         let fill_size = delta.abs();
 
                         info!(
-                            "{} {} Position delta detected: {} {} → {} {} (Δ {:.4})",
+                            "{} {} Position delta detected: {} {} -> {} {} (delta {:.4})",
                             tag_static("POSITION_MONITOR", Color::BrightCyan),
-                            "⚡".yellow().bold(),
+                            "FAST".yellow().bold(),
                             format!("{:.4}", last_signed).bright_white(),
                             last_side.yellow(),
                             format!("{:.4}", current_signed).bright_white(),
@@ -153,7 +158,7 @@ impl PositionMonitorService {
                             info!(
                                 "{} {} Skipping hedge for first position change from baseline (startup initialization)",
                                 tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                "ℹ".blue().bold()
+                                "INFO".blue().bold()
                             );
 
                             // Update snapshot to prevent continuous detection
@@ -168,21 +173,21 @@ impl PositionMonitorService {
 
                         // Check bot state - don't trigger duplicate hedges
                         let current_state = {
-                            let state = self.bot_state.read().await;
+                            let state = self.bot_state.read();
                             state.status.clone()
                         };
 
                         // Skip if already filled, hedging, or complete
                         if matches!(
                             current_state,
-                            crate::bot::BotStatus::Filled |
-                            crate::bot::BotStatus::Hedging |
-                            crate::bot::BotStatus::Complete
+                            crate::bot::BotStatus::Filled
+                                | crate::bot::BotStatus::Hedging
+                                | crate::bot::BotStatus::Complete
                         ) {
                             info!(
                                 "{} {} Fill already handled by primary detection (state: {:?}), skipping duplicate hedge",
                                 tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                "ℹ".blue().bold(),
+                                "INFO".blue().bold(),
                                 current_state
                             );
 
@@ -196,103 +201,134 @@ impl PositionMonitorService {
                             continue;
                         }
 
-                        // Route through the aggregator too so any earlier WS/REST partials
-                        // on the same order_id are reconciled. Position-delta events are
-                        // always terminal (the delta reflects a completed trade batch).
-                        // We best-effort compute absolute filled size via delta magnitude.
-                        if let Some(id) = order_id_opt {
-                            let _ = self.fill_aggregator.on_fill(id, order_side, fill_size, 0.0, true);
-                        }
+                        let estimated_price = current_position
+                            .and_then(|p| p.entry_price.parse::<f64>().ok())
+                            .unwrap_or(0.0);
 
-                        // Canonical dedup: prefer exchange order_id (shared with WS / REST
-                        // detectors); fall back to cloid only if order_id is missing.
-                        let dedup_key = match order_id_opt {
-                            Some(id) => FillKey::OrderId(id),
-                            None => FillKey::Cloid(client_order_id.clone()),
+                        let hedge_event = if let Some(id) = order_id_opt {
+                            match self.fill_aggregator.on_fill(
+                                id,
+                                order_side,
+                                fill_size,
+                                estimated_price,
+                                true,
+                            ) {
+                                Some(decision) => decision.into(),
+                                None => {
+                                    debug!(
+                                        "[POSITION_MONITOR] Position fill already accounted for (order_id={})",
+                                        id
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            HedgeEvent {
+                                source_order_id: 0,
+                                hedge_seq: 0,
+                                side: order_side,
+                                size: fill_size,
+                                avg_price: estimated_price,
+                                detected_at: std::time::Instant::now(),
+                                terminal: true,
+                            }
                         };
+
+                        let dedup_key =
+                            FillKey::from_cloid_cumulative(client_order_id.clone(), fill_size);
                         let should_process = self.processed_fills.insert_if_new(dedup_key);
 
                         if should_process {
                             info!(
                                 "{} {} FILL DETECTED via position change!",
                                 tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                "✓".green().bold()
+                                "OK".green().bold()
                             );
 
                             // Update state to Filled
                             {
-                                let mut state = self.bot_state.write().await;
-                                state.mark_filled(fill_size, order_side);
+                                let mut state = self.bot_state.write();
+                                state.mark_filled(hedge_event.size, hedge_event.side);
+                            }
+
+                            info!(
+                                "{} Triggering hedge for position-detected fill",
+                                tag_static("POSITION_MONITOR", Color::BrightCyan)
+                            );
+
+                            if let Err(e) = enqueue_hedge_intent(
+                                &self.hedge_tx,
+                                &self.bot_state,
+                                hedge_event.clone(),
+                            )
+                            .await
+                            {
+                                error!(
+                                    "{} {} Hedge intent enqueue failed: {}",
+                                    tag_static("POSITION_MONITOR", Color::BrightCyan),
+                                    "x".red().bold(),
+                                    e
+                                );
                             }
 
                             // Dual cancellation
-                            info!("{} {} Dual cancellation (REST + WebSocket)...",
+                            info!(
+                                "{} {} Dual cancellation (REST + WebSocket)...",
                                 tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                "⚡".yellow().bold()
+                                "FAST".yellow().bold()
                             );
 
-                            let rest_result = self.pacifica_trading
+                            let rest_result = self
+                                .pacifica_trading
                                 .cancel_all_orders(false, Some(&self.symbol), false)
                                 .await;
 
                             match rest_result {
                                 Ok(count) => {
-                                    info!("{} {} REST API cancelled {} order(s)",
+                                    info!(
+                                        "{} {} REST API cancelled {} order(s)",
                                         tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "✓".green().bold(),
+                                        "OK".green().bold(),
                                         count
                                     );
                                 }
                                 Err(e) => {
-                                    warn!("{} {} REST API cancel failed: {}",
+                                    warn!(
+                                        "{} {} REST API cancel failed: {}",
                                         tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "⚠".yellow().bold(),
+                                        "WARN".yellow().bold(),
                                         e
                                     );
                                 }
                             }
 
-                            let ws_result = self.pacifica_ws_trading
+                            let ws_result = self
+                                .pacifica_ws_trading
                                 .cancel_all_orders_ws(false, Some(&self.symbol), false)
                                 .await;
 
                             match ws_result {
                                 Ok(count) => {
-                                    info!("{} {} WebSocket cancelled {} order(s)",
+                                    info!(
+                                        "{} {} WebSocket cancelled {} order(s)",
                                         tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "✓".green().bold(),
+                                        "OK".green().bold(),
                                         count
                                     );
                                 }
                                 Err(e) => {
-                                    warn!("{} {} WebSocket cancel failed: {}",
+                                    warn!(
+                                        "{} {} WebSocket cancel failed: {}",
                                         tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "⚠".yellow().bold(),
+                                        "WARN".yellow().bold(),
                                         e
                                     );
                                 }
                             }
-
-                            // Estimate fill price (use current entry price or mid)
-                            let estimated_price = current_position
-                                .and_then(|p| p.entry_price.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-
-                            info!("{} Triggering hedge for position-detected fill",
-                                tag_static("POSITION_MONITOR", Color::BrightCyan)
-                            );
-
-                            // Trigger hedge (with current timestamp since position monitor detects fills retroactively)
-                            if let Err(e) = self.hedge_tx.try_send((order_side, fill_size, estimated_price, std::time::Instant::now())) {
-                                error!(
-                                    "{} {} Hedge queue send failed — BACKLOG: {}",
-                                    tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                    "✗".red().bold(),
-                                    e
-                                );
-                            }
                         } else {
-                            debug!("[POSITION_MONITOR] Fill already processed by another detection method");
+                            debug!(
+                                "[POSITION_MONITOR] Fill already processed by another detection method"
+                            );
                         }
 
                         // Update snapshot

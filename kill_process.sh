@@ -8,12 +8,12 @@
 echo "Stopping all XEMM bot processes..."
 
 # Kill the bot loop script (if running)
-pkill -f "run_bot_loop_cargo.sh" 2>/dev/null && echo "✓ Stopped run_bot_loop_cargo.sh"
+pkill -f "run_bot_loop_cargo.sh" 2>/dev/null && echo "OK Stopped run_bot_loop_cargo.sh"
 
 # Kill any cargo processes running xemm_rust
-pkill -f "cargo run.*xemm" 2>/dev/null && echo "✓ Stopped cargo processes"
+pkill -f "cargo run.*xemm" 2>/dev/null && echo "OK Stopped cargo processes"
 
 # Kill the xemm_rust binary
-killall xemm_rust 2>/dev/null && echo "✓ Stopped xemm_rust binary"
+killall xemm_rust 2>/dev/null && echo "OK Stopped xemm_rust binary"
 
 echo "All XEMM processes stopped."

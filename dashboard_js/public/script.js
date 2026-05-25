@@ -43,24 +43,24 @@ async function checkStatus() {
         if (data.status === 'RUNNING') {
             statusBadge.classList.add('running');
             statusText.textContent = 'Running';
-            statusDetail.textContent = '✓ Bot is running for 1 cycle (will stop automatically when cycle completes). Click "Stop Bot" to interrupt.';
+            statusDetail.textContent = 'OK Bot is running for 1 cycle (will stop automatically when cycle completes). Click "Stop Bot" to interrupt.';
             statusDetail.className = 'status-description running';
         } else if (data.status === 'STOPPED') {
             statusBadge.classList.add('stopped');
             statusText.textContent = 'Stopped';
-            statusDetail.textContent = '⏸ Bot is stopped and waiting for user to start. Click "Start Bot" to begin trading.';
+            statusDetail.textContent = 'pause Bot is stopped and waiting for user to start. Click "Start Bot" to begin trading.';
             statusDetail.className = 'status-description stopped';
         } else {
             statusBadge.classList.add('unknown');
             statusText.textContent = 'Unknown';
-            statusDetail.textContent = '⚠ Unable to determine bot status. Check remote connection.';
+            statusDetail.textContent = 'WARN Unable to determine bot status. Check remote connection.';
             statusDetail.className = 'status-description unknown';
         }
     } catch (error) {
         console.error('Error checking status:', error);
         statusText.textContent = error.name === 'AbortError' ? 'Timeout' : 'Error';
         statusBadge.className = 'status-badge unknown';
-        document.getElementById('status-detail').textContent = '❌ Connection error. Unable to reach remote server.';
+        document.getElementById('status-detail').textContent = 'ERROR Connection error. Unable to reach remote server.';
         document.getElementById('status-detail').className = 'status-description error';
     } finally {
         isCheckingStatus = false;

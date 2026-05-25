@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         .context("Failed to load Pacifica credentials from environment")?;
 
     // Create trading client
-    let mut trading = PacificaTrading::new(credentials.clone());
+    let mut trading = PacificaTrading::new(credentials.clone())?;
     info!("[TEST] Trading client initialized");
 
     // Get market info
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         .cancel_all_orders(false, Some(&config.symbol), false)
         .await
     {
-        Ok(count) => info!("[STEP 1] ✓ Cancelled {} existing order(s)", count),
+        Ok(count) => info!("[STEP 1] OK Cancelled {} existing order(s)", count),
         Err(e) => error!("[STEP 1] Failed to cancel existing orders: {}", e),
     }
     info!("");
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
         {
             Ok(order_data) => {
                 info!(
-                    "[STEP 2] ✓ Placed BUY order {}: ID={:?}, cloid={:?}",
+                    "[STEP 2] OK Placed BUY order {}: ID={:?}, cloid={:?}",
                     i, order_data.order_id, order_data.client_order_id
                 );
             }
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
     {
         Ok(order_data) => {
             info!(
-                "[STEP 2] ✓ Placed SELL order: ID={:?}, cloid={:?}",
+                "[STEP 2] OK Placed SELL order: ID={:?}, cloid={:?}",
                 order_data.order_id, order_data.client_order_id
             );
         }
@@ -143,22 +143,19 @@ async fn main() -> Result<()> {
         .await
     {
         Ok(count) => {
-            info!(
-                "[STEP 3] ✓ Successfully cancelled {} order(s)",
-                count
-            );
+            info!("[STEP 3] OK Successfully cancelled {} order(s)", count);
             if count >= 3 {
-                info!("[TEST] ✓✓✓ TEST PASSED - All orders were cancelled!");
+                info!("[TEST] OK TEST PASSED - All orders were cancelled!");
             } else {
                 error!(
-                    "[TEST] ✗✗✗ TEST FAILED - Expected to cancel 3 orders, but cancelled {}",
+                    "[TEST] FAIL TEST FAILED - Expected to cancel 3 orders, but cancelled {}",
                     count
                 );
             }
         }
         Err(e) => {
-            error!("[STEP 3] ✗ Failed to cancel all orders: {}", e);
-            error!("[TEST] ✗✗✗ TEST FAILED - Could not cancel orders");
+            error!("[STEP 3] FAIL Failed to cancel all orders: {}", e);
+            error!("[TEST] FAIL TEST FAILED - Could not cancel orders");
         }
     }
 

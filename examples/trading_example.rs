@@ -1,8 +1,8 @@
-use xemm_rust::connector::pacifica::{
-    OrderbookClient, OrderbookConfig, PacificaTrading, PacificaCredentials, OrderSide
-};
-use tracing::info;
 use tokio::time::{sleep, Duration};
+use tracing::info;
+use xemm_rust::connector::pacifica::{
+    OrderSide, OrderbookClient, OrderbookConfig, PacificaCredentials, PacificaTrading,
+};
 
 /// Example: Place a limit order and cancel it after 10 seconds
 #[tokio::main]
@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -24,10 +24,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Load credentials from .env
     let credentials = PacificaCredentials::from_env()?;
-    info!("[PACIFICA] Loaded credentials for account: {}", credentials.account);
+    info!(
+        "[PACIFICA] Loaded credentials for account: {}",
+        credentials.account
+    );
 
     // Create trading client (mainnet)
-    let mut trading_client = PacificaTrading::new(credentials);
+    let mut trading_client = PacificaTrading::new(credentials)?;
 
     // Create orderbook client to get current prices
     let orderbook_config = OrderbookConfig {
@@ -43,9 +46,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Connect to orderbook
     tokio::spawn(async move {
-        orderbook_client.start(|_bid, _ask, _symbol, _timestamp| {
-            // Just consume updates, don't log
-        }).await.ok();
+        orderbook_client
+            .start(|_bid, _ask, _symbol, _timestamp| {
+                // Just consume updates, don't log
+            })
+            .await
+            .ok();
     });
 
     // Wait for initial orderbook data
@@ -71,36 +77,47 @@ async fn main() -> anyhow::Result<()> {
     let current_bid = 150.0; // Example bid price
     let current_ask = 150.2; // Example ask price
 
-    info!("[PACIFICA] Current market: Bid=${} Ask=${}", current_bid, current_ask);
+    info!(
+        "[PACIFICA] Current market: Bid=${} Ask=${}",
+        current_bid, current_ask
+    );
 
-    let buy_order = trading_client.place_limit_order(
-        symbol,
-        OrderSide::Buy,
-        order_size,
-        None,  // Use mid price offset
-        1.0,   // 1% below mid price
-        Some(current_bid),
-        Some(current_ask),
-    ).await?;
+    let buy_order = trading_client
+        .place_limit_order(
+            symbol,
+            OrderSide::Buy,
+            order_size,
+            None, // Use mid price offset
+            1.0,  // 1% below mid price
+            Some(current_bid),
+            Some(current_ask),
+        )
+        .await?;
 
-    let buy_client_order_id = buy_order.client_order_id
+    let buy_client_order_id = buy_order
+        .client_order_id
         .as_ref()
         .expect("Client order ID should be present")
         .clone();
 
-    info!("[PACIFICA] ✅ Buy order placed successfully!");
-    info!("[PACIFICA]    Order ID: {}", buy_order.order_id.unwrap_or(0));
+    info!("[PACIFICA] OK Buy order placed successfully!");
+    info!(
+        "[PACIFICA]    Order ID: {}",
+        buy_order.order_id.unwrap_or(0)
+    );
     info!("[PACIFICA]    Client Order ID: {}", buy_client_order_id);
     info!("");
 
     // Wait 10 seconds
-    info!("[PACIFICA] ⏳ Waiting 10 seconds before cancelling...");
+    info!("[PACIFICA] WAIT Waiting 10 seconds before cancelling...");
     sleep(Duration::from_secs(10)).await;
 
     // Cancel the buy order
-    info!("[PACIFICA] 🗑️  Cancelling buy order...");
-    trading_client.cancel_order(symbol, &buy_client_order_id).await?;
-    info!("[PACIFICA] ✅ Buy order cancelled successfully!");
+    info!("[PACIFICA] delete  Cancelling buy order...");
+    trading_client
+        .cancel_order(symbol, &buy_client_order_id)
+        .await?;
+    info!("[PACIFICA] OK Buy order cancelled successfully!");
     info!("");
 
     // Example 2: Place sell order at exact price
@@ -109,36 +126,47 @@ async fn main() -> anyhow::Result<()> {
     info!("═══════════════════════════════════════════════════");
 
     let exact_sell_price = 151.0; // Specific price
-    info!("[PACIFICA] Placing sell order at exact price: ${}", exact_sell_price);
+    info!(
+        "[PACIFICA] Placing sell order at exact price: ${}",
+        exact_sell_price
+    );
 
-    let sell_order = trading_client.place_limit_order(
-        symbol,
-        OrderSide::Sell,
-        order_size,
-        Some(exact_sell_price),  // Exact price
-        1.0,   // Not used when exact price is provided
-        None,  // Not needed
-        None,  // Not needed
-    ).await?;
+    let sell_order = trading_client
+        .place_limit_order(
+            symbol,
+            OrderSide::Sell,
+            order_size,
+            Some(exact_sell_price), // Exact price
+            1.0,                    // Not used when exact price is provided
+            None,                   // Not needed
+            None,                   // Not needed
+        )
+        .await?;
 
-    let sell_client_order_id = sell_order.client_order_id
+    let sell_client_order_id = sell_order
+        .client_order_id
         .as_ref()
         .expect("Client order ID should be present")
         .clone();
 
-    info!("[PACIFICA] ✅ Sell order placed successfully!");
-    info!("[PACIFICA]    Order ID: {}", sell_order.order_id.unwrap_or(0));
+    info!("[PACIFICA] OK Sell order placed successfully!");
+    info!(
+        "[PACIFICA]    Order ID: {}",
+        sell_order.order_id.unwrap_or(0)
+    );
     info!("[PACIFICA]    Client Order ID: {}", sell_client_order_id);
     info!("");
 
     // Wait 10 seconds
-    info!("[PACIFICA] ⏳ Waiting 10 seconds before cancelling...");
+    info!("[PACIFICA] WAIT Waiting 10 seconds before cancelling...");
     sleep(Duration::from_secs(10)).await;
 
     // Cancel the sell order
-    info!("[PACIFICA] 🗑️  Cancelling sell order...");
-    trading_client.cancel_order(symbol, &sell_client_order_id).await?;
-    info!("[PACIFICA] ✅ Sell order cancelled successfully!");
+    info!("[PACIFICA] delete  Cancelling sell order...");
+    trading_client
+        .cancel_order(symbol, &sell_client_order_id)
+        .await?;
+    info!("[PACIFICA] OK Sell order cancelled successfully!");
     info!("");
 
     info!("═══════════════════════════════════════════════════");

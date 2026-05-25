@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use tracing::{error, info};
 use xemm_rust::config::Config;
-use xemm_rust::connector::pacifica::{OrderSide, PacificaCredentials, PacificaTrading, PacificaWsTrading};
+use xemm_rust::connector::pacifica::{
+    OrderSide, PacificaCredentials, PacificaTrading, PacificaWsTrading,
+};
 
 /// Test the WebSocket cancel_all_orders functionality
 ///
@@ -21,9 +23,22 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
-    println!("{}", "  WebSocket Cancel All Orders Test".bright_cyan().bold());
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        "  WebSocket Cancel All Orders Test".bright_cyan().bold()
+    );
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!("");
 
     // Load configuration
@@ -35,10 +50,10 @@ async fn main() -> Result<()> {
         .context("Failed to load Pacifica credentials from environment")?;
 
     // Create trading clients
-    let mut rest_trading = PacificaTrading::new(credentials.clone());
+    let mut rest_trading = PacificaTrading::new(credentials.clone())?;
     let ws_trading = PacificaWsTrading::new(credentials.clone(), false); // false = mainnet
 
-    info!("{} Trading clients initialized", "✓".green().bold());
+    info!("{} Trading clients initialized", "OK".green().bold());
 
     // Get market info
     let market_info = rest_trading
@@ -57,13 +72,13 @@ async fn main() -> Result<()> {
 
     info!(
         "{} Using symbol: {} (tick size: {})",
-        "✓".green().bold(),
+        "OK".green().bold(),
         config.symbol.bright_white().bold(),
         tick_size
     );
 
     // Get current market price via REST API
-    info!("{} Fetching current market price...", "✓".green().bold());
+    info!("{} Fetching current market price...", "OK".green().bold());
     let (current_bid, current_ask) = rest_trading
         .get_best_bid_ask_rest(&config.symbol, config.agg_level)
         .await
@@ -73,7 +88,7 @@ async fn main() -> Result<()> {
     let mid_price = (current_bid + current_ask) / 2.0;
     info!(
         "{} Current market: bid=${:.6}, ask=${:.6}, mid=${:.6}",
-        "✓".green().bold(),
+        "OK".green().bold(),
         current_bid,
         current_ask,
         mid_price
@@ -85,22 +100,43 @@ async fn main() -> Result<()> {
     // PART 1: Test WebSocket cancel_all_orders
     // ═══════════════════════════════════════════════════
 
-    println!("{}", "═══ PART 1: WebSocket Cancel All Orders ═══".bright_yellow().bold());
+    println!(
+        "{}",
+        "═══ PART 1: WebSocket Cancel All Orders ═══"
+            .bright_yellow()
+            .bold()
+    );
     println!("");
 
     // Step 1: Clear existing orders with REST API
-    info!("{} Clearing existing orders (REST API)...", "[SETUP]".cyan().bold());
+    info!(
+        "{} Clearing existing orders (REST API)...",
+        "[SETUP]".cyan().bold()
+    );
     match rest_trading
         .cancel_all_orders(false, Some(&config.symbol), false)
         .await
     {
-        Ok(count) => info!("{} {} Cleared {} existing order(s)", "[SETUP]".cyan().bold(), "✓".green().bold(), count),
-        Err(e) => error!("{} {} Failed: {}", "[SETUP]".cyan().bold(), "✗".red().bold(), e),
+        Ok(count) => info!(
+            "{} {} Cleared {} existing order(s)",
+            "[SETUP]".cyan().bold(),
+            "OK".green().bold(),
+            count
+        ),
+        Err(e) => error!(
+            "{} {} Failed: {}",
+            "[SETUP]".cyan().bold(),
+            "FAIL".red().bold(),
+            e
+        ),
     }
     println!("");
 
     // Step 2: Place test orders via REST API
-    info!("{} Placing 3 test orders (REST API)...", "[STEP 1]".blue().bold());
+    info!(
+        "{} Placing 3 test orders (REST API)...",
+        "[STEP 1]".blue().bold()
+    );
 
     // Use prices 5% away from market to avoid fills but stay within exchange limits
     let safe_buy_price = current_bid * 0.95; // 5% below current bid
@@ -139,13 +175,19 @@ async fn main() -> Result<()> {
                 info!(
                     "{} {} BUY order {}: ID={:?}",
                     "[STEP 1]".blue().bold(),
-                    "✓".green().bold(),
+                    "OK".green().bold(),
                     i,
                     order_data.order_id
                 );
             }
             Err(e) => {
-                error!("{} {} BUY order {} failed: {}", "[STEP 1]".blue().bold(), "✗".red().bold(), i, e);
+                error!(
+                    "{} {} BUY order {} failed: {}",
+                    "[STEP 1]".blue().bold(),
+                    "FAIL".red().bold(),
+                    i,
+                    e
+                );
             }
         }
     }
@@ -167,23 +209,36 @@ async fn main() -> Result<()> {
             info!(
                 "{} {} SELL order: ID={:?}",
                 "[STEP 1]".blue().bold(),
-                "✓".green().bold(),
+                "OK".green().bold(),
                 order_data.order_id
             );
         }
         Err(e) => {
-            error!("{} {} SELL order failed: {}", "[STEP 1]".blue().bold(), "✗".red().bold(), e);
+            error!(
+                "{} {} SELL order failed: {}",
+                "[STEP 1]".blue().bold(),
+                "FAIL".red().bold(),
+                e
+            );
         }
     }
 
-    info!("{} {} All test orders placed", "[STEP 1]".blue().bold(), "✓".green().bold());
+    info!(
+        "{} {} All test orders placed",
+        "[STEP 1]".blue().bold(),
+        "OK".green().bold()
+    );
     println!("");
 
     // Wait for orders to be registered
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     // Step 3: Cancel all orders via WEBSOCKET
-    info!("{} {} Cancelling via WebSocket...", "[STEP 2]".bright_magenta().bold(), "⚡".yellow().bold());
+    info!(
+        "{} {} Cancelling via WebSocket...",
+        "[STEP 2]".bright_magenta().bold(),
+        "FAST".yellow().bold()
+    );
     match ws_trading
         .cancel_all_orders_ws(false, Some(&config.symbol), false)
         .await
@@ -192,24 +247,37 @@ async fn main() -> Result<()> {
             println!(
                 "{} {} {} Successfully cancelled {} order(s)",
                 "[STEP 2]".bright_magenta().bold(),
-                "⚡".yellow().bold(),
-                "✓".green().bold(),
+                "FAST".yellow().bold(),
+                "OK".green().bold(),
                 count.to_string().bright_white().bold()
             );
             if count >= 3 {
-                println!("{} {} WebSocket test PASSED!", "[RESULT]".green().bold(), "✓✓✓".green().bold());
+                println!(
+                    "{} {} WebSocket test PASSED!",
+                    "[RESULT]".green().bold(),
+                    "OK".green().bold()
+                );
             } else {
                 error!(
                     "{} {} Expected 3 orders, cancelled {}",
                     "[RESULT]".red().bold(),
-                    "✗✗✗".red().bold(),
+                    "FAIL".red().bold(),
                     count
                 );
             }
         }
         Err(e) => {
-            error!("{} {} WebSocket cancel failed: {}", "[STEP 2]".bright_magenta().bold(), "✗".red().bold(), e);
-            error!("{} {} WebSocket test FAILED", "[RESULT]".red().bold(), "✗✗✗".red().bold());
+            error!(
+                "{} {} WebSocket cancel failed: {}",
+                "[STEP 2]".bright_magenta().bold(),
+                "FAIL".red().bold(),
+                e
+            );
+            error!(
+                "{} {} WebSocket test FAILED",
+                "[RESULT]".red().bold(),
+                "FAIL".red().bold()
+            );
         }
     }
 
@@ -220,11 +288,17 @@ async fn main() -> Result<()> {
     // PART 2: Compare with REST API (for verification)
     // ═══════════════════════════════════════════════════
 
-    println!("{}", "═══ PART 2: REST API Comparison ═══".bright_yellow().bold());
+    println!(
+        "{}",
+        "═══ PART 2: REST API Comparison ═══".bright_yellow().bold()
+    );
     println!("");
 
     // Place another set of orders
-    info!("{} Placing 3 more test orders (REST API)...", "[STEP 3]".blue().bold());
+    info!(
+        "{} Placing 3 more test orders (REST API)...",
+        "[STEP 3]".blue().bold()
+    );
 
     for i in 1..=2 {
         let price = safe_buy_price - (i as f64 * tick_size * 10.0);
@@ -256,7 +330,11 @@ async fn main() -> Result<()> {
         .await
         .ok();
 
-    info!("{} {} Orders placed", "[STEP 3]".blue().bold(), "✓".green().bold());
+    info!(
+        "{} {} Orders placed",
+        "[STEP 3]".blue().bold(),
+        "OK".green().bold()
+    );
     println!("");
 
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -271,23 +349,47 @@ async fn main() -> Result<()> {
             println!(
                 "{} {} Successfully cancelled {} order(s)",
                 "[STEP 4]".cyan().bold(),
-                "✓".green().bold(),
+                "OK".green().bold(),
                 count.to_string().bright_white().bold()
             );
             if count >= 3 {
-                println!("{} {} REST API test PASSED!", "[RESULT]".green().bold(), "✓✓✓".green().bold());
+                println!(
+                    "{} {} REST API test PASSED!",
+                    "[RESULT]".green().bold(),
+                    "OK".green().bold()
+                );
             }
         }
         Err(e) => {
-            error!("{} {} REST API cancel failed: {}", "[STEP 4]".cyan().bold(), "✗".red().bold(), e);
+            error!(
+                "{} {} REST API cancel failed: {}",
+                "[STEP 4]".cyan().bold(),
+                "FAIL".red().bold(),
+                e
+            );
         }
     }
 
     println!("");
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
     println!("{}", "  Test Complete".bright_cyan().bold());
-    println!("{}", "  Both WebSocket and REST API methods tested".bright_cyan().bold());
-    println!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
+    println!(
+        "{}",
+        "  Both WebSocket and REST API methods tested"
+            .bright_cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════"
+            .bright_cyan()
+            .bold()
+    );
 
     Ok(())
 }

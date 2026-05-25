@@ -5,48 +5,54 @@ use std::time::{Duration, Instant};
 
 use crate::strategy::OrderSide;
 
-/// Accumulator for partial fills on a single order. The aggregator combines
-/// events from all fill-detection paths (WS / REST / position-monitor) into
-/// one authoritative view so only a single hedge is emitted per order cycle.
+/// Exposure accumulator for a single Pacifica maker order.
+///
+/// The important invariant is residual based:
+/// cumulative_filled - cumulative_hedged_confirmed - cumulative_hedge_pending
+/// is the only quantity eligible for a new hedge intent.
 #[derive(Debug, Clone, Copy)]
-pub struct PartialAccumulator {
-    pub cumulative_size: f64,
-    pub avg_price: f64,
+pub struct OrderFillState {
+    pub order_id: u64,
     pub side: OrderSide,
+    pub cumulative_filled: f64,
+    pub cumulative_hedged_confirmed: f64,
+    pub cumulative_hedge_pending: f64,
+    pub avg_price: f64,
+    pub terminal: bool,
     pub last_updated: Instant,
     pub created_at: Instant,
-    /// Set once the aggregator has emitted a HedgeDecision for this order.
-    pub emitted: bool,
+    pub next_hedge_seq: u64,
 }
 
-/// Decision returned by `on_fill` when a hedge should fire.
+impl OrderFillState {
+    #[inline]
+    pub fn residual(&self) -> f64 {
+        (self.cumulative_filled - self.cumulative_hedged_confirmed - self.cumulative_hedge_pending)
+            .max(0.0)
+    }
+}
+
+/// Decision returned by `on_fill` / `flush_idle` when a residual hedge should
+/// fire.
 #[derive(Debug, Clone, Copy)]
 pub struct HedgeDecision {
+    pub source_order_id: u64,
+    pub hedge_seq: u64,
     pub side: OrderSide,
     pub size: f64,
     pub avg_price: f64,
     pub detected_at: Instant,
+    pub terminal: bool,
 }
 
-/// Aggregates fill events from multiple detectors into at most one hedge
-/// emission per `order_id`.
-///
-/// Emission rules (first one that fires wins, and the entry stays marked
-/// `emitted=true` thereafter so later events for the same order are ignored):
-///
-/// 1. Terminal event — a full fill, or a cancellation that left some
-///    fills behind. Emits whatever was accumulated.
-/// 2. Notional breach — cumulative fill notional exceeds
-///    `emergency_notional_usd`, a defensive upper bound (e.g. 2× the
-///    configured order size) in case the exchange silently splits a fill
-///    across many partials without a final terminal event.
-/// 3. Idle timeout — `maybe_flush_idle` checks for accumulators with no
-///    update in the last `idle_timeout`, emits them, and marks them
-///    emitted. Called from a background task at ~1 Hz.
+/// Aggregates fill observations from multiple detectors into residual hedge
+/// decisions. Unlike the previous one-shot order dedup, this allows a later
+/// residual fill on the same maker order to generate another hedge.
 pub struct FillAggregator {
-    inner: Mutex<HashMap<u64, PartialAccumulator>>,
+    inner: Mutex<HashMap<u64, OrderFillState>>,
     pub emergency_notional_usd: f64,
     pub idle_timeout: Duration,
+    pub min_hedge_qty: f64,
 }
 
 impl FillAggregator {
@@ -55,13 +61,15 @@ impl FillAggregator {
             inner: Mutex::new(HashMap::new()),
             emergency_notional_usd,
             idle_timeout: Duration::from_secs(2),
+            min_hedge_qty: 0.0,
         })
     }
 
-    /// Record a fill for `order_id`. `absolute_filled_size` and `avg_price`
-    /// are the authoritative totals as reported by the exchange (not the
-    /// per-event increment) — WS `account_order_updates` already reports
-    /// these fields as running totals.
+    /// Record an authoritative cumulative fill observation for `order_id`.
+    ///
+    /// The detector must pass the exchange's cumulative filled size, not the
+    /// per-event delta. Out-of-order observations are tolerated by keeping the
+    /// largest cumulative size observed so far.
     pub fn on_fill(
         &self,
         order_id: u64,
@@ -72,75 +80,93 @@ impl FillAggregator {
     ) -> Option<HedgeDecision> {
         let now = Instant::now();
         let mut g = self.inner.lock();
-        let entry = g.entry(order_id).or_insert_with(|| PartialAccumulator {
-            cumulative_size: 0.0,
-            avg_price: 0.0,
+        let entry = g.entry(order_id).or_insert_with(|| OrderFillState {
+            order_id,
             side,
+            cumulative_filled: 0.0,
+            cumulative_hedged_confirmed: 0.0,
+            cumulative_hedge_pending: 0.0,
+            avg_price: 0.0,
+            terminal: false,
             last_updated: now,
             created_at: now,
-            emitted: false,
+            next_hedge_seq: 0,
         });
 
-        if entry.emitted {
-            return None;
-        }
-
-        // Update to authoritative absolute totals. Fill detectors can arrive
-        // out of order (REST may race WS); keep the larger cumulative.
-        if absolute_filled_size > entry.cumulative_size {
-            entry.cumulative_size = absolute_filled_size;
+        if absolute_filled_size > entry.cumulative_filled {
+            entry.cumulative_filled = absolute_filled_size;
             entry.avg_price = avg_price;
         }
+        entry.terminal |= is_terminal;
         entry.last_updated = now;
 
-        let should_emit = is_terminal
-            || (entry.cumulative_size * entry.avg_price) >= self.emergency_notional_usd;
+        let residual = entry.residual();
+        let notional = residual * entry.avg_price;
+        let should_emit = residual > 0.0
+            && (entry.terminal
+                || (self.min_hedge_qty > 0.0 && residual >= self.min_hedge_qty)
+                || notional >= self.emergency_notional_usd);
 
-        if should_emit && entry.cumulative_size > 0.0 {
-            entry.emitted = true;
-            return Some(HedgeDecision {
-                side: entry.side,
-                size: entry.cumulative_size,
-                avg_price: entry.avg_price,
-                detected_at: now,
-            });
+        if should_emit {
+            Some(Self::emit_pending(entry, now, entry.terminal))
+        } else {
+            None
         }
-        None
     }
 
-    /// Scan accumulators and emit any that have been idle past `idle_timeout`
-    /// with a non-zero accumulated size. Caller is responsible for dispatching
-    /// the returned decisions to the hedge queue.
+    fn emit_pending(entry: &mut OrderFillState, now: Instant, terminal: bool) -> HedgeDecision {
+        let residual = entry.residual();
+        let hedge_seq = entry.next_hedge_seq;
+        entry.next_hedge_seq += 1;
+        entry.cumulative_hedge_pending += residual;
+
+        HedgeDecision {
+            source_order_id: entry.order_id,
+            hedge_seq,
+            side: entry.side,
+            size: residual,
+            avg_price: entry.avg_price,
+            detected_at: now,
+            terminal,
+        }
+    }
+
+    /// Mark a hedge intent as confirmed. Partial Hyperliquid fills leave the
+    /// unfilled remainder pending for the hedge executor/reconciler rather than
+    /// being re-emitted by fill observation dedup.
+    pub fn mark_hedge_confirmed(&self, order_id: u64, filled_qty: f64) {
+        let mut g = self.inner.lock();
+        if let Some(entry) = g.get_mut(&order_id) {
+            let filled = filled_qty.max(0.0).min(entry.cumulative_hedge_pending);
+            entry.cumulative_hedge_pending -= filled;
+            entry.cumulative_hedged_confirmed += filled;
+        }
+    }
+
+    /// Scan accumulators and emit residuals that have gone idle.
     pub fn flush_idle(&self) -> Vec<(u64, HedgeDecision)> {
         let now = Instant::now();
         let mut out = Vec::new();
         let mut g = self.inner.lock();
         for (order_id, acc) in g.iter_mut() {
-            if !acc.emitted
-                && acc.cumulative_size > 0.0
-                && now.duration_since(acc.last_updated) >= self.idle_timeout
-            {
-                acc.emitted = true;
-                out.push((
-                    *order_id,
-                    HedgeDecision {
-                        side: acc.side,
-                        size: acc.cumulative_size,
-                        avg_price: acc.avg_price,
-                        detected_at: now,
-                    },
-                ));
+            if acc.residual() > 0.0 && now.duration_since(acc.last_updated) >= self.idle_timeout {
+                let decision = Self::emit_pending(acc, now, acc.terminal);
+                out.push((*order_id, decision));
             }
         }
         out
     }
 
-    /// Remove accumulators that have been emitted and are older than
-    /// `ttl`. Prevents unbounded growth across long bot runs.
+    /// Remove terminal accumulators whose exposure has been fully hedged.
     pub fn gc(&self, ttl: Duration) {
         let now = Instant::now();
         let mut g = self.inner.lock();
-        g.retain(|_, acc| !acc.emitted || now.duration_since(acc.created_at) < ttl);
+        g.retain(|_, acc| {
+            !(acc.terminal
+                && acc.residual() <= f64::EPSILON
+                && acc.cumulative_hedge_pending <= f64::EPSILON
+                && now.duration_since(acc.created_at) >= ttl)
+        });
     }
 
     /// Current accumulator count (diagnostic / test use).
@@ -158,7 +184,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_terminal_partial_does_not_emit() {
+    fn non_terminal_partial_does_not_emit_by_default() {
         let agg = FillAggregator::new(1000.0);
         let d = agg.on_fill(1, OrderSide::Buy, 0.5, 100.0, false);
         assert!(d.is_none());
@@ -172,10 +198,32 @@ mod tests {
         assert!((d.size - 1.0).abs() < 1e-9);
         assert!((d.avg_price - 101.0).abs() < 1e-9);
         assert_eq!(d.side, OrderSide::Buy);
+        assert!(d.terminal);
     }
 
     #[test]
-    fn second_event_after_emit_is_ignored() {
+    fn later_residual_after_idle_flush_emits_again() {
+        let agg = Arc::new(FillAggregator {
+            inner: Mutex::new(HashMap::new()),
+            emergency_notional_usd: 1_000_000.0,
+            idle_timeout: Duration::from_millis(10),
+            min_hedge_qty: 0.0,
+        });
+        assert!(agg.on_fill(1, OrderSide::Buy, 0.4, 100.0, false).is_none());
+        std::thread::sleep(Duration::from_millis(20));
+        let first = agg.flush_idle();
+        assert_eq!(first.len(), 1);
+        assert!((first[0].1.size - 0.4).abs() < 1e-9);
+        assert!(!first[0].1.terminal);
+
+        let second = agg.on_fill(1, OrderSide::Buy, 1.0, 101.0, true).unwrap();
+        assert!((second.size - 0.6).abs() < 1e-9);
+        assert_eq!(second.hedge_seq, 1);
+        assert!(second.terminal);
+    }
+
+    #[test]
+    fn duplicate_cumulative_observation_does_not_emit_duplicate() {
         let agg = FillAggregator::new(1000.0);
         assert!(agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).is_some());
         assert!(agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).is_none());
@@ -186,6 +234,7 @@ mod tests {
         let agg = FillAggregator::new(50.0);
         let d = agg.on_fill(1, OrderSide::Sell, 1.0, 100.0, false).unwrap();
         assert!((d.size - 1.0).abs() < 1e-9);
+        assert!(!d.terminal);
     }
 
     #[test]
@@ -199,25 +248,18 @@ mod tests {
     }
 
     #[test]
-    fn flush_idle_emits_stale_accumulators() {
-        // Build an aggregator with short idle_timeout for test determinism.
-        let agg = Arc::new(FillAggregator {
-            inner: Mutex::new(HashMap::new()),
-            emergency_notional_usd: 1_000_000.0,
-            idle_timeout: Duration::from_millis(10),
-        });
-        let _ = agg.on_fill(1, OrderSide::Buy, 0.3, 100.0, false);
-        std::thread::sleep(Duration::from_millis(20));
-        let flushed = agg.flush_idle();
-        assert_eq!(flushed.len(), 1);
-        assert_eq!(flushed[0].0, 1);
-        assert!((flushed[0].1.size - 0.3).abs() < 1e-9);
+    fn mark_confirmed_moves_pending_to_confirmed() {
+        let agg = FillAggregator::new(1000.0);
+        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        agg.mark_hedge_confirmed(1, d.size);
+        assert!(agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).is_none());
     }
 
     #[test]
-    fn gc_removes_old_emitted_entries() {
+    fn gc_removes_old_terminal_hedged_entries() {
         let agg = FillAggregator::new(1000.0);
-        assert!(agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).is_some());
+        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        agg.mark_hedge_confirmed(1, d.size);
         assert_eq!(agg.len(), 1);
         std::thread::sleep(Duration::from_millis(5));
         agg.gc(Duration::from_millis(1));

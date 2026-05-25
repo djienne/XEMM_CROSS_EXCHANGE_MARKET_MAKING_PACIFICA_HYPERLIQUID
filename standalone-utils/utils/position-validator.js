@@ -48,7 +48,7 @@ class PositionValidator extends EventEmitter {
       // Sync the position cache with actual positions
       this.positionCache.syncWithActual(actualPositions);
 
-      console.log('[POSITION VALIDATOR] ✅ Position cache initialized');
+      console.log('[POSITION VALIDATOR] OK Position cache initialized');
     } catch (error) {
       console.error('[POSITION VALIDATOR] Failed to initialize cache:', error.message);
       throw error;
@@ -261,7 +261,7 @@ class PositionValidator extends EventEmitter {
     };
 
     console.log('\n' + '='.repeat(80));
-    console.log('⚠️  POSITION IMBALANCE DETECTED');
+    console.log('WARN  POSITION IMBALANCE DETECTED');
     console.log('='.repeat(80));
 
     for (const imbalance of imbalances) {
@@ -285,7 +285,7 @@ class PositionValidator extends EventEmitter {
     }
 
     console.log('\n' + '='.repeat(80));
-    console.log('⚠️  ACTION REQUIRED: Review positions and investigate cause');
+    console.log('WARN  ACTION REQUIRED: Review positions and investigate cause');
     console.log('    Use: node tests/close-all-positions.js to fix imbalances');
     console.log('='.repeat(80) + '\n');
 
