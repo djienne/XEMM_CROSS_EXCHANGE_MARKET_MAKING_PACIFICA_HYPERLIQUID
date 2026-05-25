@@ -3,10 +3,12 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 
-use crate::services::HedgeEvent;
+use crate::services::HedgeIntent;
 
 const DEFAULT_HEDGE_LIFECYCLE_PATH: &str = "data/hedge_lifecycle.jsonl";
+static LIFECYCLE_LOGGER: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HedgeIntentStatus {
@@ -41,7 +43,7 @@ impl HedgeIntentStatus {
 
 #[derive(Debug, Clone)]
 pub struct HedgeLifecycleUpdate<'a> {
-    pub intent: &'a HedgeEvent,
+    pub intent: &'a HedgeIntent,
     pub status: HedgeIntentStatus,
     pub cloid: Option<&'a str>,
     pub target_qty: Option<f64>,
@@ -52,7 +54,7 @@ pub struct HedgeLifecycleUpdate<'a> {
 }
 
 impl<'a> HedgeLifecycleUpdate<'a> {
-    pub fn new(intent: &'a HedgeEvent, status: HedgeIntentStatus) -> Self {
+    pub fn new(intent: &'a HedgeIntent, status: HedgeIntentStatus) -> Self {
         Self {
             intent,
             status,
@@ -66,18 +68,69 @@ impl<'a> HedgeLifecycleUpdate<'a> {
     }
 }
 
-pub fn intent_id(intent: &HedgeEvent) -> String {
+pub fn intent_id(intent: &HedgeIntent) -> String {
     format!("{}-{}", intent.source_order_id, intent.hedge_seq)
 }
 
-pub async fn append_lifecycle_update(update: HedgeLifecycleUpdate<'_>) -> Result<()> {
-    append_lifecycle_update_to_path(DEFAULT_HEDGE_LIFECYCLE_PATH, update).await
+pub fn start_lifecycle_logger(capacity: usize) {
+    let (tx, mut rx) = mpsc::channel::<String>(capacity);
+    if LIFECYCLE_LOGGER.set(tx).is_err() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let path = Path::new(DEFAULT_HEDGE_LIFECYCLE_PATH);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!("failed to create hedge lifecycle log dir: {}", e);
+                return;
+            }
+        }
+
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+        {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::warn!("failed to open hedge lifecycle log: {}", e);
+                return;
+            }
+        };
+
+        while let Some(line) = rx.recv().await {
+            if let Err(e) = file.write_all(line.as_bytes()).await {
+                tracing::warn!("failed to write hedge lifecycle update: {}", e);
+                continue;
+            }
+            if let Err(e) = file.write_all(b"\n").await {
+                tracing::warn!("failed to write hedge lifecycle newline: {}", e);
+            }
+        }
+        let _ = file.flush().await;
+    });
 }
 
+pub async fn append_lifecycle_update(update: HedgeLifecycleUpdate<'_>) -> Result<()> {
+    let line = lifecycle_record(update).to_string();
+    if let Some(tx) = LIFECYCLE_LOGGER.get() {
+        tx.try_send(line)?;
+        return Ok(());
+    }
+    append_lifecycle_line_to_path(DEFAULT_HEDGE_LIFECYCLE_PATH, line).await
+}
+
+#[cfg(test)]
 async fn append_lifecycle_update_to_path(
     path: impl AsRef<Path>,
     update: HedgeLifecycleUpdate<'_>,
 ) -> Result<()> {
+    append_lifecycle_line_to_path(path, lifecycle_record(update).to_string()).await
+}
+
+async fn append_lifecycle_line_to_path(path: impl AsRef<Path>, line: String) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -89,14 +142,22 @@ async fn append_lifecycle_update_to_path(
         .open(path)
         .await?;
 
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
+}
+
+fn lifecycle_record(update: HedgeLifecycleUpdate<'_>) -> serde_json::Value {
     let intent = update.intent;
-    let record = json!({
+    json!({
         "ts_ms": chrono::Utc::now().timestamp_millis(),
         "intent_id": intent_id(intent),
         "status": update.status.as_str(),
         "source_order_id": intent.source_order_id,
         "hedge_seq": intent.hedge_seq,
-        "side": intent.side.as_str(),
+        "source": intent.source.as_str(),
+        "maker_side": intent.maker_side.map(|side| side.as_str()),
+        "hedge_side": intent.hedge_side.as_str(),
         "size": intent.size,
         "avg_price": intent.avg_price,
         "terminal": intent.terminal,
@@ -106,11 +167,7 @@ async fn append_lifecycle_update_to_path(
         "residual_qty": update.residual_qty,
         "attempt": update.attempt,
         "reason": update.reason,
-    });
-
-    file.write_all(record.to_string().as_bytes()).await?;
-    file.write_all(b"\n").await?;
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -125,15 +182,8 @@ mod tests {
             "hedge_lifecycle_test_{}.jsonl",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let intent = HedgeEvent {
-            source_order_id: 7,
-            hedge_seq: 2,
-            side: OrderSide::Buy,
-            size: 0.5,
-            avg_price: 100.0,
-            detected_at: Instant::now(),
-            terminal: true,
-        };
+        let intent =
+            HedgeIntent::from_maker_fill(7, 2, OrderSide::Buy, 0.5, 100.0, Instant::now(), true);
         let mut update = HedgeLifecycleUpdate::new(&intent, HedgeIntentStatus::Submitted);
         update.cloid = Some("0xabc");
         update.target_qty = Some(0.5);

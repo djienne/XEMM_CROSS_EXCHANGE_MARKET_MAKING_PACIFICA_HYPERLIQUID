@@ -1,19 +1,16 @@
-use parking_lot::Mutex;
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::bot::{BotState, BotStatus, RunState};
 use crate::config::Config;
-use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
+use crate::services::cancel_manager::{CancelIntent, CancelReason};
 use crate::strategy::{OpportunityEvaluator, OrderSide};
-use crate::util::price::{prices_valid, QuoteSource, SharedQuote};
-use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
+use crate::util::price::{now_ns, prices_valid, SharedQuote};
 
 // ============================================================================
 // ATOMIC STATUS FOR LOCK-FREE HOT PATH CHECKS
@@ -39,78 +36,124 @@ pub struct OrderSnapshot {
     pub price: f64,
     pub size: f64,
     pub initial_profit_bps: f64,
-    pub placed_at: Instant,
+    pub placed_at_ns: u64,
     pub cancel_requested: bool,
 }
 
-/// Shared order snapshot updated atomically by order placer
-/// Uses Option wrapped in Mutex for atomic swap semantics
-pub struct SharedOrderSnapshot {
-    inner: Mutex<Option<OrderSnapshot>>,
+/// Shared order snapshot updated with a seqlock so readers avoid a mutex.
+pub struct AtomicOrderSnapshot {
+    seq: AtomicU64,
+    present: AtomicU8,
+    side: AtomicU8,
+    price_bits: AtomicU64,
+    size_bits: AtomicU64,
+    initial_profit_bits: AtomicU64,
+    placed_at_ns: AtomicU64,
+    cancel_requested: AtomicU8,
 }
 
-impl SharedOrderSnapshot {
+pub type SharedOrderSnapshot = AtomicOrderSnapshot;
+
+impl AtomicOrderSnapshot {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(None),
+            seq: AtomicU64::new(0),
+            present: AtomicU8::new(0),
+            side: AtomicU8::new(0),
+            price_bits: AtomicU64::new(0),
+            size_bits: AtomicU64::new(0),
+            initial_profit_bits: AtomicU64::new(0),
+            placed_at_ns: AtomicU64::new(0),
+            cancel_requested: AtomicU8::new(0),
         }
     }
 
     #[inline]
     pub fn get(&self) -> Option<OrderSnapshot> {
-        *self.inner.lock()
+        for _ in 0..8 {
+            let seq1 = self.seq.load(Ordering::Acquire);
+            if seq1 % 2 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            compiler_fence(Ordering::Acquire);
+            let present = self.present.load(Ordering::Relaxed);
+            let side = self.side.load(Ordering::Relaxed);
+            let price = f64::from_bits(self.price_bits.load(Ordering::Relaxed));
+            let size = f64::from_bits(self.size_bits.load(Ordering::Relaxed));
+            let initial_profit_bps =
+                f64::from_bits(self.initial_profit_bits.load(Ordering::Relaxed));
+            let placed_at_ns = self.placed_at_ns.load(Ordering::Relaxed);
+            let cancel_requested = self.cancel_requested.load(Ordering::Relaxed) != 0;
+            compiler_fence(Ordering::Acquire);
+            let seq2 = self.seq.load(Ordering::Acquire);
+            if seq1 == seq2 && seq2 % 2 == 0 {
+                if present == 0 {
+                    return None;
+                }
+                return Some(OrderSnapshot {
+                    side: if side == 0 {
+                        OrderSide::Buy
+                    } else {
+                        OrderSide::Sell
+                    },
+                    price,
+                    size,
+                    initial_profit_bps,
+                    placed_at_ns,
+                    cancel_requested,
+                });
+            }
+        }
+        None
     }
 
     #[inline]
     pub fn set(&self, snapshot: Option<OrderSnapshot>) {
-        *self.inner.lock() = snapshot;
+        let seq = self.seq.fetch_add(1, Ordering::AcqRel);
+        match snapshot {
+            Some(snapshot) => {
+                self.side.store(
+                    match snapshot.side {
+                        OrderSide::Buy => 0,
+                        OrderSide::Sell => 1,
+                    },
+                    Ordering::Release,
+                );
+                self.price_bits
+                    .store(snapshot.price.to_bits(), Ordering::Release);
+                self.size_bits
+                    .store(snapshot.size.to_bits(), Ordering::Release);
+                self.initial_profit_bits
+                    .store(snapshot.initial_profit_bps.to_bits(), Ordering::Release);
+                self.placed_at_ns
+                    .store(snapshot.placed_at_ns, Ordering::Release);
+                self.cancel_requested
+                    .store(u8::from(snapshot.cancel_requested), Ordering::Release);
+                self.present.store(1, Ordering::Release);
+            }
+            None => {
+                self.present.store(0, Ordering::Release);
+                self.cancel_requested.store(0, Ordering::Release);
+            }
+        }
+        self.seq.store(seq + 2, Ordering::Release);
     }
 
     #[inline]
     pub fn request_cancel(&self) -> bool {
-        let mut guard = self.inner.lock();
-        if let Some(snapshot) = guard.as_mut() {
-            if snapshot.cancel_requested {
-                return false;
-            }
-            snapshot.cancel_requested = true;
-            true
-        } else {
-            false
-        }
+        self.present.load(Ordering::Acquire) != 0
+            && self
+                .cancel_requested
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 
     #[inline]
     pub fn reset_cancel_request(&self) {
-        if let Some(snapshot) = self.inner.lock().as_mut() {
-            snapshot.cancel_requested = false;
-        }
+        self.cancel_requested.store(0, Ordering::Release);
     }
 }
-
-// ============================================================================
-// CANCELLATION REQUEST CHANNEL (DECOUPLE FROM HOT PATH)
-// ============================================================================
-
-/// Cancellation request sent from monitor to cancellation handler.
-///
-/// Hot-path `CancelRequest` values are `Copy` and allocation-free - the
-/// monitor loop runs at 1 kHz and can fire multiple requests per second, so
-/// any string building is deferred to the (cold) cancellation handler.
-#[derive(Debug, Clone, Copy)]
-pub enum CancelRequest {
-    /// Cancel due to age expiry (order age in ms).
-    AgeExpiry { age_ms: u64 },
-    /// Cancel due to profit deviation.
-    ProfitDeviation {
-        current_profit_bps: f64,
-        deviation_bps: f64,
-    },
-}
-
-// ============================================================================
-// ORDER MONITOR SERVICE (OPTIMIZED)
-// ============================================================================
 
 /// Order monitoring service
 ///
@@ -142,12 +185,7 @@ pub struct OrderMonitorService {
     pub config: Config,
     pub evaluator: OpportunityEvaluator,
 
-    // Trading connectors (only used by cancellation task)
-    pub pacifica_trading: Arc<PacificaTrading>,
-    pub hyperliquid_trading: Arc<HyperliquidTrading>,
-
-    // Channel for cancel requests (decouples hot path from I/O)
-    pub cancel_tx: mpsc::Sender<CancelRequest>,
+    pub cancel_tx: mpsc::Sender<CancelIntent>,
 }
 
 impl OrderMonitorService {
@@ -160,13 +198,9 @@ impl OrderMonitorService {
         hyperliquid_prices: Arc<SharedQuote>,
         config: Config,
         evaluator: OpportunityEvaluator,
-        pacifica_trading: Arc<PacificaTrading>,
-        hyperliquid_trading: Arc<HyperliquidTrading>,
-    ) -> (Self, mpsc::Receiver<CancelRequest>) {
-        // Bounded channel to prevent unbounded growth, but large enough to not block
-        let (cancel_tx, cancel_rx) = mpsc::channel(64);
-
-        let service = Self {
+        cancel_tx: mpsc::Sender<CancelIntent>,
+    ) -> Self {
+        Self {
             bot_state,
             atomic_status,
             order_snapshot,
@@ -174,12 +208,8 @@ impl OrderMonitorService {
             hyperliquid_prices,
             config,
             evaluator,
-            pacifica_trading,
-            hyperliquid_trading,
             cancel_tx,
-        };
-
-        (service, cancel_rx)
+        }
     }
 
     /// Main monitoring loop - LATENCY CRITICAL
@@ -214,16 +244,19 @@ impl OrderMonitorService {
                 continue;
             }
 
-            let age = snapshot.placed_at.elapsed();
+            let age = Duration::from_nanos(now_ns().saturating_sub(snapshot.placed_at_ns));
 
             // Check 1: Age threshold
             if age > age_threshold {
                 // Send allocation-free cancel request (non-blocking). The human
                 // formatting happens in the cold-path handler.
                 if self.order_snapshot.request_cancel() {
-                    let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
-                        age_ms: age.as_millis() as u64,
-                    });
+                    let _ = self.cancel_tx.try_send(CancelIntent::new(
+                        self.config.symbol.clone(),
+                        CancelReason::AgeExpiry {
+                            age_ms: age.as_millis() as u64,
+                        },
+                    ));
                 }
                 continue;
             }
@@ -246,140 +279,13 @@ impl OrderMonitorService {
             ) && self.order_snapshot.request_cancel()
             {
                 // Send allocation-free cancel request (non-blocking).
-                let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
-                    current_profit_bps: current_profit,
-                    deviation_bps: profit_drop,
-                });
-            }
-        }
-    }
-
-    /// Cancellation handler task - runs separately from hot path
-    ///
-    /// Handles all I/O operations: REST API calls, state updates, logging
-    pub async fn run_cancellation_handler(&self, mut cancel_rx: mpsc::Receiver<CancelRequest>) {
-        let mut rate_limit = RateLimitTracker::new();
-
-        while let Some(request) = cancel_rx.recv().await {
-            // Check rate limit backoff
-            if rate_limit.should_skip() {
-                debug!(
-                    "[CANCEL] Skipping cancellation (rate limit backoff, {:.1}s remaining)",
-                    rate_limit.remaining_backoff_secs()
-                );
-                continue;
-            }
-
-            // Double-check state hasn't changed (order might have filled)
-            let status = self.atomic_status.load(Ordering::Acquire);
-            if status != AtomicBotStatus::OrderPlaced as u8 {
-                debug!("[CANCEL] Skipping - status changed to {}", status);
-                self.order_snapshot.reset_cancel_request();
-                continue;
-            }
-
-            // Get current snapshot for logging
-            let _snapshot = self.order_snapshot.get();
-
-            // Check for partial fills before cancelling
-            match self.check_for_fills().await {
-                FillCheckResult::HasFills(amount) => {
-                    info!(
-                        "[CANCEL] Order has fills ({}) - skipping cancellation, waiting for fill detection",
-                        amount
-                    );
-                    continue;
-                }
-                FillCheckResult::NotFound => {
-                    debug!("[CANCEL] Order not in open orders - might be filled/cancelled");
-                    let mut state = self.bot_state.write();
-                    if matches!(state.status, BotStatus::OrderPlaced | BotStatus::Cancelling) {
-                        state.clear_active_order();
-                        self.order_snapshot.set(None);
-                    }
-                    continue;
-                }
-                FillCheckResult::NoFills => {
-                    // Safe to proceed with cancellation
-                }
-                FillCheckResult::CheckFailed(e) => {
-                    debug!(
-                        "[CANCEL] Fill check failed: {} - proceeding with cancellation",
-                        e
-                    );
-                    // Continue with cancellation (safer than leaving hanging orders)
-                }
-            }
-
-            if RunState::try_transition(
-                &self.atomic_status,
-                RunState::OrderPlaced,
-                RunState::Cancelling,
-            ) {
-                let mut state = self.bot_state.write();
-                if matches!(state.status, BotStatus::OrderPlaced) {
-                    state.mark_cancelling();
-                }
-            }
-
-            // Log the cancellation reason (cold path, formatting is fine here)
-            match request {
-                CancelRequest::AgeExpiry { age_ms } => {
-                    info!(
-                        "[CANCEL] Age expiry: age {}ms > {}s threshold",
-                        age_ms, self.config.order_refresh_interval_secs
-                    );
-                }
-                CancelRequest::ProfitDeviation {
-                    current_profit_bps,
-                    deviation_bps,
-                } => {
-                    info!(
-                        "[CANCEL] Profit deviation: current={:.2} bps, deviation={:.2} bps",
-                        current_profit_bps, deviation_bps
-                    );
-                }
-            }
-
-            // Execute cancellation against the configured symbol
-            match self
-                .pacifica_trading
-                .cancel_all_orders(false, Some(&self.config.symbol), false)
-                .await
-            {
-                Ok(_) => {
-                    rate_limit.record_success();
-
-                    // Clear state only if still in OrderPlaced
-                    {
-                        let mut state = self.bot_state.write();
-                        if matches!(state.status, BotStatus::OrderPlaced | BotStatus::Cancelling) {
-                            state.clear_active_order();
-                            self.order_snapshot.set(None);
-                        }
-                    }
-
-                    // Refresh prices in parallel (not blocking the handler)
-                    self.refresh_prices_parallel().await;
-                }
-                Err(e) => {
-                    if is_rate_limit_error(&e) {
-                        rate_limit.record_error();
-                        warn!(
-                            "[CANCEL] Rate limit exceeded. Backing off for {}s (attempt #{})",
-                            rate_limit.get_backoff_secs(),
-                            rate_limit.consecutive_errors()
-                        );
-                    } else {
-                        warn!("[CANCEL] Failed to cancel: {}", e);
-                    }
-                    self.order_snapshot.reset_cancel_request();
-                    let mut state = self.bot_state.write();
-                    if matches!(state.status, BotStatus::Cancelling) {
-                        state.status = BotStatus::OrderPlaced;
-                        state.store_status();
-                    }
-                }
+                let _ = self.cancel_tx.try_send(CancelIntent::new(
+                    self.config.symbol.clone(),
+                    CancelReason::ProfitDeviation {
+                        current_profit_bps: current_profit,
+                        deviation_bps: profit_drop,
+                    },
+                ));
             }
         }
     }
@@ -414,7 +320,7 @@ impl OrderMonitorService {
                 hl_ask,
             );
             let profit_change = current_profit - snapshot.initial_profit_bps;
-            let age_ms = snapshot.placed_at.elapsed().as_millis();
+            let age_ms = now_ns().saturating_sub(snapshot.placed_at_ns) / 1_000_000;
 
             let hedge_price = match snapshot.side {
                 OrderSide::Buy => hl_bid,
@@ -432,66 +338,6 @@ impl OrderMonitorService {
             );
         }
     }
-
-    /// Check if order has fills (called from cancellation handler, not hot path)
-    async fn check_for_fills(&self) -> FillCheckResult {
-        // Get client_order_id from full state (only in cancellation handler)
-        let client_order_id = {
-            let state = self.bot_state.read();
-            match &state.active_order {
-                Some(order) => order.client_order_id.clone(),
-                None => return FillCheckResult::NotFound,
-            }
-        };
-
-        match self.pacifica_trading.get_open_orders().await {
-            Ok(orders) => {
-                if let Some(order) = orders.iter().find(|o| o.client_order_id == client_order_id) {
-                    let filled_amount: f64 = fast_float::parse(&order.filled_amount).unwrap_or(0.0);
-                    if filled_amount > 0.0 {
-                        FillCheckResult::HasFills(filled_amount)
-                    } else {
-                        FillCheckResult::NoFills
-                    }
-                } else {
-                    FillCheckResult::NotFound
-                }
-            }
-            Err(e) => FillCheckResult::CheckFailed(e.to_string()),
-        }
-    }
-
-    /// Refresh prices from both exchanges in parallel
-    async fn refresh_prices_parallel(&self) {
-        let pac_future = self
-            .pacifica_trading
-            .get_best_bid_ask_rest(&self.config.symbol, self.config.agg_level);
-        let hl_future = self
-            .hyperliquid_trading
-            .get_l2_snapshot(&self.config.symbol);
-
-        let (pac_result, hl_result) = tokio::join!(pac_future, hl_future);
-
-        if let Ok(Some((bid, ask))) = pac_result {
-            self.pacifica_prices
-                .store_with_source(bid, ask, 0, QuoteSource::Rest);
-            debug!("[REFRESH] Pacifica: bid=${:.6}, ask=${:.6}", bid, ask);
-        }
-
-        if let Ok(Some((bid, ask))) = hl_result {
-            self.hyperliquid_prices
-                .store_with_source(bid, ask, 0, QuoteSource::Rest);
-            debug!("[REFRESH] Hyperliquid: bid=${:.6}, ask=${:.6}", bid, ask);
-        }
-    }
-}
-
-/// Result of checking for partial fills
-enum FillCheckResult {
-    HasFills(f64),
-    NoFills,
-    NotFound,
-    CheckFailed(String),
 }
 
 // ============================================================================
@@ -519,7 +365,7 @@ pub fn update_order_snapshot(
         price,
         size,
         initial_profit_bps,
-        placed_at: Instant::now(),
+        placed_at_ns: now_ns(),
         cancel_requested: false,
     }));
 }
@@ -538,20 +384,11 @@ pub fn should_cancel_for_profit_drop(
 // ============================================================================
 
 /// Spawn all monitor tasks
-pub fn spawn_monitor_tasks(
-    service: Arc<OrderMonitorService>,
-    cancel_rx: mpsc::Receiver<CancelRequest>,
-) {
+pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>) {
     // Hot path monitor (1kHz)
     let service_clone = Arc::clone(&service);
     tokio::spawn(async move {
         service_clone.run_monitor_loop().await;
-    });
-
-    // Cancellation handler (processes cancel requests)
-    let service_clone = Arc::clone(&service);
-    tokio::spawn(async move {
-        service_clone.run_cancellation_handler(cancel_rx).await;
     });
 
     // Profit logger (0.5 Hz)

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{interval, Duration};
@@ -118,6 +119,7 @@ pub struct FillDetectionClient {
     /// Optional hook called after each (re)connect. Populate to run REST
     /// reconciliation and catch up on fills that happened during the outage.
     reconcile_hook: Arc<Mutex<Option<ReconcileHook>>>,
+    ready: Arc<AtomicBool>,
 }
 
 impl FillDetectionClient {
@@ -140,7 +142,16 @@ impl FillDetectionClient {
             last_order_fill_time: Arc::new(Mutex::new(Instant::now())),
             position_initialized: Arc::new(Mutex::new(HashSet::new())),
             reconcile_hook: Arc::new(Mutex::new(None)),
+            ready: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub fn ready_flag(&self) -> Arc<AtomicBool> {
+        self.ready.clone()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
 
     /// Register a reconciliation hook that runs after every (re)connect.
@@ -338,6 +349,7 @@ impl FillDetectionClient {
                 self.config.account
             );
         }
+        self.ready.store(true, Ordering::Release);
 
         // Set up ping interval
         let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
@@ -354,14 +366,17 @@ impl FillDetectionClient {
                         }
                         Some(Ok(Message::Close(_))) => {
                             info!("WebSocket closed by server");
+                            self.ready.store(false, Ordering::Release);
                             break;
                         }
                         Some(Err(e)) => {
                             error!("WebSocket error: {}", e);
+                            self.ready.store(false, Ordering::Release);
                             return Err(e.into());
                         }
                         None => {
                             info!("WebSocket stream ended");
+                            self.ready.store(false, Ordering::Release);
                             break;
                         }
                         _ => {}

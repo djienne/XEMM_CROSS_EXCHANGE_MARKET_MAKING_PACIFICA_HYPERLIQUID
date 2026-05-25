@@ -7,21 +7,21 @@ use tracing::{debug, error, info, warn};
 
 use crate::bot::{BotState, BotStatus};
 use crate::connector::pacifica::{
-    FillDetectionClient, FillEvent, PacificaTrading, PacificaWsTrading, PositionBaselineUpdater,
+    FillDetectionClient, FillEvent, PacificaTrading, PositionBaselineUpdater,
 };
+use crate::services::cancel_manager::{CancelIntent, CancelReason};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::{enqueue_hedge_intent, HedgeEvent};
+use crate::services::{enqueue_hedge_intent, HedgeIntent};
 use crate::strategy::OrderSide;
-use crate::util::cancel::dual_cancel;
 use crate::util::log::{tag_static, Color};
 
 /// WebSocket-based fill detection service (primary fill detection method)
 pub struct FillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeIntent>,
+    pub cancel_tx: mpsc::Sender<CancelIntent>,
     pub pacifica_trading: Arc<PacificaTrading>,
-    pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub fill_client: FillDetectionClient,
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
@@ -74,12 +74,13 @@ impl FillDetectionService {
                                     "ask" | "sell" => OrderSide::Sell,
                                     _ => continue,
                                 };
-                                if let Some(d) = aggregator.on_fill(
+                                if let Some(d) = aggregator.on_fill_with_target(
                                     order.order_id,
                                     side,
                                     filled,
                                     price,
                                     is_terminal,
+                                    Some(initial),
                                 ) {
                                     if processed.insert_if_new(FillKey::from_cloid_cumulative(
                                         order.client_order_id.clone(),
@@ -114,8 +115,7 @@ impl FillDetectionService {
         // Clone dependencies for the callback closure
         let bot_state = self.bot_state.clone();
         let hedge_tx = self.hedge_tx.clone();
-        let pacifica_trading = self.pacifica_trading.clone();
-        let pacifica_ws_trading = self.pacifica_ws_trading.clone();
+        let cancel_tx = self.cancel_tx.clone();
         let symbol = self.symbol.clone();
         let processed_fills = self.processed_fills.clone();
         let fill_aggregator = self.fill_aggregator.clone();
@@ -153,9 +153,8 @@ impl FillDetectionService {
                         let filled_amount_str = filled_amount.clone();
                         let avg_price_str = avg_price.clone();
                         let cloid = client_order_id.clone();
-                        let pac_trading_clone = pacifica_trading.clone();
-                        let pac_ws_trading_clone = pacifica_ws_trading.clone();
                         let symbol_clone = symbol.clone();
+                        let cancel_tx_clone = cancel_tx.clone();
                         let processed_fills_clone = processed_fills.clone();
                         let fill_aggregator_clone = fill_aggregator.clone();
                         let baseline_updater_clone = baseline_updater.clone();
@@ -236,35 +235,10 @@ impl FillDetectionService {
                                     "FAST".yellow().bold()
                                 );
 
-                                // Clone for async cancellation task
-                                let pac_trading_bg = pac_trading_clone.clone();
-                                let pac_ws_trading_bg = pac_ws_trading_clone.clone();
-                                let symbol_bg = symbol_clone.clone();
-
-                                // Spawn dual cancel in background (don't await)
-                                tokio::spawn(async move {
-                                    match dual_cancel(
-                                        &pac_trading_bg,
-                                        &pac_ws_trading_bg,
-                                        &symbol_bg
-                                    ).await {
-                                        Ok((rest_count, ws_count)) => {
-                                            info!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
-                                                tag_static("FILL_DETECTION", Color::Magenta),
-                                                "OK".green().bold(),
-                                                rest_count,
-                                                ws_count
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!("{} {} Background dual cancellation failed: {}",
-                                                tag_static("FILL_DETECTION", Color::Magenta),
-                                                "FAIL".red().bold(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                });
+                                let _ = cancel_tx_clone.try_send(CancelIntent::new(
+                                    symbol_clone.clone(),
+                                    CancelReason::PartialFill,
+                                ));
 
                                 // *** CRITICAL: UPDATE POSITION BASELINE ***
                                 // This prevents position-based detection from triggering duplicate hedge
@@ -380,7 +354,12 @@ impl FillDetectionService {
                                         // Error state, don't change anything
                                         debug!("[BOT] Cancellation received in Error state (ignoring)");
                                     }
-                                    BotStatus::Placing | BotStatus::Reconciling => {
+                                    BotStatus::Placing
+                                    | BotStatus::Reconciling
+                                    | BotStatus::PlacementUnknown
+                                    | BotStatus::CancelPending
+                                    | BotStatus::HedgeUnknown
+                                    | BotStatus::ShuttingDown => {
                                         debug!(
                                             "[BOT] Cancellation received in {:?} state (ignoring)",
                                             state.status
@@ -431,12 +410,14 @@ impl FillDetectionService {
                             }
                         };
 
-                        let decision = fill_aggregator.on_fill(
+                        let target_size: f64 = parse(&original_amount).unwrap_or(0.0);
+                        let decision = fill_aggregator.on_fill_with_target(
                             order_id,
                             order_side,
                             filled_size,
                             fill_price,
                             false, // not terminal - still partial
+                            Some(target_size),
                         );
 
                         if let Some(d) = decision {
@@ -454,9 +435,8 @@ impl FillDetectionService {
                             let hedge_tx = hedge_tx.clone();
                             let side_str = side.clone();
                             let cloid = client_order_id.clone();
-                            let pac_trading_clone = pacifica_trading.clone();
-                            let pac_ws_trading_clone = pacifica_ws_trading.clone();
                             let symbol_clone = symbol.clone();
+                            let cancel_tx_clone = cancel_tx.clone();
                             let processed_fills_clone = processed_fills.clone();
                             let baseline_updater_clone = baseline_updater.clone();
 
@@ -493,33 +473,10 @@ impl FillDetectionService {
                                         "OK".green().bold()
                                     );
 
-                                    let pac_trading_bg = pac_trading_clone.clone();
-                                    let pac_ws_trading_bg = pac_ws_trading_clone.clone();
-                                    let symbol_bg = symbol_clone.clone();
-
-                                    tokio::spawn(async move {
-                                        match dual_cancel(
-                                            &pac_trading_bg,
-                                            &pac_ws_trading_bg,
-                                            &symbol_bg
-                                        ).await {
-                                            Ok((rest_count, ws_count)) => {
-                                                info!("{} {} Background dual cancellation complete (REST: {}, WS: {})",
-                                                    tag_static("FILL_DETECTION", Color::Magenta),
-                                                    "OK".green().bold(),
-                                                    rest_count,
-                                                    ws_count
-                                                );
-                                            }
-                                            Err(e) => {
-                                                error!("{} {} Background dual cancellation failed: {}",
-                                                    tag_static("FILL_DETECTION", Color::Magenta),
-                                                    "FAIL".red().bold(),
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    });
+                                    let _ = cancel_tx_clone.try_send(CancelIntent::new(
+                                        symbol_clone.clone(),
+                                        CancelReason::PartialFill,
+                                    ));
 
                                     baseline_updater_clone.update_baseline(
                                         &symbol_clone,

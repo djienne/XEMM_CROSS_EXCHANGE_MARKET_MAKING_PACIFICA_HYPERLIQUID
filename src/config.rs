@@ -103,6 +103,46 @@ pub struct Config {
     #[serde(default = "default_max_consecutive_hedge_failures")]
     pub max_consecutive_hedge_failures: u32,
 
+    /// Minimum partial-fill hedge notional.
+    #[serde(default = "default_partial_hedge_min_notional_usd")]
+    pub partial_hedge_min_notional_usd: f64,
+
+    /// Minimum fraction of cumulative filled size that triggers a partial hedge.
+    #[serde(default = "default_partial_hedge_min_fraction")]
+    pub partial_hedge_min_fraction: f64,
+
+    /// Idle timeout before a partial fill is hedged.
+    #[serde(default = "default_partial_hedge_idle_timeout_ms")]
+    pub partial_hedge_idle_timeout_ms: u64,
+
+    /// Minimum base quantity for partial hedge emission.
+    #[serde(default = "default_partial_hedge_min_base")]
+    pub partial_hedge_min_base: f64,
+
+    /// Maximum number of fill accumulators kept in memory.
+    #[serde(default = "default_fill_aggregator_max_entries")]
+    pub fill_aggregator_max_entries: usize,
+
+    /// Initial hedge slippage tolerance in basis points.
+    #[serde(default = "default_hedge_slippage_bps_initial")]
+    pub hedge_slippage_bps_initial: f64,
+
+    /// Retry hedge slippage tolerance in basis points.
+    #[serde(default = "default_hedge_slippage_bps_retry")]
+    pub hedge_slippage_bps_retry: f64,
+
+    /// Emergency hedge slippage tolerance in basis points.
+    #[serde(default = "default_hedge_slippage_bps_emergency")]
+    pub hedge_slippage_bps_emergency: f64,
+
+    /// Base retry delay for hedge attempts.
+    #[serde(default = "default_hedge_retry_base_delay_ms")]
+    pub hedge_retry_base_delay_ms: u64,
+
+    /// Max retry delay for hedge attempts.
+    #[serde(default = "default_hedge_retry_max_delay_ms")]
+    pub hedge_retry_max_delay_ms: u64,
+
     /// Permit startup to continue if stale Pacifica order cancellation fails.
     #[serde(default = "default_allow_startup_with_cancel_failure")]
     pub allow_startup_with_cancel_failure: bool,
@@ -201,6 +241,46 @@ fn default_max_consecutive_hedge_failures() -> u32 {
     3
 }
 
+fn default_partial_hedge_min_notional_usd() -> f64 {
+    5.0
+}
+
+fn default_partial_hedge_min_fraction() -> f64 {
+    0.35
+}
+
+fn default_partial_hedge_idle_timeout_ms() -> u64 {
+    250
+}
+
+fn default_partial_hedge_min_base() -> f64 {
+    0.0
+}
+
+fn default_fill_aggregator_max_entries() -> usize {
+    10_000
+}
+
+fn default_hedge_slippage_bps_initial() -> f64 {
+    10.0
+}
+
+fn default_hedge_slippage_bps_retry() -> f64 {
+    25.0
+}
+
+fn default_hedge_slippage_bps_emergency() -> f64 {
+    50.0
+}
+
+fn default_hedge_retry_base_delay_ms() -> u64 {
+    250
+}
+
+fn default_hedge_retry_max_delay_ms() -> u64 {
+    1_500
+}
+
 fn default_allow_startup_with_cancel_failure() -> bool {
     false
 }
@@ -233,6 +313,16 @@ impl Default for Config {
             max_unhedged_usd: default_max_unhedged_usd(),
             max_unhedged_ms: default_max_unhedged_ms(),
             max_consecutive_hedge_failures: default_max_consecutive_hedge_failures(),
+            partial_hedge_min_notional_usd: default_partial_hedge_min_notional_usd(),
+            partial_hedge_min_fraction: default_partial_hedge_min_fraction(),
+            partial_hedge_idle_timeout_ms: default_partial_hedge_idle_timeout_ms(),
+            partial_hedge_min_base: default_partial_hedge_min_base(),
+            fill_aggregator_max_entries: default_fill_aggregator_max_entries(),
+            hedge_slippage_bps_initial: default_hedge_slippage_bps_initial(),
+            hedge_slippage_bps_retry: default_hedge_slippage_bps_retry(),
+            hedge_slippage_bps_emergency: default_hedge_slippage_bps_emergency(),
+            hedge_retry_base_delay_ms: default_hedge_retry_base_delay_ms(),
+            hedge_retry_max_delay_ms: default_hedge_retry_max_delay_ms(),
             allow_startup_with_cancel_failure: default_allow_startup_with_cancel_failure(),
         }
     }
@@ -346,6 +436,26 @@ impl Config {
         anyhow::ensure!(
             self.max_consecutive_hedge_failures > 0,
             "Max consecutive hedge failures must be positive"
+        );
+        anyhow::ensure!(
+            self.partial_hedge_min_notional_usd >= 0.0
+                && self.partial_hedge_min_fraction >= 0.0
+                && self.partial_hedge_min_base >= 0.0,
+            "Partial hedge thresholds cannot be negative"
+        );
+        anyhow::ensure!(
+            self.partial_hedge_idle_timeout_ms > 0 && self.fill_aggregator_max_entries > 0,
+            "Partial hedge idle timeout and aggregator max entries must be positive"
+        );
+        anyhow::ensure!(
+            self.hedge_slippage_bps_initial > 0.0
+                && self.hedge_slippage_bps_retry > 0.0
+                && self.hedge_slippage_bps_emergency > 0.0,
+            "Hedge slippage bps values must be positive"
+        );
+        anyhow::ensure!(
+            self.hedge_retry_base_delay_ms > 0 && self.hedge_retry_max_delay_ms > 0,
+            "Hedge retry delays must be positive"
         );
 
         Ok(())

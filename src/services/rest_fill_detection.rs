@@ -8,21 +8,21 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::bot::{BotState, BotStatus};
-use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::connector::pacifica::PacificaTrading;
+use crate::services::cancel_manager::{CancelIntent, CancelReason};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::{enqueue_hedge_intent, HedgeEvent};
+use crate::services::{enqueue_hedge_intent, HedgeIntent};
 use crate::strategy::OrderSide;
-use crate::util::cancel::dual_cancel;
 use crate::util::log::{tag_static, Color};
 use crate::util::rate_limit::is_rate_limit_error;
 
 /// REST API fill detection service (backup/fallback method).
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeIntent>,
+    pub cancel_tx: mpsc::Sender<CancelIntent>,
     pub pacifica_trading: Arc<PacificaTrading>,
-    pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
     pub fill_aggregator: Arc<FillAggregator>,
@@ -123,12 +123,13 @@ impl RestFillDetectionService {
                         }
                     };
 
-                    let decision = self.fill_aggregator.on_fill(
+                    let decision = self.fill_aggregator.on_fill_with_target(
                         order.order_id,
                         order_side,
                         filled_amount,
                         price,
                         is_full_fill,
+                        Some(initial_amount),
                     );
 
                     let Some(decision) = decision else {
@@ -178,8 +179,7 @@ impl RestFillDetectionService {
 
                     let bot_state = self.bot_state.clone();
                     let hedge_tx = self.hedge_tx.clone();
-                    let pac_trading = self.pacifica_trading.clone();
-                    let pac_ws_trading = self.pacifica_ws_trading.clone();
+                    let cancel_tx = self.cancel_tx.clone();
                     let symbol = self.symbol.clone();
 
                     tokio::spawn(async move {
@@ -194,29 +194,8 @@ impl RestFillDetectionService {
                             "*".green().bold()
                         );
 
-                        let pac_trading_bg = pac_trading.clone();
-                        let pac_ws_trading_bg = pac_ws_trading.clone();
-                        let symbol_bg = symbol.clone();
-                        tokio::spawn(async move {
-                            match dual_cancel(&pac_trading_bg, &pac_ws_trading_bg, &symbol_bg).await
-                            {
-                                Ok((rest_count, ws_count)) => {
-                                    info!(
-                                        "{} Dual cancellation complete (REST: {}, WS: {})",
-                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                        rest_count,
-                                        ws_count
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "{} Dual cancellation failed: {}",
-                                        tag_static("REST_FILL_DETECTION", Color::BrightCyan),
-                                        e
-                                    );
-                                }
-                            }
-                        });
+                        let _ = cancel_tx
+                            .try_send(CancelIntent::new(symbol.clone(), CancelReason::PartialFill));
 
                         info!(
                             "{} {}, triggering hedge (REST)",

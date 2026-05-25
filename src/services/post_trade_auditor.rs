@@ -98,9 +98,8 @@ impl PostTradeAuditorService {
         if self.verify_neutral().await {
             {
                 let mut state = self.bot_state.write();
-                state.mark_complete();
+                state.mark_cycle_complete_and_idle();
             }
-            let _ = self.shutdown_tx.send(()).await;
         } else {
             {
                 let mut state = self.bot_state.write();

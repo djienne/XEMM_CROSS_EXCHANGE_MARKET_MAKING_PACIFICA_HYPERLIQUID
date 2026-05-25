@@ -19,8 +19,12 @@ pub enum RunState {
     Filled = 4,
     Hedging = 5,
     Reconciling = 6,
-    Complete = 7,
-    Error = 8,
+    PlacementUnknown = 7,
+    CancelPending = 8,
+    HedgeUnknown = 9,
+    ShuttingDown = 10,
+    Complete = 11,
+    Error = 12,
 }
 
 impl RunState {
@@ -39,8 +43,12 @@ impl RunState {
             4 => Self::Filled,
             5 => Self::Hedging,
             6 => Self::Reconciling,
-            7 => Self::Complete,
-            8 => Self::Error,
+            7 => Self::PlacementUnknown,
+            8 => Self::CancelPending,
+            9 => Self::HedgeUnknown,
+            10 => Self::ShuttingDown,
+            11 => Self::Complete,
+            12 => Self::Error,
             _ => Self::Error,
         }
     }
@@ -95,6 +103,14 @@ pub enum BotStatus {
     Hedging,
     /// Exposure/open-order state is being reconciled
     Reconciling,
+    /// Placement may have reached the exchange but the response was lost.
+    PlacementUnknown,
+    /// Cancellation is pending verification.
+    CancelPending,
+    /// Hedge submit/fill state is uncertain and requires reconciliation.
+    HedgeUnknown,
+    /// Shutdown has stopped new placement and is draining risk.
+    ShuttingDown,
     /// Full cycle complete (order filled + hedged)
     Complete,
     /// Error occurred
@@ -112,6 +128,10 @@ impl BotStatus {
             BotStatus::Filled => RunState::Filled,
             BotStatus::Hedging => RunState::Hedging,
             BotStatus::Reconciling => RunState::Reconciling,
+            BotStatus::PlacementUnknown => RunState::PlacementUnknown,
+            BotStatus::CancelPending => RunState::CancelPending,
+            BotStatus::HedgeUnknown => RunState::HedgeUnknown,
+            BotStatus::ShuttingDown => RunState::ShuttingDown,
             BotStatus::Complete => RunState::Complete,
             BotStatus::Error(_) => RunState::Error,
         }
@@ -153,6 +173,8 @@ pub struct BotState {
     pub run_state: Arc<AtomicU8>,
     /// Last time an order was cancelled (for grace period enforcement)
     pub last_cancellation_time: Option<Instant>,
+    /// Number of successful fill+hedge cycles completed by this process.
+    pub cycle_count: u64,
 }
 
 impl BotState {
@@ -170,6 +192,7 @@ impl BotState {
             status: BotStatus::Idle,
             run_state,
             last_cancellation_time: None,
+            cycle_count: 0,
         }
     }
 
@@ -239,11 +262,41 @@ impl BotState {
         self.store_status();
     }
 
+    pub fn mark_placement_unknown(&mut self) {
+        self.status = BotStatus::PlacementUnknown;
+        self.store_status();
+    }
+
+    pub fn mark_cancel_pending(&mut self) {
+        self.status = BotStatus::CancelPending;
+        self.store_status();
+    }
+
+    pub fn mark_hedge_unknown(&mut self) {
+        self.status = BotStatus::HedgeUnknown;
+        self.store_status();
+    }
+
+    pub fn mark_shutting_down(&mut self) {
+        self.status = BotStatus::ShuttingDown;
+        self.store_status();
+    }
+
     /// Mark as complete
     pub fn mark_complete(&mut self) {
         self.status = BotStatus::Complete;
         self.store_status();
         self.active_order = None;
+    }
+
+    /// Record a successful cycle and return to idle without terminating the
+    /// process. This is the normal post-audit path for the persistent bot.
+    pub fn mark_cycle_complete_and_idle(&mut self) {
+        self.active_order = None;
+        self.position = 0.0;
+        self.cycle_count = self.cycle_count.saturating_add(1);
+        self.status = BotStatus::Idle;
+        self.store_status();
     }
 
     /// Set error status

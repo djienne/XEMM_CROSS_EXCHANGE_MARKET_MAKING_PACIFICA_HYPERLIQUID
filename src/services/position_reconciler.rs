@@ -11,13 +11,13 @@ use crate::bot::{BotState, RunState};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
-use crate::services::{enqueue_hedge_intent, HedgeEvent};
-use crate::strategy::OrderSide;
+use crate::market_rules::{fallback_rules, is_dust_or_below_min};
+use crate::services::{enqueue_hedge_intent, HedgeIntent, HedgeSource, HedgeVenueSide};
 
 /// Slow safety loop that reconciles net exposure across exchanges.
 pub struct PositionReconcilerService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeIntent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub config: Config,
@@ -85,7 +85,7 @@ impl PositionReconcilerService {
                                 info!(
                                     "[RECONCILER] Net exposure is neutral and no Pacifica orders remain; marking cycle complete"
                                 );
-                                state.mark_complete();
+                                state.mark_cycle_complete_and_idle();
                             }
                         }
                         Ok(_) => {
@@ -138,21 +138,35 @@ impl PositionReconcilerService {
                 continue;
             }
 
-            let side = if net > 0.0 {
-                OrderSide::Buy
+            let mid_price = self.estimate_mid_price().await.unwrap_or(0.0);
+            if is_dust_or_below_min(
+                net,
+                mid_price,
+                fallback_rules(&self.config.symbol),
+                self.config.neutral_dust_base,
+            ) {
+                debug!(
+                    "[RECONCILER] Net exposure {} is below exchange min/dust after rounding",
+                    net
+                );
+                continue;
+            }
+
+            let hedge_side = if net > 0.0 {
+                HedgeVenueSide::Sell
             } else {
-                OrderSide::Sell
+                HedgeVenueSide::Buy
             };
             let hedge_seq = seq.fetch_add(1, Ordering::AcqRel);
-            let intent = HedgeEvent {
-                source_order_id: 0,
+            let intent = HedgeIntent::from_venue_side(
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
                 hedge_seq,
-                side,
-                size: net.abs(),
-                avg_price: 0.0,
-                detected_at: std::time::Instant::now(),
-                terminal: false,
-            };
+                HedgeSource::Reconciler,
+                hedge_side,
+                net.abs(),
+                0.0,
+                false,
+            );
 
             warn!(
                 "[RECONCILER] Net exposure {} exceeds dust {}; queued residual hedge {}",
@@ -192,6 +206,10 @@ impl PositionReconcilerService {
     }
 
     async fn estimate_usd_exposure(&self, abs_base: f64) -> Option<f64> {
+        self.estimate_mid_price().await.map(|mid| abs_base * mid)
+    }
+
+    async fn estimate_mid_price(&self) -> Option<f64> {
         let Ok(Some((bid, ask))) = self
             .hyperliquid_trading
             .get_l2_snapshot(&self.config.symbol)
@@ -202,7 +220,7 @@ impl PositionReconcilerService {
         if bid <= 0.0 || ask <= 0.0 {
             return None;
         }
-        Some(abs_base * ((bid + ask) / 2.0))
+        Some((bid + ask) / 2.0)
     }
 
     async fn pacifica_position(&self) -> anyhow::Result<f64> {

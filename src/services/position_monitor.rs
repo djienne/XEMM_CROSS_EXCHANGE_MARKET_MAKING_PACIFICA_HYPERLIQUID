@@ -5,14 +5,15 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
-use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::connector::pacifica::PacificaTrading;
+use crate::services::cancel_manager::{CancelIntent, CancelReason};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::{enqueue_hedge_intent, HedgeEvent};
+use crate::services::{enqueue_hedge_intent, HedgeIntent};
 use crate::strategy::OrderSide;
 use crate::util::log::{tag_static, Color};
 
@@ -23,9 +24,9 @@ use crate::util::log::{tag_static, Color};
 /// a fill definitely occurred regardless of WebSocket/REST/order status detection.
 pub struct PositionMonitorService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeIntent>,
+    pub cancel_tx: mpsc::Sender<CancelIntent>,
     pub pacifica_trading: Arc<PacificaTrading>,
-    pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
     pub fill_aggregator: Arc<FillAggregator>,
@@ -223,15 +224,15 @@ impl PositionMonitorService {
                                 }
                             }
                         } else {
-                            HedgeEvent {
-                                source_order_id: 0,
-                                hedge_seq: 0,
-                                side: order_side,
-                                size: fill_size,
-                                avg_price: estimated_price,
-                                detected_at: std::time::Instant::now(),
-                                terminal: true,
-                            }
+                            HedgeIntent::from_maker_fill(
+                                0,
+                                0,
+                                order_side,
+                                fill_size,
+                                estimated_price,
+                                std::time::Instant::now(),
+                                true,
+                            )
                         };
 
                         let dedup_key =
@@ -248,7 +249,7 @@ impl PositionMonitorService {
                             // Update state to Filled
                             {
                                 let mut state = self.bot_state.write();
-                                state.mark_filled(hedge_event.size, hedge_event.side);
+                                state.mark_filled(hedge_event.size, hedge_event.audit_maker_side());
                             }
 
                             info!(
@@ -271,60 +272,15 @@ impl PositionMonitorService {
                                 );
                             }
 
-                            // Dual cancellation
                             info!(
-                                "{} {} Dual cancellation (REST + WebSocket)...",
+                                "{} {} Queueing cancellation of any remaining Pacifica orders...",
                                 tag_static("POSITION_MONITOR", Color::BrightCyan),
                                 "FAST".yellow().bold()
                             );
-
-                            let rest_result = self
-                                .pacifica_trading
-                                .cancel_all_orders(false, Some(&self.symbol), false)
-                                .await;
-
-                            match rest_result {
-                                Ok(count) => {
-                                    info!(
-                                        "{} {} REST API cancelled {} order(s)",
-                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "OK".green().bold(),
-                                        count
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "{} {} REST API cancel failed: {}",
-                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "WARN".yellow().bold(),
-                                        e
-                                    );
-                                }
-                            }
-
-                            let ws_result = self
-                                .pacifica_ws_trading
-                                .cancel_all_orders_ws(false, Some(&self.symbol), false)
-                                .await;
-
-                            match ws_result {
-                                Ok(count) => {
-                                    info!(
-                                        "{} {} WebSocket cancelled {} order(s)",
-                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "OK".green().bold(),
-                                        count
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "{} {} WebSocket cancel failed: {}",
-                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                        "WARN".yellow().bold(),
-                                        e
-                                    );
-                                }
-                            }
+                            let _ = self.cancel_tx.try_send(CancelIntent::new(
+                                self.symbol.clone(),
+                                CancelReason::PartialFill,
+                            ));
                         } else {
                             debug!(
                                 "[POSITION_MONITOR] Fill already processed by another detection method"

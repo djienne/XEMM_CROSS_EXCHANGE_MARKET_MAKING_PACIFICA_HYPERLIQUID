@@ -14,6 +14,19 @@ pub enum EndpointGroup {
     Info,
     Trades,
     Positions,
+    PacificaPlace,
+    PacificaCancel,
+    PacificaOpenOrders,
+    PacificaPositions,
+    HyperliquidHedge,
+    HyperliquidInfo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitPriority {
+    Alpha,
+    Risk,
+    Emergency,
 }
 
 /// Thread-safe book of `RateLimitTracker`s keyed by endpoint group. Shared
@@ -45,6 +58,17 @@ impl RateLimitBook {
             .get(&group)
             .map(|t| t.should_skip())
             .unwrap_or(false)
+    }
+
+    pub fn should_skip_with_priority(
+        &self,
+        group: EndpointGroup,
+        priority: RateLimitPriority,
+    ) -> bool {
+        match priority {
+            RateLimitPriority::Alpha => self.should_skip(group),
+            RateLimitPriority::Risk | RateLimitPriority::Emergency => false,
+        }
     }
 
     /// Backoff in seconds for the current failure streak.

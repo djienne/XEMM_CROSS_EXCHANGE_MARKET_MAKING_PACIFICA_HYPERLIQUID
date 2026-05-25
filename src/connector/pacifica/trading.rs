@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::market_rules::{pacifica_maker_price_for_is_buy, pacifica_size_floor};
+
 const MAINNET_REST_URL: &str = "https://api.pacifica.fi";
 
 /// Credentials for Pacifica trading
@@ -382,34 +384,14 @@ impl PacificaTrading {
         }
     }
 
-    /// Round price to tick size
-    fn round_to_tick_size(&self, price: f64, tick_size: String) -> Result<f64> {
-        let tick: f64 = tick_size.parse()?;
-        let rounded = (price / tick).round() * tick;
-
-        let decimal_places = if tick_size.contains('.') {
-            tick_size.split('.').nth(1).unwrap().len()
-        } else {
-            0
-        };
-
-        let factor = 10_f64.powi(decimal_places as i32);
-        Ok((rounded * factor).round() / factor)
+    /// Round price to tick size using side-aware passive rounding.
+    fn round_to_tick_size(&self, side: OrderSide, price: f64, tick_size: String) -> Result<f64> {
+        pacifica_maker_price_for_is_buy(matches!(side, OrderSide::Buy), price, &tick_size)
     }
 
     /// Round size to lot size
     fn round_to_lot_size(&self, size: f64, lot_size: String) -> Result<f64> {
-        let lot: f64 = lot_size.parse()?;
-        let rounded = (size / lot).floor() * lot;
-
-        let decimal_places = if lot_size.contains('.') {
-            lot_size.split('.').nth(1).unwrap().len()
-        } else {
-            0
-        };
-
-        let factor = 10_f64.powi(decimal_places as i32);
-        Ok((rounded * factor).round() / factor)
+        pacifica_size_floor(size, &lot_size)
     }
 
     /// Sign a message using Ed25519
@@ -534,7 +516,7 @@ impl PacificaTrading {
         };
 
         // Round to tick and lot size
-        let rounded_price = self.round_to_tick_size(order_price, tick_size.clone())?;
+        let rounded_price = self.round_to_tick_size(side, order_price, tick_size.clone())?;
         let rounded_size = self.round_to_lot_size(size, lot_size.clone())?;
 
         info!(

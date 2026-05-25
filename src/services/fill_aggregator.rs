@@ -22,6 +22,8 @@ pub struct OrderFillState {
     pub last_updated: Instant,
     pub created_at: Instant,
     pub next_hedge_seq: u64,
+    pub last_unknown_hedge: Option<Instant>,
+    pub target_size: f64,
 }
 
 impl OrderFillState {
@@ -45,14 +47,61 @@ pub struct HedgeDecision {
     pub terminal: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HedgeSettlementStatus {
+    Filled,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HedgeSettlement {
+    pub order_id: u64,
+    pub target_qty: f64,
+    pub confirmed_qty: f64,
+    pub status: HedgeSettlementStatus,
+}
+
+impl HedgeSettlement {
+    pub fn filled(order_id: u64, target_qty: f64, confirmed_qty: f64) -> Self {
+        Self {
+            order_id,
+            target_qty,
+            confirmed_qty,
+            status: HedgeSettlementStatus::Filled,
+        }
+    }
+
+    pub fn rejected(order_id: u64, target_qty: f64, confirmed_qty: f64) -> Self {
+        Self {
+            order_id,
+            target_qty,
+            confirmed_qty,
+            status: HedgeSettlementStatus::Rejected,
+        }
+    }
+
+    pub fn unknown(order_id: u64, target_qty: f64, confirmed_qty: f64) -> Self {
+        Self {
+            order_id,
+            target_qty,
+            confirmed_qty,
+            status: HedgeSettlementStatus::Unknown,
+        }
+    }
+}
+
 /// Aggregates fill observations from multiple detectors into residual hedge
 /// decisions. Unlike the previous one-shot order dedup, this allows a later
 /// residual fill on the same maker order to generate another hedge.
 pub struct FillAggregator {
     inner: Mutex<HashMap<u64, OrderFillState>>,
     pub emergency_notional_usd: f64,
+    pub min_notional_usd: f64,
+    pub min_fraction: f64,
     pub idle_timeout: Duration,
     pub min_hedge_qty: f64,
+    pub max_entries: usize,
 }
 
 impl FillAggregator {
@@ -61,7 +110,29 @@ impl FillAggregator {
             inner: Mutex::new(HashMap::new()),
             emergency_notional_usd,
             idle_timeout: Duration::from_secs(2),
+            min_notional_usd: emergency_notional_usd,
+            min_fraction: 0.0,
             min_hedge_qty: 0.0,
+            max_entries: 10_000,
+        })
+    }
+
+    pub fn with_thresholds(
+        emergency_notional_usd: f64,
+        min_notional_usd: f64,
+        min_fraction: f64,
+        idle_timeout: Duration,
+        min_hedge_qty: f64,
+        max_entries: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(HashMap::new()),
+            emergency_notional_usd,
+            min_notional_usd,
+            min_fraction,
+            idle_timeout,
+            min_hedge_qty,
+            max_entries: max_entries.max(1),
         })
     }
 
@@ -78,8 +149,36 @@ impl FillAggregator {
         avg_price: f64,
         is_terminal: bool,
     ) -> Option<HedgeDecision> {
+        self.on_fill_with_target(
+            order_id,
+            side,
+            absolute_filled_size,
+            avg_price,
+            is_terminal,
+            None,
+        )
+    }
+
+    pub fn on_fill_with_target(
+        &self,
+        order_id: u64,
+        side: OrderSide,
+        absolute_filled_size: f64,
+        avg_price: f64,
+        is_terminal: bool,
+        target_size: Option<f64>,
+    ) -> Option<HedgeDecision> {
         let now = Instant::now();
         let mut g = self.inner.lock();
+        if !g.contains_key(&order_id) && g.len() >= self.max_entries {
+            if let Some(oldest) = g
+                .iter()
+                .min_by_key(|(_, state)| state.created_at)
+                .map(|(id, _)| *id)
+            {
+                g.remove(&oldest);
+            }
+        }
         let entry = g.entry(order_id).or_insert_with(|| OrderFillState {
             order_id,
             side,
@@ -91,8 +190,15 @@ impl FillAggregator {
             last_updated: now,
             created_at: now,
             next_hedge_seq: 0,
+            last_unknown_hedge: None,
+            target_size: target_size.unwrap_or(0.0).max(0.0),
         });
 
+        if let Some(target_size) = target_size {
+            if target_size > entry.target_size {
+                entry.target_size = target_size;
+            }
+        }
         if absolute_filled_size > entry.cumulative_filled {
             entry.cumulative_filled = absolute_filled_size;
             entry.avg_price = avg_price;
@@ -102,9 +208,16 @@ impl FillAggregator {
 
         let residual = entry.residual();
         let notional = residual * entry.avg_price;
+        let fraction = if entry.target_size > 0.0 {
+            residual / entry.target_size
+        } else {
+            0.0
+        };
         let should_emit = residual > 0.0
             && (entry.terminal
                 || (self.min_hedge_qty > 0.0 && residual >= self.min_hedge_qty)
+                || (self.min_notional_usd > 0.0 && notional >= self.min_notional_usd)
+                || (self.min_fraction > 0.0 && fraction >= self.min_fraction)
                 || notional >= self.emergency_notional_usd);
 
         if should_emit {
@@ -131,15 +244,28 @@ impl FillAggregator {
         }
     }
 
-    /// Mark a hedge intent as confirmed. Partial Hyperliquid fills leave the
-    /// unfilled remainder pending for the hedge executor/reconciler rather than
-    /// being re-emitted by fill observation dedup.
+    /// Mark a hedge intent as confirmed.
+    ///
+    /// This compatibility method is kept for older tests and call sites. New
+    /// code should call `settle_hedge`, which releases the full reserved target
+    /// and confirms only the quantity that actually filled.
     pub fn mark_hedge_confirmed(&self, order_id: u64, filled_qty: f64) {
+        self.settle_hedge(HedgeSettlement::filled(order_id, filled_qty, filled_qty));
+    }
+
+    pub fn settle_hedge(&self, settlement: HedgeSettlement) {
         let mut g = self.inner.lock();
-        if let Some(entry) = g.get_mut(&order_id) {
-            let filled = filled_qty.max(0.0).min(entry.cumulative_hedge_pending);
-            entry.cumulative_hedge_pending -= filled;
+        if let Some(entry) = g.get_mut(&settlement.order_id) {
+            let reserved = settlement
+                .target_qty
+                .max(0.0)
+                .min(entry.cumulative_hedge_pending);
+            let filled = settlement.confirmed_qty.max(0.0).min(reserved);
+            entry.cumulative_hedge_pending -= reserved;
             entry.cumulative_hedged_confirmed += filled;
+            if settlement.status == HedgeSettlementStatus::Unknown {
+                entry.last_unknown_hedge = Some(Instant::now());
+            }
         }
     }
 
@@ -206,8 +332,11 @@ mod tests {
         let agg = Arc::new(FillAggregator {
             inner: Mutex::new(HashMap::new()),
             emergency_notional_usd: 1_000_000.0,
+            min_notional_usd: 1_000_000.0,
+            min_fraction: 1.0,
             idle_timeout: Duration::from_millis(10),
             min_hedge_qty: 0.0,
+            max_entries: 10_000,
         });
         assert!(agg.on_fill(1, OrderSide::Buy, 0.4, 100.0, false).is_none());
         std::thread::sleep(Duration::from_millis(20));
@@ -253,6 +382,34 @@ mod tests {
         let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
         agg.mark_hedge_confirmed(1, d.size);
         assert!(agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).is_none());
+    }
+
+    #[test]
+    fn configured_partial_threshold_uses_original_target_size() {
+        let agg = FillAggregator::with_thresholds(
+            1_000_000.0,
+            1_000_000.0,
+            0.35,
+            Duration::from_secs(60),
+            0.0,
+            100,
+        );
+        assert!(agg
+            .on_fill_with_target(1, OrderSide::Buy, 0.1, 100.0, false, Some(1.0))
+            .is_none());
+        let d = agg
+            .on_fill_with_target(1, OrderSide::Buy, 0.4, 100.0, false, Some(1.0))
+            .unwrap();
+        assert!((d.size - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn settlement_releases_full_reserved_target_but_confirms_only_filled() {
+        let agg = FillAggregator::new(1000.0);
+        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        agg.settle_hedge(HedgeSettlement::rejected(1, d.size, 0.4));
+        let residual = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        assert!((residual.size - 0.6).abs() < 1e-9);
     }
 
     #[test]

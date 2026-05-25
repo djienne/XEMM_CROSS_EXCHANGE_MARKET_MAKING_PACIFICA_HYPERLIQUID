@@ -14,7 +14,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::trading::canonicalize_json;
+use crate::connector::pacifica::trading::{OrderData, OrderSide};
 use crate::connector::pacifica::PacificaCredentials;
+use crate::market_rules::{pacifica_maker_price_for_is_buy, pacifica_size_floor};
 
 /// Maximum time to wait for a request/response round trip before giving up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -73,6 +75,101 @@ impl PacificaWsTrading {
         self.connected.load(Ordering::Acquire)
     }
 
+    pub async fn place_limit_order_ws(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        size: f64,
+        price: f64,
+        tick_size: &str,
+        lot_size: &str,
+        client_order_id: String,
+    ) -> Result<OrderData> {
+        if !self.is_connected() {
+            anyhow::bail!("Pacifica WS not connected");
+        }
+
+        let rounded_price =
+            pacifica_maker_price_for_is_buy(matches!(side, OrderSide::Buy), price, tick_size)?;
+        let rounded_size = pacifica_size_floor(size, lot_size)?;
+        if rounded_size <= 0.0 {
+            anyhow::bail!("rounded Pacifica order size is zero");
+        }
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let expiry_window: i64 = 5000;
+        let header = json!({
+            "type": "create_order",
+            "timestamp": timestamp,
+            "expiry_window": expiry_window,
+        });
+        let payload = json!({
+            "symbol": symbol,
+            "price": rounded_price.to_string(),
+            "amount": rounded_size.to_string(),
+            "side": side.as_str(),
+            "tif": "ALO",
+            "reduce_only": false,
+            "client_order_id": client_order_id.clone(),
+        });
+        let signature = self.sign_message(header, payload.clone())?;
+
+        let request_json = json!({
+            "id": Uuid::new_v4().to_string(),
+            "params": {
+                "create_order": {
+                    "account": self.credentials.account,
+                    "agent_wallet": self.credentials.agent_wallet,
+                    "signature": signature,
+                    "timestamp": timestamp,
+                    "expiry_window": expiry_window,
+                    "symbol": symbol,
+                    "price": rounded_price.to_string(),
+                    "amount": rounded_size.to_string(),
+                    "side": side.as_str(),
+                    "tif": "ALO",
+                    "reduce_only": false,
+                    "client_order_id": client_order_id.clone(),
+                }
+            }
+        });
+
+        let response = self.send_request_and_wait(request_json).await?;
+        let code = response.get("code").and_then(|v| v.as_u64()).unwrap_or(200);
+        if code != 200 {
+            let err = response
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown Pacifica WS placement error");
+            anyhow::bail!("Pacifica WS place_limit_order failed: {}", err);
+        }
+
+        let data = response
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        let order_id = data
+            .get("order_id")
+            .or_else(|| data.get("i"))
+            .and_then(|v| v.as_u64());
+        let returned_cloid = data
+            .get("client_order_id")
+            .or_else(|| data.get("I"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or(client_order_id);
+
+        Ok(OrderData {
+            order_id,
+            i: order_id,
+            client_order_id: Some(returned_cloid),
+            symbol: Some(symbol.to_string()),
+            requested_size: Some(size),
+            submitted_size: Some(rounded_size),
+            submitted_price: Some(rounded_price),
+        })
+    }
+
     /// Cancel all orders via WebSocket. Returns the number of orders cancelled.
     ///
     /// Uses the long-lived connection established by `new()`. If the socket is
@@ -91,7 +188,6 @@ impl PacificaWsTrading {
             anyhow::bail!("Pacifica WS not connected");
         }
 
-        let request_id = Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().timestamp_millis();
         let expiry_window: i64 = 5000;
 
@@ -124,15 +220,44 @@ impl PacificaWsTrading {
         }
 
         let request_json = json!({
-            "id": request_id,
+            "id": Uuid::new_v4().to_string(),
             "params": {
                 "cancel_all_orders": Value::Object(params_inner),
             },
         });
+
+        let value = self.send_request_and_wait(request_json).await?;
+        let code = value.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
+        if code == 200 {
+            let cancelled = value
+                .get("data")
+                .and_then(|d| d.get("cancelled_count"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            info!("[PACIFICA_WS] Cancelled {} order(s)", cancelled);
+            Ok(cancelled)
+        } else {
+            let err = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("code={}", code));
+            anyhow::bail!("Pacifica WS cancel_all failed: {}", err);
+        }
+    }
+
+    async fn send_request_and_wait(&self, mut request_json: Value) -> Result<Value> {
+        if !self.is_connected() {
+            anyhow::bail!("Pacifica WS not connected");
+        }
+        let request_id = request_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        request_json["id"] = json!(request_id);
         let request_text = serde_json::to_string(&request_json)?;
 
-        // Register pending oneshot before sending to avoid a race where the
-        // response arrives before we insert.
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(request_id.clone(), tx);
 
@@ -142,35 +267,14 @@ impl PacificaWsTrading {
         }
 
         match timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(value)) => {
-                let code = value.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
-                if code == 200 {
-                    let cancelled = value
-                        .get("data")
-                        .and_then(|d| d.get("cancelled_count"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    info!("[PACIFICA_WS] Cancelled {} order(s)", cancelled);
-                    Ok(cancelled)
-                } else {
-                    let err = value
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("code={}", code));
-                    anyhow::bail!("Pacifica WS cancel_all failed: {}", err);
-                }
-            }
+            Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => {
                 self.pending.lock().remove(&request_id);
                 anyhow::bail!("Pacifica WS response channel dropped")
             }
             Err(_) => {
                 self.pending.lock().remove(&request_id);
-                anyhow::bail!(
-                    "Pacifica WS cancel_all timed out after {:?}",
-                    REQUEST_TIMEOUT
-                )
+                anyhow::bail!("Pacifica WS request timed out after {:?}", REQUEST_TIMEOUT)
             }
         }
     }

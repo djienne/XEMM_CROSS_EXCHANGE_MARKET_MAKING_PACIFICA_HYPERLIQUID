@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use super::types::*;
+use crate::market_rules::hyperliquid_size_floor;
 
 const MAINNET_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const MAINNET_EXCHANGE_URL: &str = "https://api.hyperliquid.xyz/exchange";
@@ -281,9 +282,7 @@ impl HyperliquidTrading {
 
     /// Round size to proper lot size (szDecimals)
     fn round_size(size: f64, sz_decimals: i32) -> String {
-        let rounded = format!("{:.prec$}", size, prec = sz_decimals.max(0) as usize)
-            .parse::<f64>()
-            .unwrap();
+        let rounded = hyperliquid_size_floor(size, sz_decimals);
 
         rounded.to_string()
     }
