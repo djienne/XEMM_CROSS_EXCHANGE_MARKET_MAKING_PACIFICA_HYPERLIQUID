@@ -232,6 +232,13 @@ impl BotState {
         self.last_cancellation_time = Some(Instant::now());
     }
 
+    /// Clear a locally reserved order that definitely never reached the exchange.
+    pub fn clear_prospective_order(&mut self) {
+        self.active_order = None;
+        self.status = BotStatus::Idle;
+        self.store_status();
+    }
+
     /// Mark active order cancellation in progress.
     pub fn mark_cancelling(&mut self) {
         self.status = BotStatus::Cancelling;

@@ -14,7 +14,7 @@ use crate::connector::pacifica::PacificaTrading;
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::order_monitor::{update_order_snapshot, SharedOrderSnapshot};
 use crate::services::trade_gate::{GateReason, TradeGate};
-use crate::services::{enqueue_hedge_intent, HedgeIntent};
+use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use crate::util::price::SharedQuote;
 
 pub struct SafetyMonitorService {
@@ -185,19 +185,39 @@ impl SafetyMonitorService {
                 {
                     let filled = parse(&fill.amount).unwrap_or(0.0);
                     let price = parse(&fill.entry_price).unwrap_or(active.price);
-                    let intent: Option<HedgeIntent> = self
-                        .fill_aggregator
-                        .on_fill(fill.order_id, active.side, filled, price, true)
-                        .map(Into::into);
-                    if let Some(intent) = intent {
+                    if self.fill_aggregator.observe_fill(
+                        fill.order_id,
+                        active.side,
+                        filled,
+                        price,
+                        true,
+                    ) {
+                        let Some(reservation) =
+                            self.fill_aggregator.try_reserve_hedge(fill.order_id)
+                        else {
+                            self.trade_gate.allow(GateReason::PlacementUnknown);
+                            return;
+                        };
+                        let intent: HedgeIntent = reservation.into();
                         {
                             let mut state = self.bot_state.write();
                             state.mark_filled(intent.size, active.side);
                         }
-                        if let Err(e) =
-                            enqueue_hedge_intent(&self.hedge_tx, &self.bot_state, intent).await
-                        {
-                            warn!("[SAFETY] Failed to enqueue recovered placement fill: {}", e);
+                        match enqueue_hedge_intent(&self.hedge_tx, &self.bot_state, intent).await {
+                            Ok(HedgeEnqueueResult::Queued) => {
+                                self.fill_aggregator.commit_queued(reservation);
+                            }
+                            Ok(HedgeEnqueueResult::PersistedButNotQueued { reason }) => {
+                                self.fill_aggregator.release_reservation(reservation);
+                                warn!(
+                                    "[SAFETY] Recovered placement fill persisted but not queued: {}",
+                                    reason
+                                );
+                            }
+                            Err(e) => {
+                                self.fill_aggregator.release_reservation(reservation);
+                                warn!("[SAFETY] Failed to enqueue recovered placement fill: {}", e);
+                            }
                         }
                     }
                     self.trade_gate.allow(GateReason::PlacementUnknown);

@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::bot::{BotState, BotStatus, RunState};
 use crate::config::Config;
-use crate::services::cancel_manager::{CancelIntent, CancelReason};
+use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::price::{now_ns, prices_valid, SharedQuote};
 
@@ -69,6 +69,24 @@ impl AtomicOrderSnapshot {
     }
 
     #[inline]
+    fn reserve_write(&self) -> u64 {
+        loop {
+            let seq = self.seq.load(Ordering::Acquire);
+            if seq % 2 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if self
+                .seq
+                .compare_exchange(seq, seq + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return seq;
+            }
+        }
+    }
+
+    #[inline]
     pub fn get(&self) -> Option<OrderSnapshot> {
         for _ in 0..8 {
             let seq1 = self.seq.load(Ordering::Acquire);
@@ -110,7 +128,7 @@ impl AtomicOrderSnapshot {
 
     #[inline]
     pub fn set(&self, snapshot: Option<OrderSnapshot>) {
-        let seq = self.seq.fetch_add(1, Ordering::AcqRel);
+        let seq = self.reserve_write();
         match snapshot {
             Some(snapshot) => {
                 self.side.store(
@@ -186,6 +204,7 @@ pub struct OrderMonitorService {
     pub evaluator: OpportunityEvaluator,
 
     pub cancel_tx: mpsc::Sender<CancelIntent>,
+    pub cancel_demand: Arc<CancelDemand>,
 }
 
 impl OrderMonitorService {
@@ -199,6 +218,7 @@ impl OrderMonitorService {
         config: Config,
         evaluator: OpportunityEvaluator,
         cancel_tx: mpsc::Sender<CancelIntent>,
+        cancel_demand: Arc<CancelDemand>,
     ) -> Self {
         Self {
             bot_state,
@@ -209,6 +229,7 @@ impl OrderMonitorService {
             config,
             evaluator,
             cancel_tx,
+            cancel_demand,
         }
     }
 
@@ -251,12 +272,14 @@ impl OrderMonitorService {
                 // Send allocation-free cancel request (non-blocking). The human
                 // formatting happens in the cold-path handler.
                 if self.order_snapshot.request_cancel() {
-                    let _ = self.cancel_tx.try_send(CancelIntent::new(
+                    request_cancel(
+                        &self.cancel_tx,
+                        &self.cancel_demand,
                         self.config.symbol.clone(),
                         CancelReason::AgeExpiry {
                             age_ms: age.as_millis() as u64,
                         },
-                    ));
+                    );
                 }
                 continue;
             }
@@ -279,13 +302,15 @@ impl OrderMonitorService {
             ) && self.order_snapshot.request_cancel()
             {
                 // Send allocation-free cancel request (non-blocking).
-                let _ = self.cancel_tx.try_send(CancelIntent::new(
+                request_cancel(
+                    &self.cancel_tx,
+                    &self.cancel_demand,
                     self.config.symbol.clone(),
                     CancelReason::ProfitDeviation {
                         current_profit_bps: current_profit,
                         deviation_bps: profit_drop,
                     },
-                ));
+                );
             }
         }
     }
@@ -396,4 +421,72 @@ pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>) {
     tokio::spawn(async move {
         service_clone.run_profit_logger().await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+
+    #[test]
+    fn concurrent_snapshot_writers_do_not_publish_torn_reads() {
+        let snapshot = Arc::new(AtomicOrderSnapshot::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_a = {
+            let snapshot = snapshot.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    snapshot.set(Some(OrderSnapshot {
+                        side: OrderSide::Buy,
+                        price: 1.0,
+                        size: 10.0,
+                        initial_profit_bps: 100.0,
+                        placed_at_ns: 1,
+                        cancel_requested: false,
+                    }));
+                }
+            })
+        };
+        let writer_b = {
+            let snapshot = snapshot.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    snapshot.set(Some(OrderSnapshot {
+                        side: OrderSide::Sell,
+                        price: 2.0,
+                        size: 20.0,
+                        initial_profit_bps: 200.0,
+                        placed_at_ns: 2,
+                        cancel_requested: true,
+                    }));
+                }
+            })
+        };
+
+        for _ in 0..50_000 {
+            let Some(read) = snapshot.get() else {
+                continue;
+            };
+            let coherent_a = read.side == OrderSide::Buy
+                && read.price == 1.0
+                && read.size == 10.0
+                && read.initial_profit_bps == 100.0
+                && read.placed_at_ns == 1
+                && !read.cancel_requested;
+            let coherent_b = read.side == OrderSide::Sell
+                && read.price == 2.0
+                && read.size == 20.0
+                && read.initial_profit_bps == 200.0
+                && read.placed_at_ns == 2
+                && read.cancel_requested;
+            assert!(coherent_a || coherent_b, "torn snapshot: {:?}", read);
+        }
+
+        stop.store(true, Ordering::Release);
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+    }
 }

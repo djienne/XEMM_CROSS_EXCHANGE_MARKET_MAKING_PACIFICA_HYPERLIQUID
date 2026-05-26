@@ -12,7 +12,9 @@ use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
 use crate::market_rules::{fallback_rules, is_dust_or_below_min};
-use crate::services::{enqueue_hedge_intent, HedgeIntent, HedgeSource, HedgeVenueSide};
+use crate::services::{
+    enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
+};
 
 /// Slow safety loop that reconciles net exposure across exchanges.
 pub struct PositionReconcilerService {
@@ -172,10 +174,16 @@ impl PositionReconcilerService {
                 "[RECONCILER] Net exposure {} exceeds dust {}; queued residual hedge {}",
                 net, self.config.neutral_dust_base, intent.size
             );
-            if let Err(e) = enqueue_hedge_intent(&self.hedge_tx, &self.bot_state, intent).await {
-                warn!("[RECONCILER] Failed to enqueue residual hedge: {}", e);
-            } else {
-                last_enqueued = Some((net, Instant::now()));
+            match enqueue_hedge_intent(&self.hedge_tx, &self.bot_state, intent).await {
+                Ok(HedgeEnqueueResult::Queued) => {
+                    last_enqueued = Some((net, Instant::now()));
+                }
+                Ok(HedgeEnqueueResult::PersistedButNotQueued { reason }) => {
+                    warn!("[RECONCILER] Residual hedge was not queued: {}", reason);
+                }
+                Err(e) => {
+                    warn!("[RECONCILER] Failed to enqueue residual hedge: {}", e);
+                }
             }
         }
     }

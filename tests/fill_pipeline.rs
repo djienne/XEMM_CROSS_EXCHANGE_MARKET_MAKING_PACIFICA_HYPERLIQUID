@@ -7,8 +7,13 @@
 
 use std::time::Duration;
 
+use parking_lot::RwLock;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use xemm_rust::bot::BotState;
 use xemm_rust::services::fill_aggregator::FillAggregator;
 use xemm_rust::services::fill_dedup::{FillDedup, FillKey};
+use xemm_rust::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use xemm_rust::strategy::OrderSide;
 
 /// Partial fill followed by full fill must hedge exactly once, and the hedge
@@ -123,4 +128,39 @@ fn idle_partial_then_later_terminal_emits_residual() {
         .expect("later terminal fill should emit residual");
     assert!((second.size - 0.6).abs() < 1e-9);
     assert!(second.terminal);
+}
+
+#[tokio::test]
+async fn queue_full_releases_reserved_pending() {
+    let agg = FillAggregator::new(50.0);
+    assert!(agg.observe_fill(88, OrderSide::Buy, 1.0, 100.0, false));
+    let reservation = agg.try_reserve_hedge(88).unwrap();
+    let intent: HedgeIntent = reservation.into();
+
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(HedgeIntent::from_maker_fill(
+        1,
+        0,
+        OrderSide::Buy,
+        1.0,
+        100.0,
+        std::time::Instant::now(),
+        true,
+    ))
+    .unwrap();
+    let bot_state = Arc::new(RwLock::new(BotState::new()));
+
+    let result = enqueue_hedge_intent(&tx, &bot_state, intent).await.unwrap();
+    assert!(matches!(
+        result,
+        HedgeEnqueueResult::PersistedButNotQueued { .. }
+    ));
+    agg.release_reservation(reservation);
+
+    let state = agg.snapshot(88).unwrap();
+    assert!((state.residual() - 1.0).abs() < 1e-9);
+    let again = agg.try_reserve_hedge(88).unwrap();
+    assert!((again.size - 1.0).abs() < 1e-9);
+
+    let _ = rx.try_recv();
 }

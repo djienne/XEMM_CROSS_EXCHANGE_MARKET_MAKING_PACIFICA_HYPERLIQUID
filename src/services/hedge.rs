@@ -19,9 +19,10 @@ use crate::connector::hyperliquid::types::{
     WsPostResponse,
 };
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::services::cancel_manager::{CancelIntent, CancelReason};
+use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::{FillAggregator, HedgeSettlement};
 use crate::services::hedge_store::{self, HedgeIntentStatus, HedgeLifecycleUpdate};
+use crate::services::metrics;
 use crate::services::post_trade_auditor::PostTradeAuditEvent;
 use crate::services::{HedgeIntent, HedgeVenueSide};
 
@@ -44,6 +45,7 @@ pub struct HedgeService {
     pub fill_aggregator: Arc<FillAggregator>,
     pub audit_tx: mpsc::Sender<PostTradeAuditEvent>,
     pub cancel_tx: mpsc::Sender<CancelIntent>,
+    pub cancel_demand: Arc<CancelDemand>,
     pub shutdown_tx: mpsc::Sender<()>,
     /// Fires when the main loop wants the hedge service to stop. The service
     /// drains any events already in `hedge_rx` and then exits cleanly. This
@@ -155,13 +157,24 @@ impl HedgeService {
             let avg_price = event.avg_price;
             let fill_timestamp = event.detected_at;
             let reception_latency = fill_timestamp.elapsed();
-            info!("{} FAST HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
-                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                hedge_side.as_str().bright_yellow(),
-                size,
-                format!("${:.4}", avg_price).cyan(),
-                reception_latency.as_secs_f64() * 1000.0
-            );
+            metrics::risk_metrics()
+                .hedge_enqueue_to_submit_us
+                .store(
+                    reception_latency
+                        .as_micros()
+                        .min(u64::MAX as u128) as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
+            metrics::store_f64(&metrics::risk_metrics().hedge_target_qty_bits, size);
+            if !self.config.low_latency_mode {
+                info!("{} FAST HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    hedge_side.as_str().bright_yellow(),
+                    size,
+                    format!("${:.4}", avg_price).cyan(),
+                    reception_latency.as_secs_f64() * 1000.0
+                );
+            }
 
             // *** CRITICAL: CANCEL ALL ORDERS BEFORE HEDGE ***
             // Extra safety: cancel again in case fill detection missed anything
@@ -169,14 +182,23 @@ impl HedgeService {
             // MOVED TO BACKGROUND TASK to avoid blocking hedge execution latency.
             let symbol_bg = self.config.symbol.clone();
             let cancel_tx_bg = self.cancel_tx.clone();
+            let cancel_demand_bg = self.cancel_demand.clone();
+            let low_latency_mode = self.config.low_latency_mode;
 
             tokio::spawn(async move {
-                info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
-                    tag(&symbol_bg, "HEDGE", Color::BrightMagenta),
-                    "FAST".yellow().bold()
-                );
+                if !low_latency_mode {
+                    info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
+                        tag(&symbol_bg, "HEDGE", Color::BrightMagenta),
+                        "FAST".yellow().bold()
+                    );
+                }
 
-                let _ = cancel_tx_bg.try_send(CancelIntent::new(symbol_bg, CancelReason::Safety));
+                request_cancel(
+                    &cancel_tx_bg,
+                    &cancel_demand_bg,
+                    symbol_bg,
+                    CancelReason::Safety,
+                );
             });
 
             // Update status
@@ -200,51 +222,34 @@ impl HedgeService {
                     "WARN".yellow().bold()
                 );
 
-                const MAX_ATTEMPTS: usize = 5;
-                for attempt in 1..=MAX_ATTEMPTS {
-                    match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
-                        Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
-                            hl_bid = bid;
-                            hl_ask = ask;
-                            self.hyperliquid_prices.store(bid, ask);
+                match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
+                    Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
+                        hl_bid = bid;
+                        hl_ask = ask;
+                        self.hyperliquid_prices.store(bid, ask);
+                        if !self.config.low_latency_mode {
                             info!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                                 "OK".green().bold(),
                                 hl_bid,
                                 hl_ask
                             );
-                            break;
-                        }
-                        Ok(_) => {
-                            warn!("{} {} Snapshot missing bid/ask data (attempt {}/{})",
-                                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "WARN".yellow().bold(),
-                                attempt,
-                                MAX_ATTEMPTS
-                            );
-                        }
-                        Err(err) => {
-                            warn!("{} {} Failed to fetch Hyperliquid snapshot (attempt {}/{}): {}",
-                                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "WARN".yellow().bold(),
-                                attempt,
-                                MAX_ATTEMPTS,
-                                err
-                            );
                         }
                     }
-
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        if let Some(cached) = self.hyperliquid_prices.usable_snapshot(Duration::from_millis(self.config.hedge_quote_max_age_ms)) {
-                            hl_bid = cached.bid;
-                            hl_ask = cached.ask;
-                            info!("{} {} Hyperliquid prices populated by feed during wait",
-                                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                "OK".green().bold()
-                            );
-                            break;
-                        }
+                    Ok(_) => {
+                        warn!(
+                            "{} {} Snapshot missing bid/ask data",
+                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                            "WARN".yellow().bold()
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            "{} {} Failed to fetch Hyperliquid snapshot: {}",
+                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                            "WARN".yellow().bold(),
+                            err
+                        );
                     }
                 }
 
@@ -262,21 +267,32 @@ impl HedgeService {
                         Some("Hyperliquid prices unavailable for hedge".to_string());
                     let _ = hedge_store::append_lifecycle_update(failed_update).await;
 
+                    self.fill_aggregator.settle_hedge(HedgeSettlement::unknown(
+                        event.source_order_id,
+                        size,
+                        0.0,
+                    ));
+                    metrics::risk_metrics()
+                        .hedge_unknown_count
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
                     {
                         let mut state = self.bot_state.write();
-                        state.mark_reconciling();
+                        state.mark_hedge_unknown();
                     }
 
                     continue;
                 }
             }
 
-            info!(
-                "{} Executing {} {} on Hyperliquid",
-                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                if is_buy { "BUY".green().bold() } else { "SELL".red().bold() },
-                size
-            );
+            if !self.config.low_latency_mode {
+                info!(
+                    "{} Executing {} {} on Hyperliquid",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    if is_buy { "BUY".green().bold() } else { "SELL".red().bold() },
+                    size
+                );
+            }
 
             // *** HEDGE WITH EXPONENTIAL RETRY ***
             // Transient failures on Hyperliquid (429, 5xx, WS disconnect) must not leave
@@ -284,6 +300,7 @@ impl HedgeService {
             // falling through to the error-shutdown path.
             let max_attempts = self.config.max_consecutive_hedge_failures.max(1) as usize;
             let mut hedge_result = Err(anyhow::anyhow!("hedge not attempted"));
+            let mut request_group = 0u64;
             for attempt in 0..max_attempts {
                 if attempt > 0 {
                     let delay_ms = (self.config.hedge_retry_base_delay_ms
@@ -306,7 +323,8 @@ impl HedgeService {
                     }
                 }
 
-                let cloid = Self::hedge_cloid(event.source_order_id, event.hedge_seq);
+                let cloid =
+                    Self::idempotency_cloid(event.source_order_id, event.hedge_seq, request_group);
                 let mut submitted = HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Submitted);
                 submitted.cloid = Some(&cloid);
                 submitted.target_qty = Some(size);
@@ -321,6 +339,7 @@ impl HedgeService {
                 }
 
                 let submitted_after_ms = Self::unix_ms();
+                let submit_start = std::time::Instant::now();
                 hedge_result = if use_ws_for_hedge {
                     // Ensure we have an active trading WebSocket
                     if ws_write.is_none() || ws_read.is_none() {
@@ -418,6 +437,10 @@ impl HedgeService {
                         )
                         .await
                 };
+                metrics::risk_metrics().hedge_submit_to_ack_us.store(
+                    submit_start.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
 
                 if hedge_result.is_err() {
                     match self
@@ -506,12 +529,14 @@ impl HedgeService {
                 // Only break the retry loop on a true "filled" success. Hyperliquid
                 // returns Ok with an internal OrderStatus::Error for rejections - treat
                 // those as retryable.
+                let mut definite_reject = false;
                 let success_or_retry = match &hedge_result {
                     Ok(resp) => match &resp.response {
                         OrderResponseContent::Success(data) => {
                             match data.data.statuses.first() {
                                 Some(OrderStatus::Filled { .. }) => true,
                                 Some(OrderStatus::Error { error }) => {
+                                    definite_reject = true;
                                     hedge_result = Err(anyhow::anyhow!("HL order status error: {}", error));
                                     false
                                 }
@@ -526,6 +551,7 @@ impl HedgeService {
                             }
                         }
                         OrderResponseContent::Error(e) => {
+                            definite_reject = true;
                             hedge_result = Err(anyhow::anyhow!("HL response error: {}", e));
                             false
                         }
@@ -535,6 +561,9 @@ impl HedgeService {
 
                 if success_or_retry {
                     break;
+                }
+                if definite_reject {
+                    request_group = request_group.saturating_add(1);
                 }
             }
 
@@ -556,6 +585,11 @@ impl HedgeService {
                                 let mut state = self.bot_state.write();
                                 state.mark_reconciling();
                             }
+                            self.fill_aggregator.settle_hedge(HedgeSettlement::rejected(
+                                event.source_order_id,
+                                size,
+                                0.0,
+                            ));
 
                             continue;
                         }
@@ -568,13 +602,15 @@ impl HedgeService {
                     let hedge_fill = if let Some(status) = response_data.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
-                                info!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
-                                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                                    "OK".green().bold(),
-                                    filled.total_sz,
-                                    filled.avg_px,
-                                    end_to_end_latency.as_secs_f64() * 1000.0
-                                );
+                                if !self.config.low_latency_mode {
+                                    info!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
+                                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                        "OK".green().bold(),
+                                        filled.total_sz,
+                                        filled.avg_px,
+                                        end_to_end_latency.as_secs_f64() * 1000.0
+                                    );
+                                }
                                 match (filled.avg_px.parse::<f64>().ok(), filled.total_sz.parse::<f64>().ok()) {
                                     (Some(px), Some(sz)) => Some((px, sz)),
                                     _ => None,
@@ -592,6 +628,11 @@ impl HedgeService {
                                     let mut state = self.bot_state.write();
                                     state.mark_reconciling();
                                 }
+                                self.fill_aggregator.settle_hedge(HedgeSettlement::rejected(
+                                    event.source_order_id,
+                                    size,
+                                    0.0,
+                                ));
 
                                 continue;
                             }
@@ -607,6 +648,11 @@ impl HedgeService {
                                     let mut state = self.bot_state.write();
                                     state.mark_reconciling();
                                 }
+                                self.fill_aggregator.settle_hedge(HedgeSettlement::unknown(
+                                    event.source_order_id,
+                                    size,
+                                    0.0,
+                                ));
 
                                 continue;
                             }
@@ -632,6 +678,14 @@ impl HedgeService {
                                 let mut state = self.bot_state.write();
                                 state.mark_reconciling();
                             }
+                            self.fill_aggregator.settle_hedge(HedgeSettlement::unknown(
+                                event.source_order_id,
+                                size,
+                                0.0,
+                            ));
+                            metrics::risk_metrics()
+                                .hedge_unknown_count
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
                             continue;
                         }
@@ -654,7 +708,12 @@ impl HedgeService {
                                 break;
                             }
                             let attempt_no = max_attempts as u64 + residual_attempt as u64;
-                            let cloid = Self::hedge_cloid(event.source_order_id, event.hedge_seq);
+                            let cloid = Self::residual_cloid(
+                                event.source_order_id,
+                                event.hedge_seq,
+                                residual_attempt as u64 + 1,
+                                attempt_no,
+                            );
                             let mut residual_update =
                                 HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Submitted);
                             residual_update.cloid = Some(&cloid);
@@ -778,6 +837,14 @@ impl HedgeService {
                                 let mut state = self.bot_state.write();
                                 state.mark_reconciling();
                             }
+                            self.fill_aggregator.settle_hedge(HedgeSettlement::unknown(
+                                event.source_order_id,
+                                size,
+                                confirmed_hedge_size,
+                            ));
+                            metrics::risk_metrics()
+                                .hedge_unknown_count
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                             warn!(
                                 "{} {} Hedge residual still unfilled (target {}, confirmed {}); leaving bot in Reconciling for slow retry",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
@@ -794,6 +861,14 @@ impl HedgeService {
                         size,
                         confirmed_hedge_size,
                     ));
+                    metrics::store_f64(
+                        &metrics::risk_metrics().hedge_confirmed_qty_bits,
+                        confirmed_hedge_size,
+                    );
+                    metrics::store_f64(
+                        &metrics::risk_metrics().hedge_residual_qty_bits,
+                        (size - confirmed_hedge_size).max(0.0),
+                    );
 
                     let mut complete_update =
                         HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Complete);
@@ -852,11 +927,13 @@ impl HedgeService {
                         return;
                     }
 
-                    info!(
-                        "{} {} Hedge confirmed; terminal audit handed to cold auditor",
-                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                        "OK".green().bold()
-                    );
+                    if !self.config.low_latency_mode {
+                        info!(
+                            "{} {} Hedge confirmed; terminal audit handed to cold auditor",
+                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                            "OK".green().bold()
+                        );
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -873,15 +950,25 @@ impl HedgeService {
                         "FAST".yellow().bold()
                     );
 
-                    let _ = self.cancel_tx.try_send(CancelIntent::new(
+                    request_cancel(
+                        &self.cancel_tx,
+                        &self.cancel_demand,
                         self.config.symbol.clone(),
                         CancelReason::Safety,
-                    ));
+                    );
 
                     {
                         let mut state = self.bot_state.write();
                         state.mark_reconciling();
                     }
+                    self.fill_aggregator.settle_hedge(HedgeSettlement::unknown(
+                        event.source_order_id,
+                        size,
+                        0.0,
+                    ));
+                    metrics::risk_metrics()
+                        .hedge_unknown_count
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
                     let mut failed_update =
                         HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Error);
@@ -1022,9 +1109,28 @@ impl HedgeService {
         bps / 10_000.0
     }
 
+    #[cfg(test)]
     fn hedge_cloid(source_order_id: u64, hedge_seq: u64) -> String {
+        Self::idempotency_cloid(source_order_id, hedge_seq, 0)
+    }
+
+    fn idempotency_cloid(source_order_id: u64, hedge_seq: u64, request_group: u64) -> String {
         let hi = source_order_id ^ (hedge_seq << 32);
-        format!("0x{:016x}{:016x}", hi, 0)
+        format!("0x{:016x}{:016x}", hi, request_group)
+    }
+
+    fn residual_cloid(
+        source_order_id: u64,
+        hedge_seq: u64,
+        residual_seq: u64,
+        submit_attempt: u64,
+    ) -> String {
+        let hi = source_order_id ^ (hedge_seq << 32) ^ (residual_seq << 48);
+        format!(
+            "0x{:016x}{:016x}",
+            hi,
+            submit_attempt | (residual_seq << 32)
+        )
     }
 
     fn filled_qty_from_response(
@@ -1086,11 +1192,13 @@ impl HedgeService {
         };
 
         let request_json = serde_json::to_string(&ws_request)?;
-        info!(
-            "{} Sending Hyperliquid hedge order via WebSocket (id={})",
-            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-            request_id
-        );
+        if !self.config.low_latency_mode {
+            info!(
+                "{} Sending Hyperliquid hedge order via WebSocket (id={})",
+                tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                request_id
+            );
+        }
         write.send(Message::Text(request_json)).await?;
 
         // Wait for the matching post response
@@ -1170,6 +1278,18 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, different_intent);
         assert!(first.starts_with("0x"));
+    }
+
+    #[test]
+    fn uncertain_retry_and_residual_cloids_have_different_scopes() {
+        let same_unknown = HedgeService::idempotency_cloid(42, 3, 0);
+        let same_unknown_again = HedgeService::idempotency_cloid(42, 3, 0);
+        let new_after_reject = HedgeService::idempotency_cloid(42, 3, 1);
+        let residual = HedgeService::residual_cloid(42, 3, 1, 4);
+
+        assert_eq!(same_unknown, same_unknown_again);
+        assert_ne!(same_unknown, new_after_reject);
+        assert_ne!(same_unknown, residual);
     }
 
     #[test]

@@ -2,18 +2,23 @@ use colored::Colorize;
 use fast_float::parse;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
 use crate::connector::pacifica::PacificaTrading;
-use crate::services::cancel_manager::{CancelIntent, CancelReason};
+use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::{enqueue_hedge_intent, HedgeIntent};
+use crate::services::{
+    enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
+};
 use crate::strategy::OrderSide;
 use crate::util::log::{tag_static, Color};
 
@@ -26,15 +31,18 @@ pub struct PositionMonitorService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
     pub cancel_tx: mpsc::Sender<CancelIntent>,
+    pub cancel_demand: Arc<CancelDemand>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
     pub fill_aggregator: Arc<FillAggregator>,
     pub last_position_snapshot: Arc<Mutex<Option<PositionSnapshot>>>,
+    pub low_latency_mode: bool,
 }
 
 impl PositionMonitorService {
     pub async fn run(self) {
+        let synthetic_nonce = AtomicU64::new(0);
         loop {
             // Adaptive polling: fast when order active, slow when idle
             let has_active_order = {
@@ -142,16 +150,18 @@ impl PositionMonitorService {
                         // Position changed in expected direction - fill detected!
                         let fill_size = delta.abs();
 
-                        info!(
-                            "{} {} Position delta detected: {} {} -> {} {} (delta {:.4})",
-                            tag_static("POSITION_MONITOR", Color::BrightCyan),
-                            "FAST".yellow().bold(),
-                            format!("{:.4}", last_signed).bright_white(),
-                            last_side.yellow(),
-                            format!("{:.4}", current_signed).bright_white(),
-                            current_side.yellow(),
-                            format!("{:.4}", delta.abs()).green().bold()
-                        );
+                        if !self.low_latency_mode {
+                            info!(
+                                "{} {} Position delta detected: {} {} -> {} {} (delta {:.4})",
+                                tag_static("POSITION_MONITOR", Color::BrightCyan),
+                                "FAST".yellow().bold(),
+                                format!("{:.4}", last_signed).bright_white(),
+                                last_side.yellow(),
+                                format!("{:.4}", current_signed).bright_white(),
+                                current_side.yellow(),
+                                format!("{:.4}", delta.abs()).green().bold()
+                            );
+                        }
 
                         // CRITICAL FIX: Skip if this is first position change from None baseline (startup)
                         // This prevents hedging the bot's first order fill which establishes initial position
@@ -206,45 +216,56 @@ impl PositionMonitorService {
                             .and_then(|p| p.entry_price.parse::<f64>().ok())
                             .unwrap_or(0.0);
 
-                        let hedge_event = if let Some(id) = order_id_opt {
-                            match self.fill_aggregator.on_fill(
-                                id,
-                                order_side,
-                                fill_size,
-                                estimated_price,
-                                true,
-                            ) {
-                                Some(decision) => decision.into(),
-                                None => {
+                        let dedup_key =
+                            FillKey::from_cloid_cumulative(client_order_id.clone(), fill_size);
+                        let should_process = self.processed_fills.insert_if_new(dedup_key);
+
+                        if should_process {
+                            let mut reservation = None;
+                            let hedge_event = if let Some(id) = order_id_opt {
+                                if !self.fill_aggregator.observe_fill(
+                                    id,
+                                    order_side,
+                                    fill_size,
+                                    estimated_price,
+                                    true,
+                                ) {
                                     debug!(
                                         "[POSITION_MONITOR] Position fill already accounted for (order_id={})",
                                         id
                                     );
                                     continue;
                                 }
+                                let Some(r) = self.fill_aggregator.try_reserve_hedge(id) else {
+                                    continue;
+                                };
+                                let intent: HedgeIntent = r.into();
+                                reservation = Some(r);
+                                intent
+                            } else {
+                                let source_order_id = synthetic_source_id(
+                                    &client_order_id,
+                                    synthetic_nonce.fetch_add(1, Ordering::AcqRel),
+                                );
+                                let hedge_seq = synthetic_nonce.fetch_add(1, Ordering::AcqRel);
+                                HedgeIntent::from_venue_side(
+                                    source_order_id,
+                                    hedge_seq,
+                                    HedgeSource::PositionMonitor,
+                                    HedgeVenueSide::from_maker_side(order_side),
+                                    fill_size,
+                                    estimated_price,
+                                    true,
+                                )
+                            };
+
+                            if !self.low_latency_mode {
+                                info!(
+                                    "{} {} FILL DETECTED via position change!",
+                                    tag_static("POSITION_MONITOR", Color::BrightCyan),
+                                    "OK".green().bold()
+                                );
                             }
-                        } else {
-                            HedgeIntent::from_maker_fill(
-                                0,
-                                0,
-                                order_side,
-                                fill_size,
-                                estimated_price,
-                                std::time::Instant::now(),
-                                true,
-                            )
-                        };
-
-                        let dedup_key =
-                            FillKey::from_cloid_cumulative(client_order_id.clone(), fill_size);
-                        let should_process = self.processed_fills.insert_if_new(dedup_key);
-
-                        if should_process {
-                            info!(
-                                "{} {} FILL DETECTED via position change!",
-                                tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                "OK".green().bold()
-                            );
 
                             // Update state to Filled
                             {
@@ -252,35 +273,62 @@ impl PositionMonitorService {
                                 state.mark_filled(hedge_event.size, hedge_event.audit_maker_side());
                             }
 
-                            info!(
-                                "{} Triggering hedge for position-detected fill",
-                                tag_static("POSITION_MONITOR", Color::BrightCyan)
-                            );
+                            if !self.low_latency_mode {
+                                info!(
+                                    "{} Triggering hedge for position-detected fill",
+                                    tag_static("POSITION_MONITOR", Color::BrightCyan)
+                                );
+                            }
 
-                            if let Err(e) = enqueue_hedge_intent(
+                            match enqueue_hedge_intent(
                                 &self.hedge_tx,
                                 &self.bot_state,
                                 hedge_event.clone(),
                             )
                             .await
                             {
-                                error!(
-                                    "{} {} Hedge intent enqueue failed: {}",
-                                    tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                    "x".red().bold(),
-                                    e
-                                );
+                                Ok(HedgeEnqueueResult::Queued) => {
+                                    if let Some(r) = reservation {
+                                        self.fill_aggregator.commit_queued(r);
+                                    }
+                                }
+                                Ok(HedgeEnqueueResult::PersistedButNotQueued { reason }) => {
+                                    if let Some(r) = reservation {
+                                        self.fill_aggregator.release_reservation(r);
+                                    }
+                                    warn!(
+                                        "{} {} Hedge intent persisted but not queued: {}",
+                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
+                                        "WARN".yellow().bold(),
+                                        reason
+                                    );
+                                }
+                                Err(e) => {
+                                    if let Some(r) = reservation {
+                                        self.fill_aggregator.release_reservation(r);
+                                    }
+                                    error!(
+                                        "{} {} Hedge intent enqueue failed: {}",
+                                        tag_static("POSITION_MONITOR", Color::BrightCyan),
+                                        "x".red().bold(),
+                                        e
+                                    );
+                                }
                             }
 
-                            info!(
-                                "{} {} Queueing cancellation of any remaining Pacifica orders...",
-                                tag_static("POSITION_MONITOR", Color::BrightCyan),
-                                "FAST".yellow().bold()
-                            );
-                            let _ = self.cancel_tx.try_send(CancelIntent::new(
+                            if !self.low_latency_mode {
+                                info!(
+                                    "{} {} Queueing cancellation of any remaining Pacifica orders...",
+                                    tag_static("POSITION_MONITOR", Color::BrightCyan),
+                                    "FAST".yellow().bold()
+                                );
+                            }
+                            request_cancel(
+                                &self.cancel_tx,
+                                &self.cancel_demand,
                                 self.symbol.clone(),
                                 CancelReason::PartialFill,
-                            ));
+                            );
                         } else {
                             debug!(
                                 "[POSITION_MONITOR] Fill already processed by another detection method"
@@ -302,4 +350,12 @@ impl PositionMonitorService {
             }
         }
     }
+}
+
+fn synthetic_source_id(client_order_id: &str, nonce: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    client_order_id.hash(&mut hasher);
+    let hash = hasher.finish();
+    let unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    hash ^ (unix_ms << 16) ^ nonce
 }

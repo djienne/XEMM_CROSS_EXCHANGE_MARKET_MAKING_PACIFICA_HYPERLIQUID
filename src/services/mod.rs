@@ -5,6 +5,7 @@ pub mod fill_dedup;
 pub mod fill_detection;
 pub mod hedge;
 pub mod hedge_store;
+pub mod metrics;
 pub mod order_monitor;
 pub mod position_monitor;
 pub mod position_reconciler;
@@ -18,6 +19,7 @@ pub mod trade_gate;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 use crate::bot::BotState;
@@ -155,6 +157,19 @@ impl From<fill_aggregator::HedgeDecision> for HedgeIntent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HedgeEnqueueResult {
+    Queued,
+    PersistedButNotQueued { reason: String },
+}
+
+impl HedgeEnqueueResult {
+    #[inline]
+    pub fn queued(&self) -> bool {
+        matches!(self, Self::Queued)
+    }
+}
+
 /// Enqueue a hedge intent without dropping exposure on backpressure.
 ///
 /// If the low-latency queue is full or closed, the intent is appended to a
@@ -163,7 +178,7 @@ pub async fn enqueue_hedge_intent(
     hedge_tx: &mpsc::Sender<HedgeIntent>,
     bot_state: &Arc<RwLock<BotState>>,
     intent: HedgeIntent,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HedgeEnqueueResult> {
     if let Err(e) = hedge_store::append_lifecycle_update(hedge_store::HedgeLifecycleUpdate::new(
         &intent,
         hedge_store::HedgeIntentStatus::Created,
@@ -175,6 +190,7 @@ pub async fn enqueue_hedge_intent(
             "failed to persist hedge intent before enqueue: {}",
             e
         ));
+        anyhow::bail!("failed to persist hedge intent before enqueue: {}", e);
     }
 
     match hedge_tx.try_send(intent.clone()) {
@@ -184,9 +200,12 @@ pub async fn enqueue_hedge_intent(
                 hedge_store::HedgeIntentStatus::Queued,
             ))
             .await?;
-            Ok(())
+            Ok(HedgeEnqueueResult::Queued)
         }
         Err(mpsc::error::TrySendError::Full(intent)) => {
+            metrics::risk_metrics()
+                .queue_full_count
+                .fetch_add(1, Ordering::AcqRel);
             let mut update = hedge_store::HedgeLifecycleUpdate::new(
                 &intent,
                 hedge_store::HedgeIntentStatus::QueueFull,
@@ -195,7 +214,9 @@ pub async fn enqueue_hedge_intent(
             hedge_store::append_lifecycle_update(update).await?;
             let mut state = bot_state.write();
             state.mark_reconciling();
-            Ok(())
+            Ok(HedgeEnqueueResult::PersistedButNotQueued {
+                reason: "hedge queue full".to_string(),
+            })
         }
         Err(mpsc::error::TrySendError::Closed(intent)) => {
             let mut update = hedge_store::HedgeLifecycleUpdate::new(
@@ -206,7 +227,9 @@ pub async fn enqueue_hedge_intent(
             hedge_store::append_lifecycle_update(update).await?;
             let mut state = bot_state.write();
             state.set_error("hedge queue closed; intent persisted".to_string());
-            Ok(())
+            Ok(HedgeEnqueueResult::PersistedButNotQueued {
+                reason: "hedge queue closed".to_string(),
+            })
         }
     }
 }

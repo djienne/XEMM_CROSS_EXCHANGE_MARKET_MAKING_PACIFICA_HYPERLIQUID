@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::services::metrics;
 use crate::strategy::OrderSide;
 
 /// Exposure accumulator for a single Pacifica maker order.
@@ -34,10 +35,12 @@ impl OrderFillState {
     }
 }
 
-/// Decision returned by `on_fill` / `flush_idle` when a residual hedge should
-/// fire.
+/// Reservation returned when a residual hedge should fire.
+///
+/// Creating this reservation increments `cumulative_hedge_pending`. The caller
+/// must either enqueue the matching hedge intent or release the reservation.
 #[derive(Debug, Clone, Copy)]
-pub struct HedgeDecision {
+pub struct HedgeReservation {
     pub source_order_id: u64,
     pub hedge_seq: u64,
     pub side: OrderSide,
@@ -46,6 +49,8 @@ pub struct HedgeDecision {
     pub detected_at: Instant,
     pub terminal: bool,
 }
+
+pub type HedgeDecision = HedgeReservation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HedgeSettlementStatus {
@@ -168,6 +173,50 @@ impl FillAggregator {
         is_terminal: bool,
         target_size: Option<f64>,
     ) -> Option<HedgeDecision> {
+        if !self.observe_fill_with_target(
+            order_id,
+            side,
+            absolute_filled_size,
+            avg_price,
+            is_terminal,
+            target_size,
+        ) {
+            return None;
+        }
+        self.try_reserve_hedge(order_id)
+    }
+
+    /// Record a cumulative fill observation without reserving pending hedge
+    /// quantity. Returns true when the residual is eligible for reservation.
+    pub fn observe_fill(
+        &self,
+        order_id: u64,
+        side: OrderSide,
+        absolute_filled_size: f64,
+        avg_price: f64,
+        is_terminal: bool,
+    ) -> bool {
+        self.observe_fill_with_target(
+            order_id,
+            side,
+            absolute_filled_size,
+            avg_price,
+            is_terminal,
+            None,
+        )
+    }
+
+    /// Record a cumulative fill observation without reserving pending hedge
+    /// quantity. Detectors should deduplicate before calling `try_reserve_hedge`.
+    pub fn observe_fill_with_target(
+        &self,
+        order_id: u64,
+        side: OrderSide,
+        absolute_filled_size: f64,
+        avg_price: f64,
+        is_terminal: bool,
+        target_size: Option<f64>,
+    ) -> bool {
         let now = Instant::now();
         let mut g = self.inner.lock();
         if !g.contains_key(&order_id) && g.len() >= self.max_entries {
@@ -206,6 +255,21 @@ impl FillAggregator {
         entry.terminal |= is_terminal;
         entry.last_updated = now;
 
+        self.should_emit(entry)
+    }
+
+    pub fn try_reserve_hedge(&self, order_id: u64) -> Option<HedgeReservation> {
+        let now = Instant::now();
+        let mut g = self.inner.lock();
+        let entry = g.get_mut(&order_id)?;
+        if self.should_emit(entry) {
+            Some(Self::emit_pending(entry, now, entry.terminal))
+        } else {
+            None
+        }
+    }
+
+    fn should_emit(&self, entry: &OrderFillState) -> bool {
         let residual = entry.residual();
         let notional = residual * entry.avg_price;
         let fraction = if entry.target_size > 0.0 {
@@ -213,27 +277,25 @@ impl FillAggregator {
         } else {
             0.0
         };
-        let should_emit = residual > 0.0
+        residual > 0.0
             && (entry.terminal
                 || (self.min_hedge_qty > 0.0 && residual >= self.min_hedge_qty)
                 || (self.min_notional_usd > 0.0 && notional >= self.min_notional_usd)
                 || (self.min_fraction > 0.0 && fraction >= self.min_fraction)
-                || notional >= self.emergency_notional_usd);
-
-        if should_emit {
-            Some(Self::emit_pending(entry, now, entry.terminal))
-        } else {
-            None
-        }
+                || notional >= self.emergency_notional_usd)
     }
 
-    fn emit_pending(entry: &mut OrderFillState, now: Instant, terminal: bool) -> HedgeDecision {
+    fn emit_pending(entry: &mut OrderFillState, now: Instant, terminal: bool) -> HedgeReservation {
         let residual = entry.residual();
         let hedge_seq = entry.next_hedge_seq;
         entry.next_hedge_seq += 1;
         entry.cumulative_hedge_pending += residual;
+        metrics::store_f64(
+            &metrics::risk_metrics().aggregator_reserved_qty_bits,
+            entry.cumulative_hedge_pending,
+        );
 
-        HedgeDecision {
+        HedgeReservation {
             source_order_id: entry.order_id,
             hedge_seq,
             side: entry.side,
@@ -241,6 +303,28 @@ impl FillAggregator {
             avg_price: entry.avg_price,
             detected_at: now,
             terminal,
+        }
+    }
+
+    pub fn commit_queued(&self, _reservation: HedgeReservation) {}
+
+    pub fn release_reservation(&self, reservation: HedgeReservation) {
+        self.release_pending(
+            reservation.source_order_id,
+            reservation.hedge_seq,
+            reservation.size,
+        );
+    }
+
+    pub fn release_pending(&self, order_id: u64, _hedge_seq: u64, qty: f64) {
+        let mut g = self.inner.lock();
+        if let Some(entry) = g.get_mut(&order_id) {
+            let release = qty.max(0.0).min(entry.cumulative_hedge_pending);
+            entry.cumulative_hedge_pending -= release;
+            metrics::store_f64(
+                &metrics::risk_metrics().aggregator_unreserved_residual_qty_bits,
+                entry.residual(),
+            );
         }
     }
 
@@ -270,7 +354,7 @@ impl FillAggregator {
     }
 
     /// Scan accumulators and emit residuals that have gone idle.
-    pub fn flush_idle(&self) -> Vec<(u64, HedgeDecision)> {
+    pub fn flush_idle(&self) -> Vec<(u64, HedgeReservation)> {
         let now = Instant::now();
         let mut out = Vec::new();
         let mut g = self.inner.lock();
@@ -302,6 +386,10 @@ impl FillAggregator {
 
     pub fn is_empty(&self) -> bool {
         self.inner.lock().is_empty()
+    }
+
+    pub fn snapshot(&self, order_id: u64) -> Option<OrderFillState> {
+        self.inner.lock().get(&order_id).copied()
     }
 }
 
@@ -410,6 +498,32 @@ mod tests {
         agg.settle_hedge(HedgeSettlement::rejected(1, d.size, 0.4));
         let residual = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
         assert!((residual.size - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn observe_does_not_reserve_until_try_reserve() {
+        let agg = FillAggregator::new(50.0);
+        assert!(agg.observe_fill(1, OrderSide::Buy, 1.0, 100.0, false));
+        let state = agg.snapshot(1).unwrap();
+        assert!((state.cumulative_hedge_pending - 0.0).abs() < 1e-9);
+
+        let reservation = agg.try_reserve_hedge(1).unwrap();
+        assert!((reservation.size - 1.0).abs() < 1e-9);
+        let state = agg.snapshot(1).unwrap();
+        assert!((state.cumulative_hedge_pending - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn release_reservation_reexposes_residual() {
+        let agg = FillAggregator::new(50.0);
+        assert!(agg.observe_fill(1, OrderSide::Buy, 1.0, 100.0, false));
+        let reservation = agg.try_reserve_hedge(1).unwrap();
+        agg.release_reservation(reservation);
+
+        let state = agg.snapshot(1).unwrap();
+        assert!((state.residual() - 1.0).abs() < 1e-9);
+        let reservation = agg.try_reserve_hedge(1).unwrap();
+        assert!((reservation.size - 1.0).abs() < 1e-9);
     }
 
     #[test]

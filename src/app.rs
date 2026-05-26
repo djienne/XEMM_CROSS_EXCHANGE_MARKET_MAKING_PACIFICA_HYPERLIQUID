@@ -26,13 +26,13 @@ use crate::connector::pacifica::{
     OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
 };
 use crate::services::{
-    cancel_manager::CancelManagerService,
+    cancel_manager::{CancelDemand, CancelManagerService},
     enqueue_hedge_intent,
     fill_aggregator::FillAggregator,
     fill_dedup::FillDedup,
     fill_detection::FillDetectionService,
     hedge::HedgeService,
-    hedge_store,
+    hedge_store, metrics,
     order_monitor::{
         spawn_monitor_tasks, update_order_snapshot, OrderMonitorService, SharedOrderSnapshot,
     },
@@ -44,7 +44,7 @@ use crate::services::{
     safety_monitor::SafetyMonitorService,
     supervisor::spawn_supervised,
     trade_gate::{GateReason, TradeGate},
-    HedgeIntent,
+    HedgeEnqueueResult, HedgeIntent,
 };
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::cancel::dual_cancel;
@@ -60,6 +60,72 @@ pub struct PositionSnapshot {
     pub amount: f64,
     pub side: String, // "bid" or "ask"
     pub last_check: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum PlacementFailure {
+    RejectedDefinitely { reason: String },
+    RateLimited,
+    SubmitUnknown { reason: String },
+    LocalInvalid { reason: String },
+}
+
+fn classify_placement_failure(error: &anyhow::Error) -> PlacementFailure {
+    let reason = error.to_string();
+    let lower = reason.to_lowercase();
+    if is_rate_limit_error(error) {
+        return PlacementFailure::RateLimited;
+    }
+    if lower.contains("rounded pacifica order size is zero")
+        || lower.contains("market info not found")
+        || lower.contains("tick size")
+        || lower.contains("lot size")
+        || lower.contains("current_bid required")
+        || lower.contains("current_ask required")
+    {
+        return PlacementFailure::LocalInvalid { reason };
+    }
+    if lower.contains("post only")
+        || lower.contains("post-only")
+        || lower.contains("alo")
+        || lower.contains("would cross")
+        || lower.contains("self trade")
+        || lower.contains("insufficient")
+        || lower.contains("rejected")
+        || lower.contains("invalid order")
+    {
+        return PlacementFailure::RejectedDefinitely { reason };
+    }
+    PlacementFailure::SubmitUnknown { reason }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_rejections_are_classified_without_unknown_freeze() {
+        assert!(matches!(
+            classify_placement_failure(&anyhow::anyhow!(
+                "Pacifica WS place_limit_order failed: post only would cross"
+            )),
+            PlacementFailure::RejectedDefinitely { .. }
+        ));
+        assert!(matches!(
+            classify_placement_failure(&anyhow::anyhow!("rounded Pacifica order size is zero")),
+            PlacementFailure::LocalInvalid { .. }
+        ));
+        assert!(matches!(
+            classify_placement_failure(&anyhow::anyhow!("Rate limit exceeded (429)")),
+            PlacementFailure::RateLimited
+        ));
+        assert!(matches!(
+            classify_placement_failure(&anyhow::anyhow!(
+                "Hyper connection timed out before response"
+            )),
+            PlacementFailure::SubmitUnknown { .. }
+        ));
+    }
 }
 
 /// XemmBot - Main application structure that encapsulates all bot components
@@ -398,6 +464,7 @@ impl XemmBot {
     /// Run the bot - spawn all services and execute main loop
     pub async fn run(mut self) -> Result<()> {
         hedge_store::start_lifecycle_logger(16_384);
+        self.recover_unresolved_exposure_on_startup().await;
 
         // ===================================================
         // SPAWN ALL SERVICES
@@ -448,6 +515,7 @@ impl XemmBot {
         let fill_ws_ready = fill_client.ready_flag();
         let baseline_updater = fill_client.get_baseline_updater();
 
+        let cancel_demand = CancelDemand::new();
         let (cancel_tx, cancel_rx) = CancelManagerService::channel();
         let cancel_manager = Arc::new(CancelManagerService {
             bot_state: self.bot_state.clone(),
@@ -456,6 +524,7 @@ impl XemmBot {
             rest: self.pacifica_trading.clone(),
             ws: self.pacifica_ws_trading.clone(),
             trade_gate: self.trade_gate.clone(),
+            cancel_demand: cancel_demand.clone(),
             config: self.config.clone(),
         });
         {
@@ -469,6 +538,7 @@ impl XemmBot {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
             cancel_tx: cancel_tx.clone(),
+            cancel_demand: cancel_demand.clone(),
             pacifica_trading: self.pacifica_trading.clone(),
             fill_client,
             symbol: self.config.symbol.clone(),
@@ -477,6 +547,7 @@ impl XemmBot {
             baseline_updater,
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
+            low_latency_mode: self.config.low_latency_mode,
         };
         spawn_supervised("fill_detection", self.trade_gate.clone(), async move {
             fill_service.run().await;
@@ -527,12 +598,14 @@ impl XemmBot {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
             cancel_tx: cancel_tx.clone(),
+            cancel_demand: cancel_demand.clone(),
             pacifica_trading: self.pacifica_trading.clone(),
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             fill_aggregator: self.fill_aggregator.clone(),
             min_hedge_notional: self.config.partial_hedge_min_notional_usd,
             poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
+            low_latency_mode: self.config.low_latency_mode,
         };
         spawn_supervised("rest_fill_detection", self.trade_gate.clone(), async move {
             rest_fill_service.run().await;
@@ -544,11 +617,13 @@ impl XemmBot {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
             cancel_tx: cancel_tx.clone(),
+            cancel_demand: cancel_demand.clone(),
             pacifica_trading: self.pacifica_trading.clone(),
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             fill_aggregator: self.fill_aggregator.clone(),
             last_position_snapshot: self.last_position_snapshot.clone(),
+            low_latency_mode: self.config.low_latency_mode,
         };
         spawn_supervised("position_monitor", self.trade_gate.clone(), async move {
             position_monitor_service.run().await;
@@ -576,6 +651,7 @@ impl XemmBot {
             self.config.clone(),
             self.evaluator.clone(),
             cancel_tx.clone(),
+            cancel_demand.clone(),
         );
         let order_monitor_service = Arc::new(order_monitor_service);
         spawn_monitor_tasks(order_monitor_service);
@@ -618,10 +694,25 @@ impl XemmBot {
                             "[AGGREGATOR] Idle-timeout flush (order_id={}): emitting residual hedge for {} @ ${:.4}",
                             order_id, d.size, d.avg_price
                         );
-                            if let Err(e) =
-                                enqueue_hedge_intent(&hedge_tx, &bot_state, d.into()).await
-                            {
-                                warn!("[AGGREGATOR] Failed to enqueue idle residual hedge: {}", e);
+                            let intent: HedgeIntent = d.into();
+                            match enqueue_hedge_intent(&hedge_tx, &bot_state, intent).await {
+                                Ok(HedgeEnqueueResult::Queued) => {
+                                    aggregator.commit_queued(d);
+                                }
+                                Ok(HedgeEnqueueResult::PersistedButNotQueued { reason }) => {
+                                    aggregator.release_reservation(d);
+                                    warn!(
+                                        "[AGGREGATOR] Idle residual persisted but not queued; released reservation: {}",
+                                        reason
+                                    );
+                                }
+                                Err(e) => {
+                                    aggregator.release_reservation(d);
+                                    warn!(
+                                        "[AGGREGATOR] Failed to enqueue idle residual hedge; released reservation: {}",
+                                        e
+                                    );
+                                }
                             }
                         }
                         aggregator.gc(Duration::from_secs(300));
@@ -653,6 +744,7 @@ impl XemmBot {
             fill_aggregator: self.fill_aggregator.clone(),
             audit_tx,
             cancel_tx: cancel_tx.clone(),
+            cancel_demand: cancel_demand.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
             shutdown_signal: self.hedge_shutdown_signal.clone(),
         };
@@ -878,12 +970,30 @@ impl XemmBot {
                                     );
 
                                     let mut state = self.bot_state.write();
-                                    if let Some(active_order) = state.active_order.as_mut() {
-                                        if active_order.client_order_id == returned_cloid {
-                                            active_order.order_id = order_id_opt;
-                                            active_order.price = submitted_price;
-                                            active_order.size = submitted_size;
+                                    let same_order = state
+                                        .active_order
+                                        .as_ref()
+                                        .map(|order| order.client_order_id == returned_cloid)
+                                        .unwrap_or(false);
+                                    if !same_order {
+                                        warn!(
+                                            "{} {} Placement response CLOID did not match prospective order; entering placement recovery",
+                                            tag(&self.config.symbol, "ORDER", Color::BrightYellow),
+                                            "WARN".yellow().bold()
+                                        );
+                                        if matches!(state.status, BotStatus::Placing | BotStatus::OrderPlaced) {
+                                            state.mark_placement_unknown();
+                                            self.trade_gate.block(GateReason::PlacementUnknown);
+                                            metrics::risk_metrics()
+                                                .placement_unknown_count
+                                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                                         }
+                                        continue;
+                                    }
+                                    if let Some(active_order) = state.active_order.as_mut() {
+                                        active_order.order_id = order_id_opt;
+                                        active_order.price = submitted_price;
+                                        active_order.size = submitted_size;
                                     }
                                     if matches!(state.status, BotStatus::Placing) {
                                         state.status = BotStatus::OrderPlaced;
@@ -912,36 +1022,63 @@ impl XemmBot {
                                     if same_order && matches!(state.status, BotStatus::Placing | BotStatus::OrderPlaced) {
                                         state.mark_placement_unknown();
                                         self.trade_gate.block(GateReason::PlacementUnknown);
+                                        metrics::risk_metrics()
+                                            .placement_unknown_count
+                                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                                     }
                                 }
                             }
                             Err(e) => {
-                                if is_rate_limit_error(&e) {
-                                    rate_limits.record_error(EndpointGroup::PacificaPlace);
-                                    let backoff_secs = rate_limits.get_backoff_secs(EndpointGroup::PacificaPlace);
-                                    info!(
-                                        "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                        tag(&self.config.symbol, "ORDER", Color::BrightYellow),
-                                        "WARN".yellow().bold(),
-                                        backoff_secs,
-                                        rate_limits.consecutive_errors(EndpointGroup::PacificaPlace)
-                                    );
-                                } else {
-                                    info!("{} {} Failed to place order: {}",
-                                        tag(&self.config.symbol, "ORDER", Color::BrightYellow),
-                                        "FAIL".red().bold(),
-                                        e.to_string().red()
-                                    );
-                                }
+                                let failure = classify_placement_failure(&e);
                                 let mut state = self.bot_state.write();
                                 let same_order = state
                                     .active_order
                                     .as_ref()
                                     .map(|order| order.client_order_id == client_order_id)
                                     .unwrap_or(false);
-                                if same_order && matches!(state.status, BotStatus::Placing | BotStatus::OrderPlaced) {
-                                    state.mark_placement_unknown();
-                                    self.trade_gate.block(GateReason::PlacementUnknown);
+                                match failure {
+                                    PlacementFailure::RateLimited => {
+                                        rate_limits.record_error(EndpointGroup::PacificaPlace);
+                                        let backoff_secs = rate_limits.get_backoff_secs(EndpointGroup::PacificaPlace);
+                                        info!(
+                                            "{} {} Failed to place order: rate limit. Backing off for {}s (attempt #{})",
+                                            tag(&self.config.symbol, "ORDER", Color::BrightYellow),
+                                            "WARN".yellow().bold(),
+                                            backoff_secs,
+                                            rate_limits.consecutive_errors(EndpointGroup::PacificaPlace)
+                                        );
+                                        if same_order {
+                                            state.clear_prospective_order();
+                                            self.order_snapshot.set(None);
+                                        }
+                                    }
+                                    PlacementFailure::RejectedDefinitely { reason }
+                                    | PlacementFailure::LocalInvalid { reason } => {
+                                        info!(
+                                            "{} {} Order placement rejected definitively: {}",
+                                            tag(&self.config.symbol, "ORDER", Color::BrightYellow),
+                                            "WARN".yellow().bold(),
+                                            reason
+                                        );
+                                        if same_order {
+                                            state.clear_prospective_order();
+                                            self.order_snapshot.set(None);
+                                        }
+                                    }
+                                    PlacementFailure::SubmitUnknown { reason } => {
+                                        info!("{} {} Failed to place order with unknown submit status: {}",
+                                            tag(&self.config.symbol, "ORDER", Color::BrightYellow),
+                                            "FAIL".red().bold(),
+                                            reason.red()
+                                        );
+                                        if same_order && matches!(state.status, BotStatus::Placing | BotStatus::OrderPlaced) {
+                                            state.mark_placement_unknown();
+                                            self.trade_gate.block(GateReason::PlacementUnknown);
+                                            metrics::risk_metrics()
+                                                .placement_unknown_count
+                                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1147,6 +1284,39 @@ impl XemmBot {
             use tokio::io::AsyncWriteExt;
             let _ = file.write_all(record.to_string().as_bytes()).await;
             let _ = file.write_all(b"\n").await;
+        }
+    }
+
+    async fn recover_unresolved_exposure_on_startup(&self) {
+        let path = std::path::Path::new("data/unresolved_exposure.jsonl");
+        if tokio::fs::metadata(path).await.is_err() {
+            return;
+        }
+
+        match self.signed_positions().await {
+            Ok((pacifica_position, hyperliquid_position)) => {
+                let net = pacifica_position + hyperliquid_position;
+                if net.abs() > self.config.neutral_dust_base {
+                    warn!(
+                        "{} {} Startup found unresolved exposure file and live net exposure {:.8}; quoting stays blocked for reconciliation",
+                        tag_static("INIT", Color::Cyan),
+                        "WARN".yellow().bold(),
+                        net
+                    );
+                    self.trade_gate.block(GateReason::NetExposure);
+                    let mut state = self.bot_state.write();
+                    state.mark_reconciling();
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "{} {} Startup could not verify unresolved exposure file: {}",
+                    tag_static("INIT", Color::Cyan),
+                    "WARN".yellow().bold(),
+                    e
+                );
+                self.trade_gate.block(GateReason::PositionUnknown);
+            }
         }
     }
 
