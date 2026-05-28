@@ -689,8 +689,17 @@ impl HyperliquidTrading {
         let status = wrapper.status;
 
         // Only pay for the avg-price lookup when something actually filled.
+        // `userFills` is eventually consistent and can lag `orderStatus`, so if it
+        // hasn't surfaced the fill yet, fall back to the order's limit price rather
+        // than recording a $0 fill price into the PnL/audit trail. For a marketable
+        // IOC the limit price is a close, conservative proxy.
         let avg_px = if filled_sz > 0.0 {
-            self.avg_fill_px_for_oid(oid).await.unwrap_or(0.0)
+            let from_fills = self.avg_fill_px_for_oid(oid).await.unwrap_or(0.0);
+            if from_fills > 0.0 {
+                from_fills
+            } else {
+                wrapper.order.limit_px.parse::<f64>().unwrap_or(0.0)
+            }
         } else {
             0.0
         };

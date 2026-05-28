@@ -37,7 +37,7 @@ impl PositionReconcilerService {
         // working hedge is not punished toward the hard-error ceiling.
         let mut unhedged_since: Option<Instant> = None;
         let mut last_enqueued: Option<(f64, Instant)> = None;
-        let mut prev_abs_net: Option<f64> = None;
+        let mut prev_eff_net: Option<f64> = None;
 
         loop {
             ticker.tick().await;
@@ -79,7 +79,7 @@ impl PositionReconcilerService {
             if net.abs() <= effective_dust {
                 unhedged_since = None;
                 last_enqueued = None;
-                prev_abs_net = None;
+                prev_eff_net = None;
                 let can_complete = {
                     let state = self.bot_state.read();
                     state.active_order.is_none()
@@ -119,57 +119,77 @@ impl PositionReconcilerService {
                 continue;
             }
 
-            // M2: while the primary hedge path is actively executing, do not race
-            // it with a duplicate corrective hedge. The exposure timer keeps
-            // running so a genuinely stuck hedge still escalates.
-            if run_state == RunState::Hedging {
-                debug!("[RECONCILER] Hedge in progress; deferring corrective hedge this tick");
+            // NOTE: we intentionally do NOT early-`continue` on `RunState::Hedging`.
+            // Skipping the whole tick there would also skip the hard-error timer, so
+            // a wedged Hedging state with real exposure would never escalate. The
+            // duplicate-hedge race is instead prevented by the pending-aware check
+            // below (`effective_net = net - total_pending_qty()`), since the primary
+            // hedge reserves its quantity in the aggregator before/while executing.
+            let mid_price = self.estimate_mid_price().await.unwrap_or(0.0);
+
+            // M2: subtract hedge quantity already reserved/in-flight by the primary
+            // hedge path so the reconciler reasons only about genuinely UNCOVERED
+            // exposure. This both prevents racing an in-flight hedge AND prevents a
+            // normal in-flight hedge (e.g. a $20 fill vs a $10 max_unhedged_usd) from
+            // tripping the error caps before the hedge has had a chance to land.
+            let pending = self.fill_aggregator.total_pending_qty();
+            let abs_net = net.abs();
+            let effective_net = (abs_net - pending).max(0.0);
+
+            // Covered by an in-flight hedge: nothing to do, and not "unhedged" for
+            // the hard-error timer.
+            if effective_net <= effective_dust {
+                unhedged_since = None;
+                last_enqueued = None;
+                prev_eff_net = None;
+                debug!(
+                    "[RECONCILER] Net {} is covered by in-flight hedge (pending {}); deferring",
+                    net, pending
+                );
                 continue;
             }
-
-            let mid_price = self.estimate_mid_price().await.unwrap_or(0.0);
 
             // L1: unhedgeable sub-min residual. Surface it but do NOT escalate to a
             // terminal error or enqueue a doomed order; reset the timer so it does
             // not accumulate toward the hard limit.
-            if is_dust_or_below_min(net, mid_price, rules, effective_dust) {
+            if is_dust_or_below_min(effective_net, mid_price, rules, effective_dust) {
                 warn!(
-                    "[RECONCILER] Net exposure {} is below {} exchange min/min-notional; cannot auto-hedge (operator action may be required)",
-                    net, self.config.symbol
+                    "[RECONCILER] Uncovered exposure {} (net {}) is below {} exchange min/min-notional; cannot auto-hedge (operator action may be required)",
+                    effective_net, net, self.config.symbol
                 );
                 unhedged_since = None;
                 last_enqueued = None;
-                prev_abs_net = None;
+                prev_eff_net = None;
                 if !matches!(run_state, RunState::Error) {
                     self.bot_state.write().mark_reconciling();
                 }
                 continue;
             }
 
-            // M3: reset the hard-error clock whenever exposure shrinks (progress),
-            // so a slow-but-working hedge is not punished for latency.
-            let abs_net = net.abs();
-            if let Some(prev) = prev_abs_net {
-                if abs_net + effective_dust < prev {
+            // M3: reset the hard-error clock whenever UNCOVERED exposure shrinks
+            // (progress), so a slow-but-working hedge is not punished for latency.
+            if let Some(prev) = prev_eff_net {
+                if effective_net + effective_dust < prev {
                     unhedged_since = Some(Instant::now());
                 }
             }
-            prev_abs_net = Some(abs_net);
+            prev_eff_net = Some(effective_net);
 
             let first_seen = *unhedged_since.get_or_insert_with(Instant::now);
             let unhedged_for = first_seen.elapsed();
             let usd_exposure = if mid_price > 0.0 {
-                Some(abs_net * mid_price)
+                Some(effective_net * mid_price)
             } else {
                 None
             };
-            let limit_breach = self.exposure_limit_breach(abs_net, usd_exposure, unhedged_for);
+            let limit_breach = self.exposure_limit_breach(effective_net, usd_exposure, unhedged_for);
             {
                 let mut state = self.bot_state.write();
                 if limit_breach {
                     state.set_error(format!(
-                        "Unhedged exposure limit breached: net_base={:.8}, net_usd={}, age_ms={}",
+                        "Unhedged exposure limit breached: net_base={:.8}, uncovered_base={:.8}, net_usd={}, age_ms={}",
                         net,
+                        effective_net,
                         usd_exposure
                             .map(|value| format!("{:.4}", value))
                             .unwrap_or_else(|| "unknown".to_string()),
@@ -180,32 +200,21 @@ impl PositionReconcilerService {
                 }
             }
 
-            // M2: subtract hedge quantity already reserved/in-flight by the primary
-            // hedge path so we only correct the genuinely uncovered exposure.
-            let pending = self.fill_aggregator.total_pending_qty();
-            let effective_net = (abs_net - pending).max(0.0);
-            if effective_net <= effective_dust {
-                debug!(
-                    "[RECONCILER] Net {} is covered by in-flight hedge (pending {}); not enqueuing",
-                    net, pending
-                );
-                continue;
-            }
-
             // M2: hold off until the primary hedge path has had a grace window to land.
             if unhedged_for < Duration::from_millis(self.config.reconciler_grace_ms) {
                 debug!(
-                    "[RECONCILER] Net exposure {} within reconciler grace ({}ms); deferring",
-                    net, self.config.reconciler_grace_ms
+                    "[RECONCILER] Uncovered exposure {} within reconciler grace ({}ms); deferring",
+                    effective_net, self.config.reconciler_grace_ms
                 );
                 continue;
             }
 
             let retry_after = Duration::from_millis(self.config.max_unhedged_ms);
-            if !Self::should_enqueue_residual(last_enqueued, net, effective_dust, retry_after) {
+            if !Self::should_enqueue_residual(last_enqueued, effective_net, effective_dust, retry_after)
+            {
                 debug!(
-                    "[RECONCILER] Net exposure {} remains pending from a recent hedge intent",
-                    net
+                    "[RECONCILER] Uncovered exposure {} remains pending from a recent hedge intent",
+                    effective_net
                 );
                 continue;
             }
@@ -232,7 +241,7 @@ impl PositionReconcilerService {
             );
             match enqueue_hedge_intent(&self.hedge_tx, &self.bot_state, intent).await {
                 Ok(HedgeEnqueueResult::Queued) => {
-                    last_enqueued = Some((net, Instant::now()));
+                    last_enqueued = Some((effective_net, Instant::now()));
                 }
                 Ok(HedgeEnqueueResult::PersistedButNotQueued { reason }) => {
                     warn!("[RECONCILER] Residual hedge was not queued: {}", reason);

@@ -4,14 +4,19 @@ use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
-use crate::services::trade_gate::{GateReason, TradeGate};
+use crate::services::trade_gate::TradeGate;
+
+/// An incarnation that runs at least this long is treated as "healthy", which
+/// resets the restart backoff.
+const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
 
 /// Fail-CLOSED supervisor.
 ///
 /// For tasks that own a non-clonable resource (e.g. an mpsc `Receiver`) and
 /// therefore cannot be re-created from clones. On exit/panic it latches
-/// `GateReason::ServiceDown` permanently, halting new maker placement until the
-/// process is restarted (the supported recovery path is `run_bot_loop_cargo.sh`).
+/// `ServiceDown` permanently, halting new maker placement until the process is
+/// restarted (the supported recovery path is `run_bot_loop_cargo.sh`). A
+/// restartable task coming back up will NOT clear this latch.
 pub fn spawn_supervised_fail_closed<F>(name: &'static str, trade_gate: Arc<TradeGate>, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -22,7 +27,7 @@ where
             Ok(()) => warn!("[SUPERVISOR] task '{}' exited (fail-closed)", name),
             Err(e) => error!("[SUPERVISOR] task '{}' panicked (fail-closed): {}", name, e),
         }
-        trade_gate.block(GateReason::ServiceDown);
+        trade_gate.latch_service_down();
     });
 }
 
@@ -31,8 +36,6 @@ where
 pub struct RestartPolicy {
     pub base_delay: Duration,
     pub max_delay: Duration,
-    pub max_restarts_in_window: u32,
-    pub window: Duration,
 }
 
 impl Default for RestartPolicy {
@@ -40,8 +43,6 @@ impl Default for RestartPolicy {
         Self {
             base_delay: Duration::from_millis(200),
             max_delay: Duration::from_secs(30),
-            max_restarts_in_window: 8,
-            window: Duration::from_secs(60),
         }
     }
 }
@@ -61,14 +62,15 @@ impl RestartPolicy {
 ///
 /// For tasks reconstructable from cheap clones (`Arc`/`Config`/clonable config).
 /// `factory` produces a fresh future each incarnation. On exit or panic we log,
-/// back off, and re-invoke the factory.
+/// mark the task down on the trade gate (which blocks new placement while it is
+/// down), back off, mark it up, and re-invoke the factory.
 ///
-/// `GateReason::ServiceDown` is treated as *transient* here: it is blocked while
-/// the task is not running (during the backoff gap) and cleared right before the
-/// next incarnation starts. This is safe because price/fill health is independently
-/// gated by `QuoteStale`/`PriceWsDown`/`FillWsDown`. If the task crash-loops past
-/// `max_restarts_in_window`, `ServiceDown` is latched (while still retrying slowly)
-/// until an incarnation runs longer than `window` (the "recovered" signal).
+/// `ServiceDown` is refcounted on the gate, so this task's recovery never clears
+/// a fail-closed task's latch, and two restartable tasks do not clear each
+/// other. Downtime is bounded by the backoff; there is no permanent latch for a
+/// restartable task (a chronically broken one simply keeps retrying every
+/// `max_delay` while quoting stays blocked during each gap). A run that lasts at
+/// least `HEALTHY_UPTIME` resets the backoff.
 pub fn spawn_supervised_with_factory<Fut, Mk>(
     name: &'static str,
     trade_gate: Arc<TradeGate>,
@@ -80,56 +82,31 @@ pub fn spawn_supervised_with_factory<Fut, Mk>(
 {
     tokio::spawn(async move {
         let mut consecutive: u32 = 0;
-        let mut window_start = Instant::now();
-        let mut restarts_in_window: u32 = 0;
-        let mut latched = false;
-
         loop {
             let started = Instant::now();
+            // Run one incarnation under an inner spawn so a panic is catchable
+            // (handle.await returns Err on panic) and triggers a restart.
             let handle = tokio::spawn(factory());
             match handle.await {
                 Ok(()) => warn!("[SUPERVISOR] task '{}' exited; restarting", name),
                 Err(e) => error!("[SUPERVISOR] task '{}' panicked; restarting: {}", name, e),
             }
 
-            // A long-lived incarnation is the "recovered" signal: reset counters
-            // and clear any latch.
-            if started.elapsed() >= policy.window {
+            // A sufficiently long-lived incarnation is the "healthy" signal:
+            // reset the backoff so a venue that reconnects after hours does not
+            // start at max_delay.
+            if started.elapsed() >= HEALTHY_UPTIME {
                 consecutive = 0;
-                restarts_in_window = 0;
-                window_start = Instant::now();
-                if latched {
-                    latched = false;
-                    trade_gate.allow(GateReason::ServiceDown);
-                }
             }
 
-            // Rolling-window crash-loop accounting.
-            if window_start.elapsed() > policy.window {
-                window_start = Instant::now();
-                restarts_in_window = 0;
-            }
-            restarts_in_window += 1;
-            if restarts_in_window > policy.max_restarts_in_window && !latched {
-                error!(
-                    "[SUPERVISOR] task '{}' exceeded {} restarts in {:?}; latching ServiceDown",
-                    name, policy.max_restarts_in_window, policy.window
-                );
-                latched = true;
-            }
-
-            // Bounded exponential backoff. Mark down while not running.
             let delay = policy.backoff(consecutive);
             consecutive = consecutive.saturating_add(1);
-            trade_gate.block(GateReason::ServiceDown);
-            tokio::time::sleep(delay).await;
 
+            // Block quoting only while the task is actually down (the backoff gap).
+            trade_gate.mark_service_down();
+            tokio::time::sleep(delay).await;
+            trade_gate.mark_service_up();
             info!("[SUPERVISOR] restarting task '{}' after {:?}", name, delay);
-            // Clear the transient down-flag before re-spawning unless we are in a
-            // crash-loop latch (then it stays blocked until a stable run clears it).
-            if !latched {
-                trade_gate.allow(GateReason::ServiceDown);
-            }
         }
     });
 }
@@ -137,14 +114,13 @@ pub fn spawn_supervised_with_factory<Fut, Mk>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::trade_gate::GateReason;
 
     #[test]
     fn backoff_is_exponential_and_capped() {
         let policy = RestartPolicy {
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(5),
-            max_restarts_in_window: 8,
-            window: Duration::from_secs(60),
         };
         assert_eq!(policy.backoff(0), Duration::from_millis(100));
         assert_eq!(policy.backoff(1), Duration::from_millis(200));
@@ -154,12 +130,47 @@ mod tests {
         assert_eq!(policy.backoff(u32::MAX), Duration::from_secs(5));
     }
 
+    #[test]
+    fn restartable_recovery_does_not_clear_failclosed_latch() {
+        // A fail-closed task latches ServiceDown permanently.
+        let gate = TradeGate::new();
+        gate.latch_service_down();
+        assert!(gate.is_blocked(GateReason::ServiceDown));
+
+        // A restartable task going down then up must NOT clear the latch.
+        gate.mark_service_down();
+        gate.mark_service_up();
+        assert!(
+            gate.is_blocked(GateReason::ServiceDown),
+            "fail-closed latch must survive a restartable task's recovery"
+        );
+    }
+
+    #[test]
+    fn service_down_is_refcounted_across_restartable_tasks() {
+        let gate = TradeGate::new();
+        gate.allow(GateReason::ServiceDown); // start clear
+        // Two restartable tasks down.
+        gate.mark_service_down();
+        gate.mark_service_down();
+        assert!(gate.is_blocked(GateReason::ServiceDown));
+        // One recovers: still blocked because the other is down.
+        gate.mark_service_up();
+        assert!(gate.is_blocked(GateReason::ServiceDown));
+        // Both recovered: cleared.
+        gate.mark_service_up();
+        assert!(!gate.is_blocked(GateReason::ServiceDown));
+        // Extra mark_service_up must not underflow / spuriously toggle.
+        gate.mark_service_up();
+        assert!(!gate.is_blocked(GateReason::ServiceDown));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn factory_restarts_after_panic_and_clears_service_down() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let gate = TradeGate::new();
-        gate.block(GateReason::ServiceDown);
+        gate.allow(GateReason::ServiceDown);
         let runs = Arc::new(AtomicU32::new(0));
 
         {
@@ -170,8 +181,6 @@ mod tests {
                 RestartPolicy {
                     base_delay: Duration::from_millis(10),
                     max_delay: Duration::from_millis(50),
-                    max_restarts_in_window: 8,
-                    window: Duration::from_millis(200),
                 },
                 move || {
                     let runs = runs.clone();
@@ -180,20 +189,18 @@ mod tests {
                         if n == 0 {
                             panic!("first incarnation fails");
                         }
-                        // Second+ incarnation: run "forever".
                         futures_util::future::pending::<()>().await;
                     }
                 },
             );
         }
 
-        // Let the first incarnation panic and the supervisor back off + restart.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             runs.load(Ordering::Acquire) >= 2,
             "task should have restarted after panic"
         );
-        // A healthy restarted task clears the transient ServiceDown gate.
+        // The restarted (healthy) task is up, so ServiceDown is cleared.
         assert!(!gate.is_blocked(GateReason::ServiceDown));
     }
 }

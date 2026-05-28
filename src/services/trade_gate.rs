@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +62,14 @@ const INITIAL_REASONS: u64 = GateReason::OpenOrderUnknown.bit()
 pub struct TradeGate {
     reasons: AtomicU64,
     pub last_cancel_ns: AtomicU64,
+    /// Count of restartable supervised tasks currently down (in backoff). The
+    /// `ServiceDown` reason bit is held while this is > 0. Refcounted so one
+    /// task coming back up does not clear another's down state.
+    service_down: AtomicU32,
+    /// Set permanently when a fail-closed task (one owning a non-recreatable
+    /// resource) dies. Keeps `ServiceDown` latched regardless of `service_down`,
+    /// so a restartable task's recovery can never silently un-halt the bot.
+    service_down_latched: AtomicBool,
 }
 
 impl TradeGate {
@@ -69,6 +77,8 @@ impl TradeGate {
         Arc::new(Self {
             reasons: AtomicU64::new(INITIAL_REASONS),
             last_cancel_ns: AtomicU64::new(0),
+            service_down: AtomicU32::new(0),
+            service_down_latched: AtomicBool::new(false),
         })
     }
 
@@ -104,6 +114,37 @@ impl TradeGate {
     #[inline]
     pub fn mark_cancel_now(&self) {
         self.last_cancel_ns.store(now_ns(), Ordering::Release);
+    }
+
+    /// A restartable supervised task has gone down (entering backoff). Holds the
+    /// `ServiceDown` gate while at least one such task is down.
+    pub fn mark_service_down(&self) {
+        self.service_down.fetch_add(1, Ordering::AcqRel);
+        self.block(GateReason::ServiceDown);
+    }
+
+    /// A restartable supervised task has come back up. Clears `ServiceDown` only
+    /// when no restartable task remains down AND no fail-closed latch is set.
+    pub fn mark_service_up(&self) {
+        // Saturating so concurrent decrements can never underflow.
+        let _ = self.service_down.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |c| Some(c.saturating_sub(1)),
+        );
+        if self.service_down.load(Ordering::Acquire) == 0
+            && !self.service_down_latched.load(Ordering::Acquire)
+        {
+            self.allow(GateReason::ServiceDown);
+        }
+    }
+
+    /// A fail-closed task (owns a non-recreatable resource such as an mpsc
+    /// Receiver) has died. Latch `ServiceDown` permanently — only a process
+    /// restart recovers. A restartable task's `mark_service_up` will not clear it.
+    pub fn latch_service_down(&self) {
+        self.service_down_latched.store(true, Ordering::Release);
+        self.block(GateReason::ServiceDown);
     }
 
     #[inline]
@@ -207,6 +248,8 @@ impl Default for TradeGate {
         Self {
             reasons: AtomicU64::new(INITIAL_REASONS),
             last_cancel_ns: AtomicU64::new(0),
+            service_down: AtomicU32::new(0),
+            service_down_latched: AtomicBool::new(false),
         }
     }
 }
