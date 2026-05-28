@@ -42,7 +42,7 @@ use crate::services::{
     price_source::{PricePollService, PriceStreamService},
     rest_fill_detection::RestFillDetectionService,
     safety_monitor::SafetyMonitorService,
-    supervisor::spawn_supervised,
+    supervisor::{spawn_supervised_fail_closed, spawn_supervised_with_factory, RestartPolicy},
     trade_gate::{GateReason, TradeGate},
     HedgeEnqueueResult, HedgeIntent,
 };
@@ -470,40 +470,67 @@ impl XemmBot {
         // SPAWN ALL SERVICES
         // ===================================================
 
-        // Service 1: Pacifica Orderbook (WebSocket, via generic PriceStreamService)
-        let pacifica_ob_client = PacOrderbookClient::new(PacOrderbookConfig {
-            symbol: self.config.symbol.clone(),
-            agg_level: self.config.agg_level,
-            reconnect_attempts: self.config.reconnect_attempts,
-            ping_interval_secs: self.config.ping_interval_secs,
-        })
-        .context("Failed to create Pacifica orderbook client")?;
-        spawn_supervised(
-            "pacifica_price_stream",
-            self.trade_gate.clone(),
-            PriceStreamService {
-                client: pacifica_ob_client,
-                prices: self.pacifica_prices.clone(),
-            }
-            .run(),
-        );
+        // Service 1: Pacifica Orderbook (WebSocket, restartable via factory).
+        {
+            let ob_cfg = PacOrderbookConfig {
+                symbol: self.config.symbol.clone(),
+                agg_level: self.config.agg_level,
+                reconnect_attempts: self.config.reconnect_attempts,
+                ping_interval_secs: self.config.ping_interval_secs,
+            };
+            // Fail fast on an invalid config at startup; the factory rebuilds the
+            // (non-Clone) client from this Clone config on every restart.
+            PacOrderbookClient::new(ob_cfg.clone())
+                .context("Failed to create Pacifica orderbook client")?;
+            let prices = self.pacifica_prices.clone();
+            spawn_supervised_with_factory(
+                "pacifica_price_stream",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let prices = prices.clone();
+                    let ob_cfg = ob_cfg.clone();
+                    async move {
+                        match PacOrderbookClient::new(ob_cfg) {
+                            Ok(client) => PriceStreamService { client, prices }.run().await,
+                            Err(e) => {
+                                tracing::error!("[pacifica_price_stream] client build failed: {}", e)
+                            }
+                        }
+                    }
+                },
+            );
+        }
 
-        // Service 2: Hyperliquid Orderbook (WebSocket, via generic PriceStreamService)
-        let hyperliquid_ob_client = HlOrderbookClient::new(HlOrderbookConfig {
-            coin: self.config.symbol.clone(),
-            reconnect_attempts: self.config.reconnect_attempts,
-            ping_interval_secs: self.config.ping_interval_secs,
-        })
-        .context("Failed to create Hyperliquid orderbook client")?;
-        spawn_supervised(
-            "hyperliquid_price_stream",
-            self.trade_gate.clone(),
-            PriceStreamService {
-                client: hyperliquid_ob_client,
-                prices: self.hyperliquid_prices.clone(),
-            }
-            .run(),
-        );
+        // Service 2: Hyperliquid Orderbook (WebSocket, restartable via factory).
+        {
+            let ob_cfg = HlOrderbookConfig {
+                coin: self.config.symbol.clone(),
+                reconnect_attempts: self.config.reconnect_attempts,
+                ping_interval_secs: self.config.ping_interval_secs,
+            };
+            HlOrderbookClient::new(ob_cfg.clone())
+                .context("Failed to create Hyperliquid orderbook client")?;
+            let prices = self.hyperliquid_prices.clone();
+            spawn_supervised_with_factory(
+                "hyperliquid_price_stream",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let prices = prices.clone();
+                    let ob_cfg = ob_cfg.clone();
+                    async move {
+                        match HlOrderbookClient::new(ob_cfg) {
+                            Ok(client) => PriceStreamService { client, prices }.run().await,
+                            Err(e) => tracing::error!(
+                                "[hyperliquid_price_stream] client build failed: {}",
+                                e
+                            ),
+                        }
+                    }
+                },
+            );
+        }
         let fill_config = FillDetectionConfig {
             account: self.pacifica_credentials.account.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
@@ -528,8 +555,10 @@ impl XemmBot {
             config: self.config.clone(),
         });
         {
+            // Fail-closed: owns the cancel-intent Receiver, which cannot be
+            // reconstructed without re-wiring every producer's Sender.
             let cancel_manager = cancel_manager.clone();
-            spawn_supervised("cancel_manager", self.trade_gate.clone(), async move {
+            spawn_supervised_fail_closed("cancel_manager", self.trade_gate.clone(), async move {
                 cancel_manager.run(cancel_rx).await;
             });
         }
@@ -549,40 +578,71 @@ impl XemmBot {
             order_snapshot: self.order_snapshot.clone(),
             low_latency_mode: self.config.low_latency_mode,
         };
-        spawn_supervised("fill_detection", self.trade_gate.clone(), async move {
+        // Fail-closed for now: the FillDetectionClient is non-Clone and its
+        // ready_flag/baseline_updater are captured by wait_for_startup_readiness
+        // and safety_monitor before spawn, so a naive restart would publish
+        // readiness to a flag those consumers don't observe. Making it restartable
+        // requires injecting long-lived Arc flags into FillDetectionClient::new
+        // (tracked as a follow-up in MEGA_FIX_PLAN_5).
+        spawn_supervised_fail_closed("fill_detection", self.trade_gate.clone(), async move {
             fill_service.run().await;
         });
 
-        // Service 4: Pacifica REST Poll (price redundancy, via generic PricePollService)
-        spawn_supervised(
-            "pacifica_price_poll",
-            self.trade_gate.clone(),
-            PricePollService {
-                source: Arc::new(PacificaPoller {
-                    trading: self.pacifica_trading.clone(),
-                    symbol: self.config.symbol.clone(),
-                    agg_level: self.config.agg_level,
-                }),
-                prices: self.pacifica_prices.clone(),
-                interval_secs: self.config.pacifica_rest_poll_interval_secs,
-            }
-            .run(),
-        );
+        // Service 4: Pacifica REST Poll (price redundancy, restartable via factory).
+        {
+            let trading = self.pacifica_trading.clone();
+            let symbol = self.config.symbol.clone();
+            let agg_level = self.config.agg_level;
+            let prices = self.pacifica_prices.clone();
+            let interval_secs = self.config.pacifica_rest_poll_interval_secs;
+            spawn_supervised_with_factory(
+                "pacifica_price_poll",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let (trading, symbol, prices) =
+                        (trading.clone(), symbol.clone(), prices.clone());
+                    async move {
+                        PricePollService {
+                            source: Arc::new(PacificaPoller {
+                                trading,
+                                symbol,
+                                agg_level,
+                            }),
+                            prices,
+                            interval_secs,
+                        }
+                        .run()
+                        .await
+                    }
+                },
+            );
+        }
 
-        // Service 4.5: Hyperliquid REST Poll (price redundancy, via generic PricePollService)
-        spawn_supervised(
-            "hyperliquid_price_poll",
-            self.trade_gate.clone(),
-            PricePollService {
-                source: Arc::new(HyperliquidPoller {
-                    trading: self.hyperliquid_trading.clone(),
-                    symbol: self.config.symbol.clone(),
-                }),
-                prices: self.hyperliquid_prices.clone(),
-                interval_secs: 2,
-            }
-            .run(),
-        );
+        // Service 4.5: Hyperliquid REST Poll (price redundancy, restartable via factory).
+        {
+            let trading = self.hyperliquid_trading.clone();
+            let symbol = self.config.symbol.clone();
+            let prices = self.hyperliquid_prices.clone();
+            spawn_supervised_with_factory(
+                "hyperliquid_price_poll",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let (trading, symbol, prices) =
+                        (trading.clone(), symbol.clone(), prices.clone());
+                    async move {
+                        PricePollService {
+                            source: Arc::new(HyperliquidPoller { trading, symbol }),
+                            prices,
+                            interval_secs: 2,
+                        }
+                        .run()
+                        .await
+                    }
+                },
+            );
+        }
 
         // Wait for initial orderbook and fill-stream readiness.
         info!(
@@ -593,53 +653,103 @@ impl XemmBot {
             .await
             .context("Startup readiness gate failed")?;
 
-        // Service 5: REST Fill Detection (backup)
-        let rest_fill_service = RestFillDetectionService {
-            bot_state: self.bot_state.clone(),
-            hedge_tx: self.hedge_tx.clone(),
-            cancel_tx: cancel_tx.clone(),
-            cancel_demand: cancel_demand.clone(),
-            pacifica_trading: self.pacifica_trading.clone(),
-            symbol: self.config.symbol.clone(),
-            processed_fills: self.processed_fills.clone(),
-            fill_aggregator: self.fill_aggregator.clone(),
-            min_hedge_notional: self.config.partial_hedge_min_notional_usd,
-            poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
-            low_latency_mode: self.config.low_latency_mode,
-        };
-        spawn_supervised("rest_fill_detection", self.trade_gate.clone(), async move {
-            rest_fill_service.run().await;
-        });
+        // Service 5: REST Fill Detection (backup, restartable via factory).
+        {
+            let bot_state = self.bot_state.clone();
+            let hedge_tx = self.hedge_tx.clone();
+            let cancel_tx = cancel_tx.clone();
+            let cancel_demand = cancel_demand.clone();
+            let pacifica_trading = self.pacifica_trading.clone();
+            let symbol = self.config.symbol.clone();
+            let processed_fills = self.processed_fills.clone();
+            let fill_aggregator = self.fill_aggregator.clone();
+            let min_hedge_notional = self.config.partial_hedge_min_notional_usd;
+            let poll_interval_ms = self.config.pacifica_active_order_rest_poll_interval_ms;
+            let low_latency_mode = self.config.low_latency_mode;
+            spawn_supervised_with_factory(
+                "rest_fill_detection",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let service = RestFillDetectionService {
+                        bot_state: bot_state.clone(),
+                        hedge_tx: hedge_tx.clone(),
+                        cancel_tx: cancel_tx.clone(),
+                        cancel_demand: cancel_demand.clone(),
+                        pacifica_trading: pacifica_trading.clone(),
+                        symbol: symbol.clone(),
+                        processed_fills: processed_fills.clone(),
+                        fill_aggregator: fill_aggregator.clone(),
+                        min_hedge_notional,
+                        poll_interval_ms,
+                        low_latency_mode,
+                    };
+                    async move { service.run().await }
+                },
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Service 5.5: Position Monitor (ground truth) - shares the single Pacifica client.
-        let position_monitor_service = PositionMonitorService {
-            bot_state: self.bot_state.clone(),
-            hedge_tx: self.hedge_tx.clone(),
-            cancel_tx: cancel_tx.clone(),
-            cancel_demand: cancel_demand.clone(),
-            pacifica_trading: self.pacifica_trading.clone(),
-            symbol: self.config.symbol.clone(),
-            processed_fills: self.processed_fills.clone(),
-            fill_aggregator: self.fill_aggregator.clone(),
-            last_position_snapshot: self.last_position_snapshot.clone(),
-            low_latency_mode: self.config.low_latency_mode,
-        };
-        spawn_supervised("position_monitor", self.trade_gate.clone(), async move {
-            position_monitor_service.run().await;
-        });
+        // Service 5.5: Position Monitor (ground truth, restartable via factory).
+        {
+            let bot_state = self.bot_state.clone();
+            let hedge_tx = self.hedge_tx.clone();
+            let cancel_tx = cancel_tx.clone();
+            let cancel_demand = cancel_demand.clone();
+            let pacifica_trading = self.pacifica_trading.clone();
+            let symbol = self.config.symbol.clone();
+            let processed_fills = self.processed_fills.clone();
+            let fill_aggregator = self.fill_aggregator.clone();
+            let last_position_snapshot = self.last_position_snapshot.clone();
+            let low_latency_mode = self.config.low_latency_mode;
+            spawn_supervised_with_factory(
+                "position_monitor",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let service = PositionMonitorService {
+                        bot_state: bot_state.clone(),
+                        hedge_tx: hedge_tx.clone(),
+                        cancel_tx: cancel_tx.clone(),
+                        cancel_demand: cancel_demand.clone(),
+                        pacifica_trading: pacifica_trading.clone(),
+                        symbol: symbol.clone(),
+                        processed_fills: processed_fills.clone(),
+                        fill_aggregator: fill_aggregator.clone(),
+                        last_position_snapshot: last_position_snapshot.clone(),
+                        low_latency_mode,
+                    };
+                    async move { service.run().await }
+                },
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let position_reconciler_service = PositionReconcilerService {
-            bot_state: self.bot_state.clone(),
-            hedge_tx: self.hedge_tx.clone(),
-            pacifica_trading: self.pacifica_trading.clone(),
-            hyperliquid_trading: self.hyperliquid_trading.clone(),
-            config: self.config.clone(),
-        };
-        spawn_supervised("position_reconciler", self.trade_gate.clone(), async move {
-            position_reconciler_service.run().await;
-        });
+        // Position Reconciler (slow net-exposure safety loop, restartable via factory).
+        {
+            let bot_state = self.bot_state.clone();
+            let hedge_tx = self.hedge_tx.clone();
+            let pacifica_trading = self.pacifica_trading.clone();
+            let hyperliquid_trading = self.hyperliquid_trading.clone();
+            let fill_aggregator = self.fill_aggregator.clone();
+            let config = self.config.clone();
+            spawn_supervised_with_factory(
+                "position_reconciler",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let service = PositionReconcilerService {
+                        bot_state: bot_state.clone(),
+                        hedge_tx: hedge_tx.clone(),
+                        pacifica_trading: pacifica_trading.clone(),
+                        hyperliquid_trading: hyperliquid_trading.clone(),
+                        fill_aggregator: fill_aggregator.clone(),
+                        config: config.clone(),
+                    };
+                    async move { service.run().await }
+                },
+            );
+        }
 
         // Service 6: Order Monitor (age/profit monitoring)
         let order_monitor_service = OrderMonitorService::new(
@@ -656,23 +766,43 @@ impl XemmBot {
         let order_monitor_service = Arc::new(order_monitor_service);
         spawn_monitor_tasks(order_monitor_service);
 
-        let safety_monitor = SafetyMonitorService {
-            bot_state: self.bot_state.clone(),
-            atomic_status: self.atomic_status.clone(),
-            order_snapshot: self.order_snapshot.clone(),
-            trade_gate: self.trade_gate.clone(),
-            pacifica_trading: self.pacifica_trading.clone(),
-            hyperliquid_trading: self.hyperliquid_trading.clone(),
-            pacifica_prices: self.pacifica_prices.clone(),
-            hyperliquid_prices: self.hyperliquid_prices.clone(),
-            fill_ws_ready: fill_ws_ready.clone(),
-            fill_aggregator: self.fill_aggregator.clone(),
-            hedge_tx: self.hedge_tx.clone(),
-            config: self.config.clone(),
-        };
-        spawn_supervised("safety_monitor", self.trade_gate.clone(), async move {
-            safety_monitor.run().await;
-        });
+        // Safety Monitor (health/gate updater, restartable via factory).
+        {
+            let bot_state = self.bot_state.clone();
+            let atomic_status = self.atomic_status.clone();
+            let order_snapshot = self.order_snapshot.clone();
+            let gate = self.trade_gate.clone();
+            let pacifica_trading = self.pacifica_trading.clone();
+            let hyperliquid_trading = self.hyperliquid_trading.clone();
+            let pacifica_prices = self.pacifica_prices.clone();
+            let hyperliquid_prices = self.hyperliquid_prices.clone();
+            let fill_ws_ready = fill_ws_ready.clone();
+            let fill_aggregator = self.fill_aggregator.clone();
+            let hedge_tx = self.hedge_tx.clone();
+            let config = self.config.clone();
+            spawn_supervised_with_factory(
+                "safety_monitor",
+                self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                    let service = SafetyMonitorService {
+                        bot_state: bot_state.clone(),
+                        atomic_status: atomic_status.clone(),
+                        order_snapshot: order_snapshot.clone(),
+                        trade_gate: gate.clone(),
+                        pacifica_trading: pacifica_trading.clone(),
+                        hyperliquid_trading: hyperliquid_trading.clone(),
+                        pacifica_prices: pacifica_prices.clone(),
+                        hyperliquid_prices: hyperliquid_prices.clone(),
+                        fill_ws_ready: fill_ws_ready.clone(),
+                        fill_aggregator: fill_aggregator.clone(),
+                        hedge_tx: hedge_tx.clone(),
+                        config: config.clone(),
+                    };
+                    async move { service.run().await }
+                },
+            );
+        }
 
         // Background: aggregator idle-flush + GC (1 Hz). Catches partials that
         // never received a terminal event and evicts emitted entries older than
@@ -681,9 +811,14 @@ impl XemmBot {
             let aggregator = self.fill_aggregator.clone();
             let hedge_tx = self.hedge_tx.clone();
             let bot_state = self.bot_state.clone();
-            spawn_supervised(
+            spawn_supervised_with_factory(
                 "fill_aggregator_flush",
                 self.trade_gate.clone(),
+                RestartPolicy::default(),
+                move || {
+                let aggregator = aggregator.clone();
+                let hedge_tx = hedge_tx.clone();
+                let bot_state = bot_state.clone();
                 async move {
                     let mut ticker = tokio::time::interval(Duration::from_secs(1));
                     loop {
@@ -717,6 +852,7 @@ impl XemmBot {
                         }
                         aggregator.gc(Duration::from_secs(300));
                     }
+                }
                 },
             );
         }
@@ -730,7 +866,8 @@ impl XemmBot {
             pacifica_trading: self.pacifica_trading.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
         };
-        spawn_supervised("post_trade_auditor", self.trade_gate.clone(), async move {
+        // Fail-closed: owns the audit-event Receiver, which cannot be reconstructed.
+        spawn_supervised_fail_closed("post_trade_auditor", self.trade_gate.clone(), async move {
             post_trade_auditor.run().await;
         });
 
@@ -762,7 +899,11 @@ impl XemmBot {
         );
         info!("");
 
+        // 1 kHz evaluation cadence. Skip (don't burst) missed ticks: the body
+        // awaits REST/WS placement I/O, and bursting accumulated ticks afterward
+        // would spin the CPU without improving reaction time.
         let mut eval_interval = interval(Duration::from_millis(1));
+        eval_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let rate_limits = RateLimitBook::new();
 
         let sigint = signal::ctrl_c();
@@ -1306,6 +1447,17 @@ impl XemmBot {
                     self.trade_gate.block(GateReason::NetExposure);
                     let mut state = self.bot_state.write();
                     state.mark_reconciling();
+                } else {
+                    // Exposure is already flat: the file is stale, clear it so it
+                    // does not get re-checked on every future startup.
+                    if tokio::fs::remove_file(path).await.is_ok() {
+                        info!(
+                            "{} {} Cleared stale unresolved-exposure file (live net {:.8} within dust)",
+                            tag_static("INIT", Color::Cyan),
+                            "OK".green().bold(),
+                            net
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -1400,7 +1552,7 @@ impl XemmBot {
 
         let hyperliquid_state = self
             .hyperliquid_trading
-            .get_user_state(&self.hyperliquid_trading.get_wallet_address())
+            .get_user_state(&self.hyperliquid_trading.account_address())
             .await?;
         let hyperliquid_position = hyperliquid_state
             .asset_positions

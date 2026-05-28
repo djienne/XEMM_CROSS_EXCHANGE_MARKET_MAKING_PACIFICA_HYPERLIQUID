@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
 use crate::market_rules::{fallback_rules, is_dust_or_below_min};
+use crate::services::fill_aggregator::FillAggregator;
 use crate::services::{
     enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
 };
@@ -22,6 +23,7 @@ pub struct PositionReconcilerService {
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
+    pub fill_aggregator: Arc<FillAggregator>,
     pub config: Config,
 }
 
@@ -30,8 +32,12 @@ impl PositionReconcilerService {
         let mut ticker = tokio::time::interval(Duration::from_millis(1000));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let seq = AtomicU64::new(0);
+        // `unhedged_since` measures *continuous, non-decreasing* unhedged exposure
+        // age; it is reset whenever exposure shrinks (progress) so a slow-but-
+        // working hedge is not punished toward the hard-error ceiling.
         let mut unhedged_since: Option<Instant> = None;
         let mut last_enqueued: Option<(f64, Instant)> = None;
+        let mut prev_abs_net: Option<f64> = None;
 
         loop {
             ticker.tick().await;
@@ -63,10 +69,17 @@ impl PositionReconcilerService {
                 }
             };
 
+            let rules = fallback_rules(&self.config.symbol);
+            // L1: a residual below the exchange minimum order size cannot be
+            // neutralized on-venue, so treat anything within max(dust, min_size)
+            // as effectively neutral for control flow.
+            let effective_dust = self.config.neutral_dust_base.max(rules.min_size);
+
             let net = pac_pos + hl_pos;
-            if net.abs() <= self.config.neutral_dust_base {
+            if net.abs() <= effective_dust {
                 unhedged_since = None;
                 last_enqueued = None;
+                prev_abs_net = None;
                 let can_complete = {
                     let state = self.bot_state.read();
                     state.active_order.is_none()
@@ -106,10 +119,51 @@ impl PositionReconcilerService {
                 continue;
             }
 
+            // M2: while the primary hedge path is actively executing, do not race
+            // it with a duplicate corrective hedge. The exposure timer keeps
+            // running so a genuinely stuck hedge still escalates.
+            if run_state == RunState::Hedging {
+                debug!("[RECONCILER] Hedge in progress; deferring corrective hedge this tick");
+                continue;
+            }
+
+            let mid_price = self.estimate_mid_price().await.unwrap_or(0.0);
+
+            // L1: unhedgeable sub-min residual. Surface it but do NOT escalate to a
+            // terminal error or enqueue a doomed order; reset the timer so it does
+            // not accumulate toward the hard limit.
+            if is_dust_or_below_min(net, mid_price, rules, effective_dust) {
+                warn!(
+                    "[RECONCILER] Net exposure {} is below {} exchange min/min-notional; cannot auto-hedge (operator action may be required)",
+                    net, self.config.symbol
+                );
+                unhedged_since = None;
+                last_enqueued = None;
+                prev_abs_net = None;
+                if !matches!(run_state, RunState::Error) {
+                    self.bot_state.write().mark_reconciling();
+                }
+                continue;
+            }
+
+            // M3: reset the hard-error clock whenever exposure shrinks (progress),
+            // so a slow-but-working hedge is not punished for latency.
+            let abs_net = net.abs();
+            if let Some(prev) = prev_abs_net {
+                if abs_net + effective_dust < prev {
+                    unhedged_since = Some(Instant::now());
+                }
+            }
+            prev_abs_net = Some(abs_net);
+
             let first_seen = *unhedged_since.get_or_insert_with(Instant::now);
             let unhedged_for = first_seen.elapsed();
-            let usd_exposure = self.estimate_usd_exposure(net.abs()).await;
-            let limit_breach = self.exposure_limit_breach(net.abs(), usd_exposure, unhedged_for);
+            let usd_exposure = if mid_price > 0.0 {
+                Some(abs_net * mid_price)
+            } else {
+                None
+            };
+            let limit_breach = self.exposure_limit_breach(abs_net, usd_exposure, unhedged_for);
             {
                 let mut state = self.bot_state.write();
                 if limit_breach {
@@ -126,29 +180,31 @@ impl PositionReconcilerService {
                 }
             }
 
-            let retry_after = Duration::from_millis(self.config.max_unhedged_ms);
-            if !Self::should_enqueue_residual(
-                last_enqueued,
-                net,
-                self.config.neutral_dust_base,
-                retry_after,
-            ) {
+            // M2: subtract hedge quantity already reserved/in-flight by the primary
+            // hedge path so we only correct the genuinely uncovered exposure.
+            let pending = self.fill_aggregator.total_pending_qty();
+            let effective_net = (abs_net - pending).max(0.0);
+            if effective_net <= effective_dust {
                 debug!(
-                    "[RECONCILER] Net exposure {} remains pending from a recent hedge intent",
-                    net
+                    "[RECONCILER] Net {} is covered by in-flight hedge (pending {}); not enqueuing",
+                    net, pending
                 );
                 continue;
             }
 
-            let mid_price = self.estimate_mid_price().await.unwrap_or(0.0);
-            if is_dust_or_below_min(
-                net,
-                mid_price,
-                fallback_rules(&self.config.symbol),
-                self.config.neutral_dust_base,
-            ) {
+            // M2: hold off until the primary hedge path has had a grace window to land.
+            if unhedged_for < Duration::from_millis(self.config.reconciler_grace_ms) {
                 debug!(
-                    "[RECONCILER] Net exposure {} is below exchange min/dust after rounding",
+                    "[RECONCILER] Net exposure {} within reconciler grace ({}ms); deferring",
+                    net, self.config.reconciler_grace_ms
+                );
+                continue;
+            }
+
+            let retry_after = Duration::from_millis(self.config.max_unhedged_ms);
+            if !Self::should_enqueue_residual(last_enqueued, net, effective_dust, retry_after) {
+                debug!(
+                    "[RECONCILER] Net exposure {} remains pending from a recent hedge intent",
                     net
                 );
                 continue;
@@ -165,14 +221,14 @@ impl PositionReconcilerService {
                 hedge_seq,
                 HedgeSource::Reconciler,
                 hedge_side,
-                net.abs(),
+                effective_net,
                 0.0,
                 false,
             );
 
             warn!(
-                "[RECONCILER] Net exposure {} exceeds dust {}; queued residual hedge {}",
-                net, self.config.neutral_dust_base, intent.size
+                "[RECONCILER] Net exposure {} exceeds dust {} (pending {}); queued residual hedge {}",
+                net, effective_dust, pending, intent.size
             );
             match enqueue_hedge_intent(&self.hedge_tx, &self.bot_state, intent).await {
                 Ok(HedgeEnqueueResult::Queued) => {
@@ -194,11 +250,13 @@ impl PositionReconcilerService {
         usd_exposure: Option<f64>,
         unhedged_for: Duration,
     ) -> bool {
+        // M3: base/USD ceilings escalate immediately; the time ceiling uses the
+        // larger hard limit so a slow-but-progressing hedge stays in Reconciling.
         (self.config.max_unhedged_base > 0.0 && abs_base > self.config.max_unhedged_base)
             || usd_exposure
                 .map(|usd| self.config.max_unhedged_usd > 0.0 && usd > self.config.max_unhedged_usd)
                 .unwrap_or(false)
-            || unhedged_for >= Duration::from_millis(self.config.max_unhedged_ms)
+            || unhedged_for >= Duration::from_millis(self.config.max_unhedged_hard_ms)
     }
 
     fn should_enqueue_residual(
@@ -211,10 +269,6 @@ impl PositionReconcilerService {
             return true;
         };
         (net - last_net).abs() > dust || last_at.elapsed() >= retry_after
-    }
-
-    async fn estimate_usd_exposure(&self, abs_base: f64) -> Option<f64> {
-        self.estimate_mid_price().await.map(|mid| abs_base * mid)
     }
 
     async fn estimate_mid_price(&self) -> Option<f64> {
@@ -245,8 +299,7 @@ impl PositionReconcilerService {
     }
 
     async fn hyperliquid_position(&self) -> anyhow::Result<f64> {
-        let wallet = std::env::var("HL_WALLET")
-            .unwrap_or_else(|_| self.hyperliquid_trading.get_wallet_address());
+        let wallet = self.hyperliquid_trading.account_address();
         let user_state = self.hyperliquid_trading.get_user_state(&wallet).await?;
         let Some(pos) = user_state
             .asset_positions

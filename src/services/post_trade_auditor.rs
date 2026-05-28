@@ -143,8 +143,7 @@ impl PostTradeAuditorService {
     }
 
     async fn fetch_hyperliquid_trade(&self) -> trade_fetcher::TradeFetchResult {
-        let hl_wallet = std::env::var("HL_WALLET")
-            .unwrap_or_else(|_| self.hyperliquid_trading.get_wallet_address());
+        let hl_wallet = self.hyperliquid_trading.account_address();
         trade_fetcher::fetch_hyperliquid_fills(
             &self.hyperliquid_trading,
             &hl_wallet,
@@ -476,8 +475,7 @@ impl PostTradeAuditorService {
     }
 
     async fn fetch_hyperliquid_position(&self) -> Option<f64> {
-        let hl_wallet = std::env::var("HL_WALLET")
-            .unwrap_or_else(|_| self.hyperliquid_trading.get_wallet_address());
+        let hl_wallet = self.hyperliquid_trading.account_address();
         for retry in 0..3 {
             if retry > 0 {
                 tokio::time::sleep(Duration::from_secs(3)).await;

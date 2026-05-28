@@ -77,8 +77,8 @@ All methods deduplicate via shared HashSet to ensure only one hedge executes per
 This development branch introduces a low-latency, queue-based hedge pipeline and WebSocket-based Hyperliquid execution:
 
 - **Hedge event queue (non-blocking)**  
-  - All fill-detection layers (`FillDetectionService`, `RestFillDetectionService`, `PositionMonitorService`) act as **producers** and push `HedgeEvent`s into an unbounded Tokio `mpsc` channel.  
-  - Producers never block when enqueuing, so fill detection is not slowed down by hedge execution.
+  - All fill-detection layers (`FillDetectionService`, `RestFillDetectionService`, `PositionMonitorService`) act as **producers** and push `HedgeEvent`s into a **bounded** Tokio `mpsc` channel (capacity 256).  
+  - Producers never block: they use `try_send`, and on the (unexpected) event of a full or closed queue the intent is persisted to a local JSONL file and maker placement is halted via the `Reconciling`/`Error` state, so exposure is never silently dropped.
 
 - **Dedicated hedge executor task**  
   - `HedgeService` runs in its own async task and acts as a **single consumer** of the hedge event queue.  
@@ -100,7 +100,7 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 - OK **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
 - OK **Auto-reconnect** - Exponential backoff on connection failures
 - OK **Concurrent Tasks** - 10 async tasks running in parallel
-- OK **High-frequency Monitoring** - 25ms profit checks, 100ms opportunity evaluation
+- OK **High-frequency Monitoring** - ~1ms (1 kHz) profit checks and opportunity evaluation (gated by quote freshness, rate limits, and run state)
 - OK **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
 - OK **Graceful Shutdown** - Cancels orders on Ctrl+C
 
@@ -114,17 +114,18 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 
 ### 1. Set up credentials
 
-Create a `.env` file with your API credentials:
+Create a `.env` file with your API credentials (see `.env.example`):
 
 ```bash
 # Pacifica credentials
-PACIFICA_API_KEY=your_api_key
-PACIFICA_SECRET_KEY=your_secret_key_base58
-PACIFICA_ACCOUNT=your_account_address
+SOL_WALLET=your_main_wallet_address      # Pacifica account address
+API_PUBLIC=your_agent_wallet_public_key  # Agent (API) wallet public key
+API_PRIVATE=your_agent_wallet_private_key_base58
 
 # Hyperliquid credentials
-HL_WALLET=your_wallet_address
-HL_PRIVATE_KEY=your_private_key_hex
+HL_PRIVATE_KEY=your_private_key_hex      # signing key; the address is derived from it
+HL_WALLET=0xyour_account_address         # optional: account to trade/query if it differs
+                                         # from the key-derived signing wallet (agent wallets)
 ```
 
 ### 2. Configure bot parameters
@@ -231,9 +232,9 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
 6. **REST API Fill Detection** - Backup fill polling (every 500ms)
 7. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
-8. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
+8. **Order Monitoring** - Profit tracking and order refresh (~1ms / 1 kHz)
 9. **Hedge Execution** - Executes Hyperliquid hedge after fill
-10. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
+10. **Main Opportunity Loop** - Evaluates and places orders (~1ms / 1 kHz, gated)
 
 ## Configuration Parameters
 
@@ -258,9 +259,9 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 
 1. **Startup**: Cancel all existing Pacifica orders
 2. **Wait**: Gather initial orderbook data (3s warmup)
-3. **Evaluate**: Check both BUY and SELL opportunities every 100ms
+3. **Evaluate**: Check both BUY and SELL opportunities every ~1ms (1 kHz), gated by quote freshness/rate limits/run state
 4. **Calculate & Place**: Calculate Pacifica limit price from Hyperliquid hedge price with target profit margin (`profit_rate_bps`) embedded, place order if still profitable after rounding
-5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >60s
+5. **Monitor**: Track profit every ~1ms (1 kHz), cancel if deviation >3 bps or age >60s
 6. **Fill Detection**: 5-layer system detects when order fills
    - WebSocket fill detection (primary, real-time via account_order_updates)
    - WebSocket position detection (redundancy, real-time via account_positions)

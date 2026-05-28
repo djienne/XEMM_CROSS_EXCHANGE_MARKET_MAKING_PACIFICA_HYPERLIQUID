@@ -379,6 +379,18 @@ impl FillAggregator {
         });
     }
 
+    /// Total base quantity currently reserved for in-flight hedges across all
+    /// orders. The position reconciler subtracts this from observed net exposure
+    /// so it does not enqueue a duplicate hedge while a primary hedge is still
+    /// executing.
+    pub fn total_pending_qty(&self) -> f64 {
+        self.inner
+            .lock()
+            .values()
+            .map(|state| state.cumulative_hedge_pending.max(0.0))
+            .sum()
+    }
+
     /// Current accumulator count (diagnostic / test use).
     pub fn len(&self) -> usize {
         self.inner.lock().len()
@@ -524,6 +536,21 @@ mod tests {
         assert!((state.residual() - 1.0).abs() < 1e-9);
         let reservation = agg.try_reserve_hedge(1).unwrap();
         assert!((reservation.size - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn total_pending_qty_sums_reserved_across_orders() {
+        let agg = FillAggregator::new(1000.0);
+        // Reserve on two different orders.
+        let a = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        let b = agg.on_fill(2, OrderSide::Sell, 0.5, 100.0, true).unwrap();
+        assert!((a.size - 1.0).abs() < 1e-9);
+        assert!((b.size - 0.5).abs() < 1e-9);
+        assert!((agg.total_pending_qty() - 1.5).abs() < 1e-9);
+
+        // Settling one releases its reservation.
+        agg.settle_hedge(HedgeSettlement::filled(1, 1.0, 1.0));
+        assert!((agg.total_pending_qty() - 0.5).abs() < 1e-9);
     }
 
     #[test]

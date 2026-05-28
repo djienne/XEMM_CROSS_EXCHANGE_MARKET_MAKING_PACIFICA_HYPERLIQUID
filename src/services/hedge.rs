@@ -4,7 +4,7 @@ use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
@@ -15,8 +15,8 @@ use tracing::{debug, error, info, warn};
 use crate::bot::BotState;
 use crate::config::Config;
 use crate::connector::hyperliquid::types::{
-    OrderResponse, OrderResponseContent, OrderStatus, WsPostRequest, WsPostRequestInner,
-    WsPostResponse,
+    OrderResponse, OrderResponseContent, OrderStatus, OrderStatusQuery, WsPostRequest,
+    WsPostRequestInner, WsPostResponse,
 };
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
@@ -145,6 +145,48 @@ impl HedgeService {
                             );
                             ws_write = None;
                             ws_read = None;
+                        }
+                    }
+
+                    // Drain any buffered inbound frames while idle so server pings
+                    // are answered and a dead/closed socket is noticed now, rather
+                    // than costing the next hedge its full response timeout (N6).
+                    if ws_read.is_some() {
+                        loop {
+                            let next = tokio::time::timeout(
+                                Duration::from_millis(5),
+                                async { ws_read.as_mut().unwrap().next().await },
+                            )
+                            .await;
+                            match next {
+                                Ok(Some(Ok(Message::Ping(data)))) => {
+                                    if let Some(w) = ws_write.as_mut() {
+                                        let _ = w.send(Message::Pong(data)).await;
+                                    }
+                                }
+                                Ok(Some(Ok(Message::Close(_)))) => {
+                                    debug!(
+                                        "{} Idle trading WS received Close; dropping for reconnect",
+                                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta)
+                                    );
+                                    ws_write = None;
+                                    ws_read = None;
+                                    break;
+                                }
+                                Ok(Some(Ok(_))) => {
+                                    // Pong / other: ignore and keep draining.
+                                }
+                                Ok(Some(Err(_))) | Ok(None) => {
+                                    debug!(
+                                        "{} Idle trading WS read ended; dropping for reconnect",
+                                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta)
+                                    );
+                                    ws_write = None;
+                                    ws_read = None;
+                                    break;
+                                }
+                                Err(_) => break, // timeout: no more buffered frames
+                            }
                         }
                     }
                 }
@@ -338,7 +380,6 @@ impl HedgeService {
                     );
                 }
 
-                let submitted_after_ms = Self::unix_ms();
                 let submit_start = std::time::Instant::now();
                 hedge_result = if use_ws_for_hedge {
                     // Ensure we have an active trading WebSocket
@@ -443,13 +484,10 @@ impl HedgeService {
                 );
 
                 if hedge_result.is_err() {
-                    match self
-                        .confirm_recent_hyperliquid_fill(is_buy, submitted_after_ms, size, 100)
-                        .await
-                    {
+                    match self.confirm_hedge_by_cloid(&cloid).await {
                         Ok(Some(response)) => {
                             warn!(
-                                "{} {} Confirmed hedge fill from recent Hyperliquid fills after submit uncertainty",
+                                "{} {} Confirmed hedge fill via orderStatus(cloid) after submit uncertainty",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                                 "OK".green().bold()
                             );
@@ -458,7 +496,7 @@ impl HedgeService {
                         Ok(None) => {}
                         Err(e) => {
                             warn!(
-                                "{} {} Could not confirm uncertain hedge via recent fills: {}",
+                                "{} {} Could not confirm uncertain hedge via orderStatus: {}",
                                 tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                                 "WARN".yellow().bold(),
                                 e
@@ -526,44 +564,69 @@ impl HedgeService {
                     );
                 }
 
-                // Only break the retry loop on a true "filled" success. Hyperliquid
-                // returns Ok with an internal OrderStatus::Error for rejections - treat
-                // those as retryable.
-                let mut definite_reject = false;
-                let success_or_retry = match &hedge_result {
+                // Classify this attempt, then decide whether to escalate to a NEW
+                // cloid. Critical invariant: a fresh cloid (request_group += 1) is
+                // only minted AFTER `orderStatus` proves the current cloid produced
+                // no fill. Otherwise a WS-timeout-but-filled hedge (whose retry hits
+                // a duplicate-cloid rejection) would be re-submitted and double-fill.
+                //
+                // Phase 1: classify under the immutable borrow (no await here).
+                enum Outcome {
+                    Filled,
+                    DupCloid,
+                    Reject,
+                    Retry,
+                }
+                let outcome = match &hedge_result {
                     Ok(resp) => match &resp.response {
-                        OrderResponseContent::Success(data) => {
-                            match data.data.statuses.first() {
-                                Some(OrderStatus::Filled { .. }) => true,
-                                Some(OrderStatus::Error { error }) => {
-                                    definite_reject = true;
-                                    hedge_result = Err(anyhow::anyhow!("HL order status error: {}", error));
-                                    false
-                                }
-                                Some(OrderStatus::Resting { resting }) => {
-                                    hedge_result = Err(anyhow::anyhow!("HL order unexpectedly resting (oid {})", resting.oid));
-                                    false
-                                }
-                                None => {
-                                    hedge_result = Err(anyhow::anyhow!("HL hedge response missing statuses"));
-                                    false
-                                }
+                        OrderResponseContent::Success(data) => match data.data.statuses.first() {
+                            Some(OrderStatus::Filled { .. }) => Outcome::Filled,
+                            Some(OrderStatus::Error { error })
+                                if Self::is_duplicate_cloid_error(error) =>
+                            {
+                                Outcome::DupCloid
                             }
+                            Some(OrderStatus::Error { .. }) => Outcome::Reject,
+                            Some(OrderStatus::Resting { .. }) | None => Outcome::Reject,
+                        },
+                        OrderResponseContent::Error(e) if Self::is_duplicate_cloid_error(e) => {
+                            Outcome::DupCloid
                         }
-                        OrderResponseContent::Error(e) => {
-                            definite_reject = true;
-                            hedge_result = Err(anyhow::anyhow!("HL response error: {}", e));
-                            false
-                        }
+                        OrderResponseContent::Error(_) => Outcome::Reject,
                     },
-                    Err(_) => false,
+                    Err(_) => Outcome::Retry,
                 };
 
-                if success_or_retry {
-                    break;
-                }
-                if definite_reject {
-                    request_group = request_group.saturating_add(1);
+                // Phase 2: act (borrow released, awaits allowed).
+                match outcome {
+                    Outcome::Filled => break,
+                    Outcome::DupCloid | Outcome::Reject => {
+                        // The cloid is now "used" at HL. orderStatus is the source of
+                        // truth: if it actually filled, adopt that fill instead of
+                        // re-submitting; only escalate once it is proven unfilled.
+                        match self.confirm_hedge_by_cloid(&cloid).await {
+                            Ok(Some(resp)) => {
+                                warn!(
+                                    "{} {} Adopted confirmed fill for cloid after reject/dup; not re-submitting",
+                                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                                    "OK".green().bold()
+                                );
+                                hedge_result = Ok(resp);
+                                break;
+                            }
+                            _ => {
+                                if self.cloid_definitively_unfilled(&cloid).await {
+                                    request_group = request_group.saturating_add(1);
+                                }
+                                hedge_result =
+                                    Err(anyhow::anyhow!("HL rejected/duplicate cloid, not filled"));
+                            }
+                        }
+                    }
+                    Outcome::Retry => {
+                        // Transient/uncertain (network, timeout): keep the SAME cloid
+                        // so the next attempt is idempotent at Hyperliquid.
+                    }
                 }
             }
 
@@ -729,7 +792,18 @@ impl HedgeService {
                                     e
                                 );
                             }
-                            let residual_submitted_after_ms = Self::unix_ms();
+                            // Pre-submit idempotency guard: if this residual cloid
+                            // already landed at HL (uncertain ack on a prior pass),
+                            // adopt that fill instead of submitting it again.
+                            if let Ok(Some(resp)) = self.confirm_hedge_by_cloid(&cloid).await {
+                                if let Some((_, filled_qty)) = Self::filled_qty_from_response(&resp)
+                                {
+                                    confirmed_hedge_size += filled_qty;
+                                    residual = (size - confirmed_hedge_size).max(0.0);
+                                    continue;
+                                }
+                            }
+
                             let mut residual_response = self
                                 .hyperliquid_trading
                                 .place_market_order_with_cloid(
@@ -745,18 +819,10 @@ impl HedgeService {
                                 .await;
 
                             if residual_response.is_err() {
-                                match self
-                                    .confirm_recent_hyperliquid_fill(
-                                        is_buy,
-                                        residual_submitted_after_ms,
-                                        residual,
-                                        0,
-                                    )
-                                    .await
-                                {
+                                match self.confirm_hedge_by_cloid(&cloid).await {
                                     Ok(Some(resp)) => {
                                         warn!(
-                                            "{} {} Confirmed residual hedge fill from recent Hyperliquid fills after REST uncertainty",
+                                            "{} {} Confirmed residual hedge fill via orderStatus(cloid) after submit uncertainty",
                                             tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                                             "OK".green().bold()
                                         );
@@ -765,7 +831,7 @@ impl HedgeService {
                                     Ok(None) => {}
                                     Err(e) => {
                                         warn!(
-                                            "{} {} Could not confirm uncertain residual hedge via recent fills: {}",
+                                            "{} {} Could not confirm uncertain residual hedge via orderStatus: {}",
                                             tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                                             "WARN".yellow().bold(),
                                             e
@@ -1002,60 +1068,61 @@ impl HedgeService {
         } // Close loop
     }
 
-    async fn confirm_recent_hyperliquid_fill(
-        &self,
-        is_buy: bool,
-        submitted_after_ms: u64,
-        target_qty: f64,
-        lookback_ms: u64,
-    ) -> anyhow::Result<Option<OrderResponse>> {
-        let fills = self
-            .hyperliquid_trading
-            .get_user_fills(&self.hyperliquid_trading.get_wallet_address(), true)
-            .await?;
-        let expected_side = if is_buy { "B" } else { "A" };
-        let min_time = submitted_after_ms.saturating_sub(lookback_ms);
+    /// Authoritatively confirm whether the order placed under `cloid` filled,
+    /// using Hyperliquid's `orderStatus` (by cloid). Returns a synthetic `Filled`
+    /// response only when HL says it filled (fully, or canceled-with-partial above
+    /// dust); otherwise `None`. This replaces the old time/side/size heuristic,
+    /// which could never confirm and left the retry loop able to double-submit.
+    async fn confirm_hedge_by_cloid(&self, cloid: &str) -> anyhow::Result<Option<OrderResponse>> {
         let dust = self.config.neutral_dust_base.max(1e-9);
-        let mut total_size = 0.0;
-        let mut total_notional = 0.0;
-
-        for fill in fills.iter().filter(|fill| {
-            fill.coin == self.config.symbol
-                && fill.time >= min_time
-                && fill.side == expected_side
-                && fill.crossed
-        }) {
-            let Ok(px) = fill.px.parse::<f64>() else {
-                continue;
-            };
-            let Ok(sz) = fill.sz.parse::<f64>() else {
-                continue;
-            };
-            if sz <= 0.0 || px <= 0.0 {
-                continue;
-            }
-
-            total_size += sz;
-            total_notional += px * sz;
-            if total_size + dust >= target_qty {
-                break;
-            }
+        match self.hyperliquid_trading.query_order_status(cloid).await? {
+            OrderStatusQuery::Filled {
+                filled_sz, avg_px, ..
+            } if filled_sz > 0.0 => Ok(Some(Self::filled_response(avg_px, filled_sz))),
+            OrderStatusQuery::Canceled {
+                filled_sz, avg_px, ..
+            } if filled_sz > dust => Ok(Some(Self::filled_response(avg_px, filled_sz))),
+            _ => Ok(None),
         }
-
-        if total_size <= dust || total_notional <= 0.0 {
-            return Ok(None);
-        }
-
-        warn!(
-            "{} {} Recent Hyperliquid fills match time/side/size, but no CLOID/order-id confirmation is available; treating as possible only",
-            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-            "WARN".yellow().bold()
-        );
-        Ok(None)
     }
 
-    #[cfg(test)]
-    fn synthetic_filled_response(avg_px: f64, total_sz: f64) -> OrderResponse {
+    /// True only when Hyperliquid authoritatively confirms the cloid produced no
+    /// fill (rejected, never-seen, or canceled with only dust filled), so it is
+    /// safe to escalate to a fresh cloid. Returns `false` on any uncertainty
+    /// (filled/resting/network error) so we never escalate into a double-submit.
+    async fn cloid_definitively_unfilled(&self, cloid: &str) -> bool {
+        let dust = self.config.neutral_dust_base.max(1e-9);
+        match self.hyperliquid_trading.query_order_status(cloid).await {
+            Ok(OrderStatusQuery::Rejected { .. }) => true,
+            Ok(OrderStatusQuery::Unknown) => true,
+            Ok(OrderStatusQuery::Canceled { filled_sz, .. }) => filled_sz <= dust,
+            // Filled / Resting / network error -> not definitively unfilled.
+            _ => false,
+        }
+    }
+
+    /// Heuristic for Hyperliquid's (undocumented) duplicate-cloid rejection text.
+    /// Only affects log wording / which branch we take; correctness does not
+    /// depend on it because escalation is always gated by an authoritative
+    /// `orderStatus` check (`cloid_definitively_unfilled`).
+    fn is_duplicate_cloid_error(msg: &str) -> bool {
+        let m = msg.to_ascii_lowercase();
+        let mentions_cloid = m.contains("cloid")
+            || m.contains("clientorderid")
+            || m.contains("client order id");
+        let mentions_reuse = m.contains("already")
+            || m.contains("reused")
+            || m.contains("duplicate")
+            || m.contains("in use");
+        mentions_cloid && mentions_reuse
+    }
+
+    /// Build a synthetic `Filled` `OrderResponse` from a confirmed price+size.
+    ///
+    /// Used when `orderStatus`/`userFills` proves a hedge actually filled after
+    /// an uncertain submit, so the downstream profit/verification logic can treat
+    /// it identically to a direct fill response.
+    fn filled_response(avg_px: f64, total_sz: f64) -> OrderResponse {
         use crate::connector::hyperliquid::types::{
             FilledOrder, OrderResponseData, OrderStatusData,
         };
@@ -1075,14 +1142,6 @@ impl HedgeService {
                 },
             }),
         }
-    }
-
-    fn unix_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u64::MAX as u128) as u64
     }
 
     /// Establish a Hyperliquid trading WebSocket connection for hedging.
@@ -1294,7 +1353,7 @@ mod tests {
 
     #[test]
     fn filled_qty_from_response_extracts_actual_filled_size() {
-        let response = HedgeService::synthetic_filled_response(123.45, 0.67);
+        let response = HedgeService::filled_response(123.45, 0.67);
         let (px, qty) =
             HedgeService::filled_qty_from_response(&response).expect("filled response expected");
 
@@ -1310,5 +1369,57 @@ mod tests {
         };
 
         assert!(HedgeService::filled_qty_from_response(&response).is_none());
+    }
+
+    #[test]
+    fn duplicate_cloid_error_is_recognized_case_insensitively() {
+        assert!(HedgeService::is_duplicate_cloid_error(
+            "Order rejected by exchange: ClientOrderId already used"
+        ));
+        assert!(HedgeService::is_duplicate_cloid_error("cloid already in use"));
+        assert!(HedgeService::is_duplicate_cloid_error(
+            "duplicate client order id"
+        ));
+        // Unrelated errors must not match (they fall through to the Reject path,
+        // which still confirms via orderStatus before escalating).
+        assert!(!HedgeService::is_duplicate_cloid_error(
+            "Order could not immediately match against any resting orders."
+        ));
+        assert!(!HedgeService::is_duplicate_cloid_error("tick rejected"));
+    }
+
+    #[test]
+    fn order_status_query_parses_filled_canceled_and_unknown() {
+        use crate::connector::hyperliquid::types::OrderStatusResponse;
+
+        // status:"order" + filled
+        let filled: OrderStatusResponse = serde_json::from_str(
+            r#"{"status":"order","order":{"order":{"coin":"SOL","side":"B","limitPx":"100.0","sz":"0.0","oid":7,"origSz":"0.5","cloid":"0x00000000000000000000000000000001"},"status":"filled","statusTimestamp":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(filled.status, "order");
+        let w = filled.order.unwrap();
+        assert_eq!(w.status, "filled");
+        let orig: f64 = w.order.orig_sz.parse().unwrap();
+        let rem: f64 = w.order.sz.parse().unwrap();
+        assert!((orig - rem - 0.5).abs() < 1e-9);
+        assert_eq!(w.order.oid, 7);
+
+        // status:"order" + canceled with a partial fill (remaining < orig)
+        let canceled: OrderStatusResponse = serde_json::from_str(
+            r#"{"status":"order","order":{"order":{"coin":"SOL","side":"A","limitPx":"100.0","sz":"0.2","oid":9,"origSz":"0.5","cloid":null},"status":"canceled","statusTimestamp":1}}"#,
+        )
+        .unwrap();
+        let w = canceled.order.unwrap();
+        assert_eq!(w.status, "canceled");
+        let orig: f64 = w.order.orig_sz.parse().unwrap();
+        let rem: f64 = w.order.sz.parse().unwrap();
+        assert!((orig - rem - 0.3).abs() < 1e-9);
+
+        // unknownOid
+        let unknown: OrderStatusResponse =
+            serde_json::from_str(r#"{"status":"unknownOid"}"#).unwrap();
+        assert_eq!(unknown.status, "unknownOid");
+        assert!(unknown.order.is_none());
     }
 }

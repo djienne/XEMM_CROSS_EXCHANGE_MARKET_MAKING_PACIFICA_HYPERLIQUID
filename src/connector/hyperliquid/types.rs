@@ -297,6 +297,64 @@ pub struct FilledOrder {
     pub oid: u64,
 }
 
+/// Top-level response of an `orderStatus` info query.
+///
+/// `status` is `"order"` when the order is known, or `"unknownOid"` when
+/// Hyperliquid has never seen the supplied oid/cloid.
+/// See `docs/HL/hyperliquid_api.txt` ("Query order status by oid or cloid").
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderStatusResponse {
+    pub status: String, // "order" | "unknownOid"
+    #[serde(default)]
+    pub order: Option<OrderStatusWrapper>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderStatusWrapper {
+    pub order: OrderStatusInner,
+    /// filled | open | canceled | rejected | marginCanceled | <variant>Rejected | <variant>Canceled | triggered
+    pub status: String,
+    #[serde(rename = "statusTimestamp", default)]
+    pub status_timestamp: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderStatusInner {
+    pub coin: String,
+    pub side: String, // "B" | "A"
+    #[serde(rename = "limitPx")]
+    pub limit_px: String,
+    pub sz: String, // remaining size
+    pub oid: u64,
+    #[serde(rename = "origSz")]
+    pub orig_sz: String, // original size
+    #[serde(default)]
+    pub cloid: Option<String>,
+}
+
+/// Authoritative classification of an order looked up by cloid or oid.
+///
+/// Used by the hedge executor to decide, after an uncertain submit, whether a
+/// hedge actually filled before deciding to re-submit under a new cloid.
+#[derive(Debug, Clone)]
+pub enum OrderStatusQuery {
+    /// Fully or partially filled. `filled_sz = origSz - remaining sz`.
+    Filled { filled_sz: f64, avg_px: f64, oid: u64 },
+    /// Accepted and still working (status open/triggered, no fill yet).
+    Resting { oid: u64, remaining_sz: f64 },
+    /// One of the `*Rejected` statuses; definitively never filled.
+    Rejected { oid: u64, status: String },
+    /// canceled / `*Canceled`; may carry a partial fill (see `filled_sz`).
+    Canceled {
+        oid: u64,
+        status: String,
+        filled_sz: f64,
+        avg_px: f64,
+    },
+    /// `status == "unknownOid"`; Hyperliquid has never seen this oid/cloid.
+    Unknown,
+}
+
 /// User fill item from userFills endpoint
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserFill {

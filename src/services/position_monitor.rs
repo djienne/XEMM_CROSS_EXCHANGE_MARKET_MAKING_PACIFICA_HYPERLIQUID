@@ -148,6 +148,13 @@ impl PositionMonitorService {
                     // If delta is significant and matches order direction
                     if delta.abs() > 0.0001 && delta_matches_order {
                         // Position changed in expected direction - fill detected!
+                        // `last_signed` is the pre-order baseline (set in the
+                        // no-active-order branch and intentionally NOT advanced
+                        // mid-order), so this delta is the CUMULATIVE filled size
+                        // for the order - which is exactly what `observe_fill`
+                        // expects. Advancing the baseline mid-order (the old
+                        // behavior) turned later observations into per-tick deltas
+                        // and under-counted multi-tick partial fills (L3).
                         let fill_size = delta.abs();
 
                         if !self.low_latency_mode {
@@ -335,13 +342,12 @@ impl PositionMonitorService {
                             );
                         }
 
-                        // Update snapshot
-                        let mut snapshot = self.last_position_snapshot.lock();
-                        *snapshot = Some(PositionSnapshot {
-                            amount: current_amount,
-                            side: current_side,
-                            last_check: std::time::Instant::now(),
-                        });
+                        // Intentionally do NOT advance the baseline here: keeping it
+                        // fixed at the pre-order position means each tick reports the
+                        // cumulative filled size. Duplicate hedging is prevented by
+                        // the fill aggregator (keeps the max cumulative, residual-based)
+                        // and the processed-fills dedup set. The baseline is refreshed
+                        // for the next order in the no-active-order branch above.
                     }
                 }
                 Err(e) => {

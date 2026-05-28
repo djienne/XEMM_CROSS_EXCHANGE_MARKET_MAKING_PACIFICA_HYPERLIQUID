@@ -642,6 +642,112 @@ impl HyperliquidTrading {
         Ok(fills)
     }
 
+    /// Query authoritative status of a single order by cloid (0x + 32 hex) or oid.
+    ///
+    /// Hyperliquid's `orderStatus` info endpoint accepts either a u64 oid or a
+    /// 16-byte hex client order id; our hedge cloids are 16-byte hex so they are
+    /// valid inputs. `orderStatus` does not carry an average fill price, so when
+    /// the order shows a fill we resolve the size-weighted avg price from
+    /// `userFills` by the now-known oid (one extra round-trip only on the fill
+    /// path; resting/rejected/unknown stay single round-trip).
+    pub async fn query_order_status(&self, cloid_or_oid: &str) -> Result<OrderStatusQuery> {
+        let user = self.account_address();
+        // A &str serializes to a JSON string, which HL interprets as the cloid form.
+        let payload = json!({
+            "type": "orderStatus",
+            "user": user,
+            "oid": cloid_or_oid,
+        });
+
+        let response = self
+            .client
+            .post(&self.info_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to fetch order status")?;
+
+        let response_text = response.text().await?;
+        let parsed: OrderStatusResponse = serde_json::from_str(&response_text).with_context(|| {
+            format!(
+                "Failed to parse orderStatus response: {}",
+                response_text.chars().take(300).collect::<String>()
+            )
+        })?;
+
+        if parsed.status == "unknownOid" {
+            return Ok(OrderStatusQuery::Unknown);
+        }
+        let Some(wrapper) = parsed.order else {
+            return Ok(OrderStatusQuery::Unknown);
+        };
+
+        let orig_sz = wrapper.order.orig_sz.parse::<f64>().unwrap_or(0.0);
+        let remaining = wrapper.order.sz.parse::<f64>().unwrap_or(0.0);
+        let filled_sz = (orig_sz - remaining).max(0.0);
+        let oid = wrapper.order.oid;
+        let status = wrapper.status;
+
+        // Only pay for the avg-price lookup when something actually filled.
+        let avg_px = if filled_sz > 0.0 {
+            self.avg_fill_px_for_oid(oid).await.unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let s = status.as_str();
+        Ok(if s == "filled" {
+            OrderStatusQuery::Filled {
+                filled_sz,
+                avg_px,
+                oid,
+            }
+        } else if s == "open" || s == "triggered" {
+            if filled_sz > 0.0 {
+                OrderStatusQuery::Filled {
+                    filled_sz,
+                    avg_px,
+                    oid,
+                }
+            } else {
+                OrderStatusQuery::Resting {
+                    oid,
+                    remaining_sz: remaining,
+                }
+            }
+        } else if s == "rejected" || s.ends_with("Rejected") {
+            OrderStatusQuery::Rejected { oid, status }
+        } else {
+            // canceled / marginCanceled / <variant>Canceled: may carry a partial fill.
+            OrderStatusQuery::Canceled {
+                oid,
+                status,
+                filled_sz,
+                avg_px,
+            }
+        })
+    }
+
+    /// Size-weighted average fill price for an order id, from recent user fills.
+    async fn avg_fill_px_for_oid(&self, oid: u64) -> Result<f64> {
+        let fills = self.get_user_fills(&self.account_address(), true).await?;
+        let mut size_sum = 0.0;
+        let mut notional = 0.0;
+        for fill in fills.iter().filter(|fill| fill.oid == oid) {
+            let px = fill.px.parse::<f64>().unwrap_or(0.0);
+            let sz = fill.sz.parse::<f64>().unwrap_or(0.0);
+            if px > 0.0 && sz > 0.0 {
+                size_sum += sz;
+                notional += px * sz;
+            }
+        }
+        if size_sum > 0.0 {
+            Ok(notional / size_sum)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     /// Get user state (positions and margin summary)
     ///
     /// # Arguments
@@ -685,6 +791,16 @@ impl HyperliquidTrading {
     /// Get wallet address from the internal wallet
     pub fn get_wallet_address(&self) -> String {
         format!("{:?}", self.wallet.address())
+    }
+
+    /// Canonical Hyperliquid account address to query for positions/fills.
+    ///
+    /// Honors the `HL_WALLET` env var (the *account* being traded, which may
+    /// differ from the key-derived *signing* wallet for agent/API-wallet
+    /// setups) and falls back to the derived address. All services must use
+    /// this so position/exposure checks agree on a single account.
+    pub fn account_address(&self) -> String {
+        std::env::var("HL_WALLET").unwrap_or_else(|_| self.get_wallet_address())
     }
 }
 

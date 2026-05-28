@@ -99,6 +99,18 @@ pub struct Config {
     #[serde(default = "default_max_unhedged_ms")]
     pub max_unhedged_ms: u64,
 
+    /// Grace period before the reconciler enqueues its OWN corrective hedge,
+    /// giving the primary hedge path (which can take >1s with retries) time to
+    /// land first. Prevents the reconciler double-hedging an in-flight hedge.
+    #[serde(default = "default_reconciler_grace_ms")]
+    pub reconciler_grace_ms: u64,
+
+    /// Hard ceiling on continuous (non-decreasing) unhedged exposure age before
+    /// the bot halts with a terminal error. Below this the reconciler keeps
+    /// retrying corrective hedges instead of giving up. Must be >= max_unhedged_ms.
+    #[serde(default = "default_max_unhedged_hard_ms")]
+    pub max_unhedged_hard_ms: u64,
+
     /// Maximum consecutive hedge failures before halting.
     #[serde(default = "default_max_consecutive_hedge_failures")]
     pub max_consecutive_hedge_failures: u32,
@@ -237,6 +249,14 @@ fn default_max_unhedged_ms() -> u64 {
     5_000
 }
 
+fn default_reconciler_grace_ms() -> u64 {
+    2_500
+}
+
+fn default_max_unhedged_hard_ms() -> u64 {
+    30_000
+}
+
 fn default_max_consecutive_hedge_failures() -> u32 {
     3
 }
@@ -312,6 +332,8 @@ impl Default for Config {
             max_unhedged_base: default_max_unhedged_base(),
             max_unhedged_usd: default_max_unhedged_usd(),
             max_unhedged_ms: default_max_unhedged_ms(),
+            reconciler_grace_ms: default_reconciler_grace_ms(),
+            max_unhedged_hard_ms: default_max_unhedged_hard_ms(),
             max_consecutive_hedge_failures: default_max_consecutive_hedge_failures(),
             partial_hedge_min_notional_usd: default_partial_hedge_min_notional_usd(),
             partial_hedge_min_fraction: default_partial_hedge_min_fraction(),
@@ -391,8 +413,12 @@ impl Config {
             "Fees must be finite"
         );
         anyhow::ensure!(
-            self.profit_rate_bps.is_finite(),
-            "Profit rate must be finite"
+            self.pacifica_maker_fee_bps >= 0.0 && self.hyperliquid_taker_fee_bps >= 0.0,
+            "Fees cannot be negative"
+        );
+        anyhow::ensure!(
+            self.profit_rate_bps.is_finite() && self.profit_rate_bps > 0.0,
+            "Profit rate must be finite and positive"
         );
         anyhow::ensure!(
             self.profit_cancel_threshold_bps >= 0.0,
@@ -433,6 +459,29 @@ impl Config {
             "Max unhedged exposure limits cannot be negative"
         );
         anyhow::ensure!(self.max_unhedged_ms > 0, "Max unhedged ms must be positive");
+        anyhow::ensure!(
+            self.reconciler_grace_ms > 0,
+            "Reconciler grace ms must be positive"
+        );
+        anyhow::ensure!(
+            self.max_unhedged_hard_ms >= self.max_unhedged_ms,
+            "Max unhedged hard ms must be >= max_unhedged_ms"
+        );
+
+        // L1: a residual below the exchange minimum order size cannot be hedged
+        // on-venue. If the neutral dust threshold is below that minimum, such a
+        // residual would otherwise wedge the reconciler. We tolerate it at runtime
+        // (see PositionReconcilerService) but warn so the operator can raise the
+        // dust threshold for large-lot symbols.
+        let min_size = crate::market_rules::fallback_rules(&self.symbol).min_size;
+        if self.neutral_dust_base < min_size {
+            tracing::warn!(
+                "[CONFIG] neutral_dust_base ({}) is below {} min order size ({}); sub-min residuals will be tolerated as neutral",
+                self.neutral_dust_base,
+                self.symbol,
+                min_size
+            );
+        }
         anyhow::ensure!(
             self.max_consecutive_hedge_failures > 0,
             "Max consecutive hedge failures must be positive"

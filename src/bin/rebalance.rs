@@ -148,8 +148,7 @@ async fn rebalance_step(
     pac_price_store: &Arc<Mutex<Option<f64>>>,
 ) -> Result<bool> {
     // 1. Fetch Positions
-    let wallet_address =
-        std::env::var("HL_WALLET").unwrap_or_else(|_| hl_trading.get_wallet_address());
+    let wallet_address = hl_trading.account_address();
     let hl_state = hl_trading.get_user_state(&wallet_address).await?;
     let pac_positions = pac_trading.get_positions().await?;
 

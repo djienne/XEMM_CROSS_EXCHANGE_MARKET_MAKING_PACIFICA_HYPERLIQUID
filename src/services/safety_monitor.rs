@@ -11,6 +11,7 @@ use crate::bot::{BotState, BotStatus, RunState};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
+use crate::market_rules::fallback_rules;
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::order_monitor::{update_order_snapshot, SharedOrderSnapshot};
 use crate::services::trade_gate::{GateReason, TradeGate};
@@ -97,11 +98,16 @@ impl SafetyMonitorService {
             Ok((pacifica, hyperliquid)) => {
                 self.trade_gate.allow(GateReason::PositionUnknown);
                 let net = pacifica + hyperliquid;
-                self.trade_gate.set(
-                    GateReason::NetExposure,
-                    net.abs() > self.config.neutral_dust_base,
-                );
-                if net.abs() > self.config.neutral_dust_base
+                // L1: residuals below the exchange minimum order size cannot be
+                // hedged on-venue, so treat them as neutral here too (consistent
+                // with the position reconciler) instead of permanently gating.
+                let effective_dust = self
+                    .config
+                    .neutral_dust_base
+                    .max(fallback_rules(&self.config.symbol).min_size);
+                self.trade_gate
+                    .set(GateReason::NetExposure, net.abs() > effective_dust);
+                if net.abs() > effective_dust
                     && RunState::load(&self.atomic_status) == RunState::Idle
                 {
                     let mut state = self.bot_state.write();
@@ -260,7 +266,7 @@ impl SafetyMonitorService {
 
         let hyperliquid_state = self
             .hyperliquid_trading
-            .get_user_state(&self.hyperliquid_trading.get_wallet_address())
+            .get_user_state(&self.hyperliquid_trading.account_address())
             .await?;
         let hyperliquid_position = hyperliquid_state
             .asset_positions

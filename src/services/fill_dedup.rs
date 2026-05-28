@@ -12,12 +12,12 @@ pub enum FillKey {
     OrderId(u64),
     OrderCumulative {
         order_id: u64,
-        cumulative_quanta: u64,
+        cumulative_quanta: u128,
     },
     Cloid(String),
     CloidCumulative {
         cloid: String,
-        cumulative_quanta: u64,
+        cumulative_quanta: u128,
     },
 }
 
@@ -46,8 +46,11 @@ impl FillKey {
 }
 
 #[inline]
-fn quantize_size(size: f64) -> u64 {
-    (size.max(0.0) * 1_000_000_000.0).round() as u64
+fn quantize_size(size: f64) -> u128 {
+    // u128 so even ultra-cheap, very-large-size symbols (where size * 1e9 would
+    // overflow u64 and saturate to u64::MAX) cannot collapse distinct cumulative
+    // sizes onto the same dedup key.
+    (size.max(0.0) * 1_000_000_000.0).round() as u128
 }
 
 /// Bounded fill-dedup set.
