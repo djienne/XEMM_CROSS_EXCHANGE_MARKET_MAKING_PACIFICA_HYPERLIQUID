@@ -136,6 +136,13 @@ impl TradeGate {
             && !self.service_down_latched.load(Ordering::Acquire)
         {
             self.allow(GateReason::ServiceDown);
+            // Recheck: a concurrent `mark_service_down` may have bumped the count
+            // and set the bit between our load and our `allow`, which would leave
+            // the bit clear while a task is actually down. Re-assert it if so. The
+            // count is the source of truth; this keeps the mirrored bit coherent.
+            if self.service_down.load(Ordering::Acquire) != 0 {
+                self.block(GateReason::ServiceDown);
+            }
         }
     }
 
