@@ -391,6 +391,20 @@ impl FillAggregator {
             .sum()
     }
 
+    /// Pending hedge qty reserved for maker fills of `maker_side` — i.e. hedges
+    /// that reduce net exposure in that side's direction. A maker Buy fill (long,
+    /// net > 0) reserves a Sell hedge, so a net-long exposure is covered by
+    /// `pending_qty_for_side(Buy)`. Side-filtering avoids subtracting an
+    /// opposite-side reservation from the current net exposure.
+    pub fn pending_qty_for_side(&self, maker_side: OrderSide) -> f64 {
+        self.inner
+            .lock()
+            .values()
+            .filter(|state| state.side == maker_side)
+            .map(|state| state.cumulative_hedge_pending.max(0.0))
+            .sum()
+    }
+
     /// Current accumulator count (diagnostic / test use).
     pub fn len(&self) -> usize {
         self.inner.lock().len()
@@ -536,6 +550,24 @@ mod tests {
         assert!((state.residual() - 1.0).abs() < 1e-9);
         let reservation = agg.try_reserve_hedge(1).unwrap();
         assert!((reservation.size - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pending_qty_for_side_filters_by_maker_side() {
+        let agg = FillAggregator::new(1000.0);
+        // Reserve a Buy-side hedge on order 1 and a Sell-side on order 2.
+        let _ = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        let _ = agg.on_fill(2, OrderSide::Sell, 0.5, 100.0, true).unwrap();
+
+        assert!((agg.pending_qty_for_side(OrderSide::Buy) - 1.0).abs() < 1e-9);
+        assert!((agg.pending_qty_for_side(OrderSide::Sell) - 0.5).abs() < 1e-9);
+        // Sanity: the side-agnostic total is the sum of both.
+        assert!((agg.total_pending_qty() - 1.5).abs() < 1e-9);
+
+        // Settling the Buy hedge leaves only the Sell reservation for its side.
+        agg.settle_hedge(HedgeSettlement::filled(1, 1.0, 1.0));
+        assert!(agg.pending_qty_for_side(OrderSide::Buy).abs() < 1e-9);
+        assert!((agg.pending_qty_for_side(OrderSide::Sell) - 0.5).abs() < 1e-9);
     }
 
     #[test]

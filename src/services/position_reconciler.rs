@@ -16,6 +16,7 @@ use crate::services::fill_aggregator::FillAggregator;
 use crate::services::{
     enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
 };
+use crate::strategy::OrderSide;
 
 /// Slow safety loop that reconciles net exposure across exchanges.
 pub struct PositionReconcilerService {
@@ -132,7 +133,17 @@ impl PositionReconcilerService {
             // exposure. This both prevents racing an in-flight hedge AND prevents a
             // normal in-flight hedge (e.g. a $20 fill vs a $10 max_unhedged_usd) from
             // tripping the error caps before the hedge has had a chance to land.
-            let pending = self.fill_aggregator.total_pending_qty();
+            // Subtract only same-direction in-flight hedge coverage: a net-long
+            // (net > 0) exposure is reduced by hedges reserved for Buy-side maker
+            // fills, a net-short by Sell-side. Using the side-filtered pending (not
+            // the side-agnostic total) avoids an opposite-side reservation ever
+            // masking real exposure.
+            let maker_side = if net > 0.0 {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            };
+            let pending = self.fill_aggregator.pending_qty_for_side(maker_side);
             let abs_net = net.abs();
             let effective_net = (abs_net - pending).max(0.0);
 

@@ -467,6 +467,10 @@ impl Config {
             self.max_unhedged_hard_ms >= self.max_unhedged_ms,
             "Max unhedged hard ms must be >= max_unhedged_ms"
         );
+        anyhow::ensure!(
+            self.reconciler_grace_ms < self.max_unhedged_hard_ms,
+            "Reconciler grace ms must be < max_unhedged_hard_ms (else the reconciler hard-errors before it can act)"
+        );
 
         // L1: a residual below the exchange minimum order size cannot be hedged
         // on-venue. If the neutral dust threshold is below that minimum, such a
@@ -540,5 +544,23 @@ mod tests {
 
         config.ping_interval_secs = 60;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn reconciler_grace_must_be_below_hard_limit() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+
+        // grace == hard is rejected (no window to enqueue a corrective hedge).
+        config.reconciler_grace_ms = config.max_unhedged_hard_ms;
+        assert!(config.validate().is_err());
+
+        // grace > hard is rejected.
+        config.reconciler_grace_ms = config.max_unhedged_hard_ms + 1;
+        assert!(config.validate().is_err());
+
+        // grace < hard is accepted.
+        config.reconciler_grace_ms = config.max_unhedged_hard_ms - 1;
+        assert!(config.validate().is_ok());
     }
 }

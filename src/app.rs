@@ -885,7 +885,13 @@ impl XemmBot {
             shutdown_tx: self.shutdown_tx.clone(),
             shutdown_signal: self.hedge_shutdown_signal.clone(),
         };
-        tokio::spawn(async move {
+        // Fail-closed: the hedge executor owns `hedge_rx` (a non-clonable Receiver),
+        // so it cannot be restarted without re-wiring every producer's sender. If it
+        // panics, latch ServiceDown to halt quoting immediately rather than relying on
+        // the next enqueue hitting the closed channel. Latching on its graceful
+        // drain-exit during shutdown is harmless (ShuttingDown already gates quoting),
+        // and run() sends shutdown_tx before returning so the drain handshake is intact.
+        spawn_supervised_fail_closed("hedge_executor", self.trade_gate.clone(), async move {
             hedge_service.run().await;
         });
 
