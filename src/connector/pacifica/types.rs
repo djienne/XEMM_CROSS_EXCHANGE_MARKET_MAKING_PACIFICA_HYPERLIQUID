@@ -235,12 +235,10 @@ pub struct OrderUpdate {
     pub created_at: u64, // milliseconds
 }
 
-/// Account order updates response
-#[derive(Debug, Deserialize)]
-pub struct AccountOrderUpdatesResponse {
-    pub channel: String,
-    pub data: Vec<OrderUpdate>,
-}
+// NOTE: `account_order_updates` frames are now decoded per-item from the generic
+// envelope (see fill_detection::handle_message) so one malformed sibling cannot
+// drop a whole batch; the previous strict `AccountOrderUpdatesResponse` wrapper
+// is therefore no longer used.
 
 /// Fill information extracted from order update
 #[derive(Debug, Clone)]

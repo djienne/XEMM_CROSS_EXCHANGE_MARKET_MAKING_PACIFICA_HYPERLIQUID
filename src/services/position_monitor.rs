@@ -260,8 +260,9 @@ impl PositionMonitorService {
                         let should_process = self.processed_fills.insert_if_new(dedup_key);
 
                         if should_process {
-                            let mut reservation = None;
-                            let hedge_event = if let Some(id) = order_id_opt {
+                            // Both arms either `continue` or yield (intent, reservation),
+                            // so the reservation is always present downstream.
+                            let (hedge_event, reservation) = if let Some(id) = order_id_opt {
                                 if !self.fill_aggregator.observe_fill(
                                     id,
                                     order_side,
@@ -279,8 +280,7 @@ impl PositionMonitorService {
                                     continue;
                                 };
                                 let intent: HedgeIntent = r.into();
-                                reservation = Some(r);
-                                intent
+                                (intent, r)
                             } else {
                                 // Synthetic id namespaced into a disjoint range (top
                                 // bit set) so it cannot collide with a real Pacifica
@@ -310,8 +310,7 @@ impl PositionMonitorService {
                                     continue;
                                 };
                                 let intent: HedgeIntent = r.into();
-                                reservation = Some(r);
-                                intent
+                                (intent, r)
                             };
 
                             if !self.low_latency_mode {
@@ -343,14 +342,10 @@ impl PositionMonitorService {
                             .await
                             {
                                 Ok(HedgeEnqueueResult::Queued) => {
-                                    if let Some(r) = reservation {
-                                        self.fill_aggregator.commit_queued(r);
-                                    }
+                                    self.fill_aggregator.commit_queued(reservation);
                                 }
                                 Ok(HedgeEnqueueResult::PersistedButNotQueued { reason }) => {
-                                    if let Some(r) = reservation {
-                                        self.fill_aggregator.release_reservation(r);
-                                    }
+                                    self.fill_aggregator.release_reservation(reservation);
                                     warn!(
                                         "{} {} Hedge intent persisted but not queued: {}",
                                         tag_static("POSITION_MONITOR", Color::BrightCyan),
@@ -359,9 +354,7 @@ impl PositionMonitorService {
                                     );
                                 }
                                 Err(e) => {
-                                    if let Some(r) = reservation {
-                                        self.fill_aggregator.release_reservation(r);
-                                    }
+                                    self.fill_aggregator.release_reservation(reservation);
                                     error!(
                                         "{} {} Hedge intent enqueue failed: {}",
                                         tag_static("POSITION_MONITOR", Color::BrightCyan),

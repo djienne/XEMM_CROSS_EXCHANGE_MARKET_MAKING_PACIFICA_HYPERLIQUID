@@ -420,13 +420,29 @@ Under a disk stall / log-channel saturation, new hedges are refused and the bot 
 
 ---
 
-## Implementation checklist
-- [ ] H1 latch authoritative on read path (+ regression test)
-- [ ] H2 cancel-vs-fill: fill-aware verify before clearing active_order
-- [ ] H3 per-item parse + `#[serde(other)]` enums
-- [ ] H4 supervise order_monitor cancel loop
-- [ ] H5 log local UUID, not server cloid
-- [ ] H6 remove key prints + deploy exclude + **rotate HL key**
-- [ ] M1–M13
-- [ ] L1–L20
-- [ ] `cargo build` + `cargo test` green after each item
+## Implementation checklist — ALL IMPLEMENTED (build green, 91 lib tests pass)
+- [x] H1 latch authoritative on read path (+ 2 regression tests)
+- [x] H2 cancel-vs-fill: fill-aware verify before clearing active_order
+- [x] H3 per-item parse + `#[serde(other)]` enums
+- [x] H4 supervise order_monitor cancel loop
+- [x] H5 log local UUID, not server cloid
+- [x] H6 remove key prints + deploy exclude — **rotate HL key is an OPERATOR action, still TODO**
+- [x] M1–M13
+- [x] L1–L19 (L20 = the deploy exclusion, done under H6)
+- [x] `cargo build --all-targets` + `cargo test` green
+
+### Implementation notes / deviations
+- **R1–R4** left unchanged (verified non-issues).
+- **H6 key rotation**: code no longer prints the key, but rotating the Hyperliquid
+  signing key is a manual operator step (the old key may be in prior logs/history).
+- **L7**: `get_trade_history` returns a `Vec` and discards the cursor, so full
+  pagination was out of proportion for a LOW; implemented the defensive half
+  (only mark terminal when cumulative covers order size; reconciler is the
+  backstop).
+- **L14**: implemented as a 1-hour TTL on `meta_cache` (the HL universe is
+  append-only, so this is a low-frequency safety refresh).
+- **L18**: code now warns when the active-order poll is below the safe default;
+  the deployed `config.json` was left at the operator's `250` (the config edit is
+  marked optional in the plan).
+- **L19**: implemented the log-gate half (unconditional debug log); left the
+  whole-second backoff granularity as-is (optional half).
