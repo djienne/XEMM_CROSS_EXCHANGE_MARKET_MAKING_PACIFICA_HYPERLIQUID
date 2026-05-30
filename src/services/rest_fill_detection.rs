@@ -256,15 +256,23 @@ impl RestFillDetectionService {
         entry.initial_amount = entry.initial_amount.max(order_size);
         entry.order_id = order_id;
         entry.last_seen_at = Instant::now();
+        let target = entry.initial_amount;
+
+        // Only claim terminal when the summed fills actually cover the order size.
+        // The trade-history fetch is capped (no pagination here), so a high-volume
+        // account could undercount; marking a partial as terminal would lock the
+        // aggregator at the low cumulative. Leaving it non-terminal lets a later
+        // poll add fills, and the position reconciler nets any genuine remainder.
+        let is_terminal = cumulative + 1e-9 >= target;
 
         self.process_cumulative_fill(
             order_id,
             client_order_id.to_string(),
             order_side,
             cumulative,
-            entry.initial_amount,
+            target,
             avg_price,
-            true,
+            is_terminal,
             delta,
         )
         .await;

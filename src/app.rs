@@ -886,6 +886,7 @@ impl XemmBot {
             config: self.config.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
             pacifica_trading: self.pacifica_trading.clone(),
+            pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
         };
         // Fail-closed: owns the audit-event Receiver, which cannot be reconstructed.
@@ -994,9 +995,12 @@ impl XemmBot {
                     ) {
                         let remaining = rate_limits
                             .remaining_backoff_secs(EndpointGroup::PacificaPlace);
-                        if remaining as u64 % 5 == 0 || remaining < 1.0 {
-                            debug!("[MAIN] Skipping order placement (rate limit backoff, {:.1}s remaining)", remaining);
-                        }
+                        // Debug-only and cheap: log every skip rather than gating on
+                        // a truncating `as u64 % 5` that could hide the backoff state.
+                        debug!(
+                            "[MAIN] Skipping order placement (rate limit backoff, {:.1}s remaining)",
+                            remaining
+                        );
                         continue;
                     }
 
@@ -1039,12 +1043,20 @@ impl XemmBot {
                     );
 
                     if let Some(opp) = best_opp {
-                        // Reserve placement atomically, then release the state lock before
-                        // Pacifica REST I/O.
-                        if !RunState::try_transition(
-                            &self.atomic_status,
-                            RunState::Idle,
-                            RunState::Placing,
+                        // L15: skip opportunities whose venue-floored size is below
+                        // the exchange min size / min notional - the placement would
+                        // only be rejected. (is_dust_or_below_min was previously used
+                        // only by the reconciler.)
+                        let floored = crate::market_rules::pacifica_size_floor(
+                            opp.size,
+                            &self.pacifica_lot_size,
+                        )
+                        .unwrap_or(0.0);
+                        if crate::market_rules::is_dust_or_below_min(
+                            floored,
+                            opp.pacifica_price,
+                            crate::market_rules::fallback_rules(&self.config.symbol),
+                            self.config.neutral_dust_base,
                         ) {
                             continue;
                         }
@@ -1060,8 +1072,19 @@ impl XemmBot {
                             initial_profit_bps: opp.initial_profit_bps,
                             placed_at: Instant::now(),
                         };
+                        // Reserve under the bot_state write lock so the safety
+                        // monitor's lock-guarded Idle->Reconciling transition cannot
+                        // interleave between the atomic CAS and the prospective-order
+                        // write and clobber the reservation. Release before REST I/O.
                         {
                             let mut state = self.bot_state.write();
+                            if !RunState::try_transition(
+                                &self.atomic_status,
+                                RunState::Idle,
+                                RunState::Placing,
+                            ) {
+                                continue;
+                            }
                             state.set_prospective_order(prospective_order);
                         }
                         update_order_snapshot(

@@ -92,6 +92,11 @@ pub fn spawn_supervised_with_factory<Fut, Mk>(
                 Err(e) => error!("[SUPERVISOR] task '{}' panicked; restarting: {}", name, e),
             }
 
+            // Assert the gate the instant the incarnation is dead, before any
+            // backoff bookkeeping, so there is no window where a dead task does not
+            // hold ServiceDown.
+            trade_gate.mark_service_down();
+
             // A sufficiently long-lived incarnation is the "healthy" signal:
             // reset the backoff so a venue that reconnects after hours does not
             // start at max_delay.
@@ -102,8 +107,7 @@ pub fn spawn_supervised_with_factory<Fut, Mk>(
             let delay = policy.backoff(consecutive);
             consecutive = consecutive.saturating_add(1);
 
-            // Block quoting only while the task is actually down (the backoff gap).
-            trade_gate.mark_service_down();
+            // Block quoting while the task is down (through the backoff gap).
             tokio::time::sleep(delay).await;
             trade_gate.mark_service_up();
             info!("[SUPERVISOR] restarting task '{}' after {:?}", name, delay);

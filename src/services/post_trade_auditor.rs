@@ -11,9 +11,10 @@ use tracing::{info, warn};
 use crate::bot::BotState;
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
+use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::csv_logger;
 use crate::strategy::OrderSide;
+use crate::util::cancel::dual_cancel;
 use crate::trade_fetcher;
 use crate::util::log::{tag, Color};
 
@@ -37,6 +38,7 @@ pub struct PostTradeAuditorService {
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub pacifica_trading: Arc<PacificaTrading>,
+    pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub shutdown_tx: mpsc::Sender<()>,
 }
 
@@ -364,17 +366,28 @@ impl PostTradeAuditorService {
             "{} Post-hedge safety: final Pacifica cancellation",
             tag(&self.config.symbol, "AUDIT", Color::Blue)
         );
-        if let Err(e) = self
-            .pacifica_trading
-            .cancel_all_orders(false, Some(&self.config.symbol), false)
-            .await
+        // Use the same redundant REST+WS cancel as the rest of the codebase, so a
+        // single failing transport does not leave a resting order after a hedge.
+        match dual_cancel(
+            &self.pacifica_trading,
+            &self.pacifica_ws_trading,
+            &self.config.symbol,
+        )
+        .await
         {
-            warn!(
+            Ok((rest_count, ws_count)) => info!(
+                "{} {} Final cancel submitted (REST: {}, WS: {})",
+                tag(&self.config.symbol, "AUDIT", Color::Blue),
+                "OK".green().bold(),
+                rest_count,
+                ws_count
+            ),
+            Err(e) => warn!(
                 "{} {} Failed to cancel orders after hedge completion: {}",
                 tag(&self.config.symbol, "AUDIT", Color::Yellow),
                 "WARN".yellow().bold(),
                 e
-            );
+            ),
         }
     }
 

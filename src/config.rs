@@ -405,8 +405,17 @@ impl Config {
         );
 
         anyhow::ensure!(
-            self.order_notional_usd > 0.0,
-            "Order notional must be positive"
+            self.order_notional_usd.is_finite() && self.order_notional_usd > 0.0,
+            "Order notional must be finite and positive"
+        );
+        // Reject a notional below the venue minimum: every order would be rejected.
+        let order_rules = crate::market_rules::fallback_rules(&self.symbol);
+        anyhow::ensure!(
+            self.order_notional_usd >= order_rules.min_notional_usd,
+            "order_notional_usd ({}) is below {} min notional ({})",
+            self.order_notional_usd,
+            self.symbol,
+            order_rules.min_notional_usd
         );
         anyhow::ensure!(
             self.pacifica_maker_fee_bps.is_finite() && self.hyperliquid_taker_fee_bps.is_finite(),
@@ -437,6 +446,16 @@ impl Config {
                 && self.pacifica_active_order_rest_poll_interval_ms > 0,
             "Poll intervals must be positive"
         );
+        // Polling faster than the documented-safe default raises the Pacifica REST
+        // rate / 429 risk; warn rather than reject so it stays operator-tunable.
+        let safe_poll = default_pacifica_active_order_rest_poll_interval();
+        if self.pacifica_active_order_rest_poll_interval_ms < safe_poll {
+            tracing::warn!(
+                "[CONFIG] pacifica_active_order_rest_poll_interval_ms={} is below the documented-safe default of {}ms; higher Pacifica REST rate / 429 risk",
+                self.pacifica_active_order_rest_poll_interval_ms,
+                safe_poll
+            );
+        }
         anyhow::ensure!(self.max_quote_age_ms > 0, "Max quote age must be positive");
         anyhow::ensure!(
             self.hedge_quote_max_age_ms > 0,
@@ -492,9 +511,9 @@ impl Config {
         );
         anyhow::ensure!(
             self.partial_hedge_min_notional_usd >= 0.0
-                && self.partial_hedge_min_fraction >= 0.0
+                && (0.0..=1.0).contains(&self.partial_hedge_min_fraction)
                 && self.partial_hedge_min_base >= 0.0,
-            "Partial hedge thresholds cannot be negative"
+            "Partial hedge thresholds invalid (min_fraction must be in [0,1], others >= 0)"
         );
         anyhow::ensure!(
             self.partial_hedge_idle_timeout_ms > 0 && self.fill_aggregator_max_entries > 0,
@@ -505,6 +524,14 @@ impl Config {
                 && self.hedge_slippage_bps_retry > 0.0
                 && self.hedge_slippage_bps_emergency > 0.0,
             "Hedge slippage bps values must be positive"
+        );
+        // Upper bound: >10% slippage on the hedge leg is almost certainly a
+        // fat-finger and would accept a catastrophic fill price.
+        anyhow::ensure!(
+            self.hedge_slippage_bps_initial <= 1000.0
+                && self.hedge_slippage_bps_retry <= 1000.0
+                && self.hedge_slippage_bps_emergency <= 1000.0,
+            "Hedge slippage bps unusually large (>10%) - possible fat-finger"
         );
         anyhow::ensure!(
             self.hedge_retry_base_delay_ms > 0 && self.hedge_retry_max_delay_ms > 0,
