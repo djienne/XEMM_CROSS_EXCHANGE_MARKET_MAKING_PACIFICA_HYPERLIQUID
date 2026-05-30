@@ -107,6 +107,10 @@ pub struct FillAggregator {
     pub idle_timeout: Duration,
     pub min_hedge_qty: f64,
     pub max_entries: usize,
+    /// Residuals at or below this are un-hedgeable dust (HL would round them to 0)
+    /// and are treated as neutral/done — never re-emitted, and GC-eligible. Should
+    /// match the position reconciler's effective dust.
+    pub neutral_dust: f64,
 }
 
 impl FillAggregator {
@@ -119,9 +123,11 @@ impl FillAggregator {
             min_fraction: 0.0,
             min_hedge_qty: 0.0,
             max_entries: 10_000,
+            neutral_dust: 0.0,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_thresholds(
         emergency_notional_usd: f64,
         min_notional_usd: f64,
@@ -129,6 +135,7 @@ impl FillAggregator {
         idle_timeout: Duration,
         min_hedge_qty: f64,
         max_entries: usize,
+        neutral_dust: f64,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(HashMap::new()),
@@ -138,7 +145,14 @@ impl FillAggregator {
             idle_timeout,
             min_hedge_qty,
             max_entries: max_entries.max(1),
+            neutral_dust: neutral_dust.max(0.0),
         })
+    }
+
+    /// The effective un-hedgeable dust floor (never below a tiny epsilon).
+    #[inline]
+    fn dust(&self) -> f64 {
+        self.neutral_dust.max(1e-9)
     }
 
     /// Record an authoritative cumulative fill observation for `order_id`.
@@ -218,15 +232,26 @@ impl FillAggregator {
         target_size: Option<f64>,
     ) -> bool {
         let now = Instant::now();
+        let dust = self.dust();
         let mut g = self.inner.lock();
         if !g.contains_key(&order_id) && g.len() >= self.max_entries {
-            if let Some(oldest) = g
+            // Only evict a FULLY-SETTLED entry. Never drop a live accumulator:
+            // doing so would lose its reserved-hedge accounting (pending qty /
+            // settle_hedge), which could cause a duplicate or re-emitted hedge.
+            let evictable = g
                 .iter()
-                .min_by_key(|(_, state)| state.created_at)
-                .map(|(id, _)| *id)
-            {
+                .filter(|(_, s)| {
+                    s.terminal
+                        && s.residual() <= dust
+                        && s.cumulative_hedge_pending <= f64::EPSILON
+                })
+                .min_by_key(|(_, s)| s.created_at)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = evictable {
                 g.remove(&oldest);
             }
+            // else: at capacity with all entries live — accept temporary growth
+            // rather than dropping live hedge accounting.
         }
         let entry = g.entry(order_id).or_insert_with(|| OrderFillState {
             order_id,
@@ -250,7 +275,11 @@ impl FillAggregator {
         }
         if absolute_filled_size > entry.cumulative_filled {
             entry.cumulative_filled = absolute_filled_size;
-            entry.avg_price = avg_price;
+            // Preserve a previously-recorded maker price across a cancel-residual
+            // observation that carries a 0.0 placeholder (poisons profit auditing).
+            if avg_price > 0.0 {
+                entry.avg_price = avg_price;
+            }
         }
         entry.terminal |= is_terminal;
         entry.last_updated = now;
@@ -277,7 +306,9 @@ impl FillAggregator {
         } else {
             0.0
         };
-        residual > 0.0
+        // A sub-dust residual is un-hedgeable (HL rounds it to 0), so never emit
+        // it — even when terminal — to avoid a perpetual failing-hedge loop.
+        residual > self.dust()
             && (entry.terminal
                 || (self.min_hedge_qty > 0.0 && residual >= self.min_hedge_qty)
                 || (self.min_notional_usd > 0.0 && notional >= self.min_notional_usd)
@@ -358,8 +389,9 @@ impl FillAggregator {
         let now = Instant::now();
         let mut out = Vec::new();
         let mut g = self.inner.lock();
+        let dust = self.dust();
         for (order_id, acc) in g.iter_mut() {
-            if acc.residual() > 0.0 && now.duration_since(acc.last_updated) >= self.idle_timeout {
+            if acc.residual() > dust && now.duration_since(acc.last_updated) >= self.idle_timeout {
                 let decision = Self::emit_pending(acc, now, acc.terminal);
                 out.push((*order_id, decision));
             }
@@ -371,9 +403,10 @@ impl FillAggregator {
     pub fn gc(&self, ttl: Duration) {
         let now = Instant::now();
         let mut g = self.inner.lock();
+        let dust = self.dust();
         g.retain(|_, acc| {
             !(acc.terminal
-                && acc.residual() <= f64::EPSILON
+                && acc.residual() <= dust
                 && acc.cumulative_hedge_pending <= f64::EPSILON
                 && now.duration_since(acc.created_at) >= ttl)
         });
@@ -451,6 +484,7 @@ mod tests {
             idle_timeout: Duration::from_millis(10),
             min_hedge_qty: 0.0,
             max_entries: 10_000,
+            neutral_dust: 0.0,
         });
         assert!(agg.on_fill(1, OrderSide::Buy, 0.4, 100.0, false).is_none());
         std::thread::sleep(Duration::from_millis(20));
@@ -507,6 +541,7 @@ mod tests {
             Duration::from_secs(60),
             0.0,
             100,
+            0.0,
         );
         assert!(agg
             .on_fill_with_target(1, OrderSide::Buy, 0.1, 100.0, false, Some(1.0))

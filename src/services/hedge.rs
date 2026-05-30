@@ -265,7 +265,7 @@ impl HedgeService {
                 );
 
                 match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
-                    Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
+                    Ok(Some((bid, ask))) if crate::util::price::prices_valid(bid, ask) => {
                         hl_bid = bid;
                         hl_ask = ask;
                         self.hyperliquid_prices.store(bid, ask);
@@ -755,7 +755,20 @@ impl HedgeService {
                     };
 
                     let hedge_dust = self.config.neutral_dust_base.max(1e-9);
-                    if confirmed_hedge_size + hedge_dust < size {
+                    // A residual smaller than one Hyperliquid size step can never be
+                    // hedged (it floors to 0), so treat it as un-hedgeable dust: do
+                    // not retry it forever, and let the position reconciler net the
+                    // bounded remainder instead of wedging in Reconciling.
+                    let hl_step = match self
+                        .hyperliquid_trading
+                        .get_asset_info(&self.config.symbol)
+                        .await
+                    {
+                        Ok(info) => 10_f64.powi(-info.sz_decimals.max(0)),
+                        Err(_) => 0.0,
+                    };
+                    let unhedgeable = hedge_dust.max(hl_step);
+                    if confirmed_hedge_size + unhedgeable < size {
                         let mut residual = size - confirmed_hedge_size;
                         warn!(
                             "{} {} Hyperliquid filled only {} of {}; retrying residual {}",
@@ -767,8 +780,36 @@ impl HedgeService {
                         );
 
                         for residual_attempt in 0..self.config.max_consecutive_hedge_failures {
-                            if residual <= hedge_dust {
+                            if residual <= unhedgeable {
                                 break;
+                            }
+
+                            // Back off between residual submits (mirrors the primary
+                            // loop) and refresh the HL quote so the IOC limit is not
+                            // anchored to a stale mid during a fast move.
+                            if residual_attempt > 0 {
+                                let delay_ms = (self.config.hedge_retry_base_delay_ms
+                                    * 2u64.saturating_pow((residual_attempt - 1) as u32))
+                                .min(self.config.hedge_retry_max_delay_ms);
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                            if let Some(cached) = self.hyperliquid_prices.usable_snapshot(
+                                Duration::from_millis(self.config.hedge_quote_max_age_ms),
+                            ) {
+                                if cached.bid > 0.0 && cached.ask > 0.0 {
+                                    hl_bid = cached.bid;
+                                    hl_ask = cached.ask;
+                                }
+                            } else if let Ok(Some((bid, ask))) = self
+                                .hyperliquid_trading
+                                .get_l2_snapshot(&self.config.symbol)
+                                .await
+                            {
+                                if bid > 0.0 && ask > 0.0 {
+                                    hl_bid = bid;
+                                    hl_ask = ask;
+                                    self.hyperliquid_prices.store(bid, ask);
+                                }
                             }
                             let attempt_no = max_attempts as u64 + residual_attempt as u64;
                             let cloid = Self::residual_cloid(
@@ -847,7 +888,7 @@ impl HedgeService {
                                         residual = (size - confirmed_hedge_size).max(0.0);
                                         let mut filled_update = HedgeLifecycleUpdate::new(
                                             &event,
-                                            if residual <= hedge_dust {
+                                            if residual <= unhedgeable {
                                                 HedgeIntentStatus::Filled
                                             } else {
                                                 HedgeIntentStatus::PartiallyFilled
@@ -891,7 +932,7 @@ impl HedgeService {
                             }
                         }
 
-                        if confirmed_hedge_size + hedge_dust < size {
+                        if confirmed_hedge_size + unhedgeable < size {
                             let mut failed_update =
                                 HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Error);
                             failed_update.target_qty = Some(size);

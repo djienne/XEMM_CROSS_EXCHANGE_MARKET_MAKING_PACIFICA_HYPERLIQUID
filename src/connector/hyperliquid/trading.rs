@@ -6,12 +6,26 @@ use ethers::utils::keccak256;
 use reqwest::Client;
 use serde_json::json;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use super::types::*;
 use crate::market_rules::hyperliquid_size_floor;
+
+/// Current Unix time in milliseconds (0 if the clock is before the epoch).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Refresh the cached asset metadata at most this often. The HL universe is
+/// append-only (existing asset indices are stable), so this is a low-frequency
+/// safety refresh against any future reindexing, not a hot-path concern.
+const META_TTL_MS: u64 = 3_600_000; // 1 hour
 
 const MAINNET_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const MAINNET_EXCHANGE_URL: &str = "https://api.hyperliquid.xyz/exchange";
@@ -43,7 +57,13 @@ pub struct HyperliquidTrading {
     client: Client,
     wallet: LocalWallet,
     meta_cache: Arc<RwLock<Option<MetaResponse>>>,
+    /// Wall-clock ms when `meta_cache` was last populated (0 = never).
+    meta_fetched_at: AtomicU64,
     is_testnet: bool,
+    /// Monotonic nonce source: strictly increasing, fast-forwarded to wall-clock
+    /// ms but never going backward, so two signed actions in the same millisecond
+    /// (or across a clock step-back) cannot collide.
+    nonce: AtomicU64,
 }
 
 impl HyperliquidTrading {
@@ -76,7 +96,9 @@ impl HyperliquidTrading {
             client: Client::new(),
             wallet,
             meta_cache: Arc::new(RwLock::new(None)),
+            meta_fetched_at: AtomicU64::new(0),
             is_testnet,
+            nonce: AtomicU64::new(now_ms()),
         })
     }
 
@@ -85,13 +107,34 @@ impl HyperliquidTrading {
         self.is_testnet
     }
 
+    /// Lock-free strictly-increasing nonce, fast-forwarded to wall-clock ms.
+    fn next_nonce(&self) -> u64 {
+        let now = now_ms();
+        let mut prev = self.nonce.load(Ordering::Relaxed);
+        loop {
+            let next = now.max(prev + 1);
+            match self.nonce.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(observed) => prev = observed,
+            }
+        }
+    }
+
     /// Fetch asset metadata (for asset IDs and szDecimals)
     pub async fn get_meta(&self) -> Result<MetaResponse> {
-        // Check cache first
+        // Check cache first (honoring the TTL so a stale asset map is refreshed).
         {
             let cache = self.meta_cache.read().await;
             if let Some(cached) = cache.as_ref() {
-                return Ok(cached.clone());
+                let age = now_ms().saturating_sub(self.meta_fetched_at.load(Ordering::Relaxed));
+                if age < META_TTL_MS {
+                    return Ok(cached.clone());
+                }
             }
         }
 
@@ -127,6 +170,7 @@ impl HyperliquidTrading {
         {
             let mut cache = self.meta_cache.write().await;
             *cache = Some(meta.clone());
+            self.meta_fetched_at.store(now_ms(), Ordering::Relaxed);
         }
 
         debug!("[HYPERLIQUID] Loaded {} assets", meta.universe.len());
@@ -199,14 +243,17 @@ impl HyperliquidTrading {
             return Ok(None);
         }
 
-        // Get best bid (first element of bids array)
+        // Get best bid (first element of bids array). Reject non-finite /
+        // non-positive levels at parse time so a corrupted L2 response can never
+        // feed garbage into hedge price math.
         let best_bid = levels
             .get(0)
             .and_then(|bids| bids.as_array())
             .and_then(|bids| bids.first())
             .and_then(|bid| bid.get("px"))
             .and_then(|px| px.as_str())
-            .and_then(|s| s.parse::<f64>().ok());
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0);
 
         // Get best ask (first element of asks array)
         let best_ask = levels
@@ -215,7 +262,8 @@ impl HyperliquidTrading {
             .and_then(|asks| asks.first())
             .and_then(|ask| ask.get("px"))
             .and_then(|px| px.as_str())
-            .and_then(|s| s.parse::<f64>().ok());
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0);
 
         match (best_bid, best_ask) {
             (Some(bid), Some(ask)) => {
@@ -425,6 +473,26 @@ impl HyperliquidTrading {
 
         let bid_price = bid.unwrap();
         let ask_price = ask.unwrap();
+        // Hard-validate the inputs before any price math: a non-finite or absurd
+        // bid/ask (corrupted REST L2 / data glitch) must never produce a hedge
+        // order priced from inf/garbage.
+        anyhow::ensure!(
+            bid_price.is_finite()
+                && ask_price.is_finite()
+                && bid_price > 0.0
+                && ask_price > 0.0
+                && ask_price >= bid_price,
+            "Invalid bid/ask for HL order: bid={bid_price} ask={ask_price}"
+        );
+        // Never sign a degenerate zero-size order: a fill below one HL size step
+        // would otherwise floor to "0". Bail so the caller routes the residual to
+        // the reconciler instead of sending an order the venue rejects.
+        anyhow::ensure!(
+            hyperliquid_size_floor(size, asset_info.sz_decimals) > 0.0,
+            "HL hedge size {} floors to 0 at szDecimals={}",
+            size,
+            asset_info.sz_decimals
+        );
         let mid_price = (bid_price + ask_price) / 2.0;
 
         // Calculate limit price with slippage
@@ -438,8 +506,36 @@ impl HyperliquidTrading {
 
         // Round price and size
         let is_spot = asset_id >= 10000;
-        let limit_price_str =
+        let mut limit_price_str =
             Self::round_price(limit_price, asset_info.sz_decimals, is_spot, is_buy, true); // aggressive=true for market orders
+
+        // round_price rounds to NEAREST, so a small configured slippage can land
+        // the IOC limit on the non-marketable side of the book (=> missed hedge).
+        // Bump one grid step toward marketability if that happened.
+        {
+            let max_decimals = ((if is_spot { 8 } else { 6 }) - asset_info.sz_decimals).max(0);
+            let grid_step = 10_f64.powi(-max_decimals);
+            if let Ok(mut p) = limit_price_str.parse::<f64>() {
+                if is_buy && p < ask_price {
+                    p += grid_step;
+                    limit_price_str =
+                        Self::round_price(p, asset_info.sz_decimals, is_spot, is_buy, true);
+                } else if !is_buy && p > bid_price {
+                    p -= grid_step;
+                    limit_price_str =
+                        Self::round_price(p, asset_info.sz_decimals, is_spot, is_buy, true);
+                }
+            }
+        }
+
+        // Final price sanity: never sign a non-finite / non-positive limit.
+        anyhow::ensure!(
+            limit_price_str
+                .parse::<f64>()
+                .map_or(false, |p| p.is_finite() && p > 0.0),
+            "Computed HL limit price not finite/positive: {limit_price_str}"
+        );
+
         let size_str = Self::round_size(size, asset_info.sz_decimals);
 
         info!(
@@ -475,10 +571,9 @@ impl HyperliquidTrading {
             grouping: "na".to_string(),
         };
 
-        // Get nonce (current timestamp in milliseconds)
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as u64;
+        // Monotonic nonce (never collides within a millisecond / across a
+        // clock step-back).
+        let nonce = self.next_nonce();
 
         // Sign the action
         let signature = self.sign_action(&action, nonce, None).await?;

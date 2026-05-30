@@ -93,6 +93,12 @@ fn classify_placement_failure(error: &anyhow::Error) -> PlacementFailure {
         || lower.contains("insufficient")
         || lower.contains("rejected")
         || lower.contains("invalid order")
+        // A signature expiry / verification failure means the order was
+        // definitively NOT accepted, so it is safe to clear and re-quote rather
+        // than freeze in unknown-submit recovery.
+        || lower.contains("expired")
+        || lower.contains("invalid message")
+        || lower.contains("verification failed")
     {
         return PlacementFailure::RejectedDefinitely { reason };
     }
@@ -124,6 +130,14 @@ mod tests {
                 "Hyper connection timed out before response"
             )),
             PlacementFailure::SubmitUnknown { .. }
+        ));
+        assert!(matches!(
+            classify_placement_failure(&anyhow::anyhow!("Order placement failed: Invalid message")),
+            PlacementFailure::RejectedDefinitely { .. }
+        ));
+        assert!(matches!(
+            classify_placement_failure(&anyhow::anyhow!("signature expired")),
+            PlacementFailure::RejectedDefinitely { .. }
         ));
     }
 }
@@ -420,6 +434,11 @@ impl XemmBot {
             Duration::from_millis(config.partial_hedge_idle_timeout_ms),
             config.partial_hedge_min_base,
             config.fill_aggregator_max_entries,
+            // Un-hedgeable dust floor: align with the reconciler's effective dust
+            // so a sub-dust terminal residual is treated as neutral/done.
+            config
+                .neutral_dust_base
+                .max(crate::market_rules::fallback_rules(&config.symbol).min_size),
         );
         let last_position_snapshot =
             Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));

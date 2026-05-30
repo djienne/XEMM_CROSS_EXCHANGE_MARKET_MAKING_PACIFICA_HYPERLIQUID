@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::trading::canonicalize_json;
-use crate::connector::pacifica::trading::{OrderData, OrderSide};
+use crate::connector::pacifica::trading::{OrderData, OrderSide, SIGNED_EXPIRY_WINDOW_MS};
 use crate::connector::pacifica::PacificaCredentials;
 use crate::market_rules::{pacifica_maker_price_for_is_buy, pacifica_size_floor};
 
@@ -97,7 +97,7 @@ impl PacificaWsTrading {
         }
 
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window: i64 = 5000;
+        let expiry_window: i64 = SIGNED_EXPIRY_WINDOW_MS;
         let header = json!({
             "type": "create_order",
             "timestamp": timestamp,
@@ -189,7 +189,7 @@ impl PacificaWsTrading {
         }
 
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window: i64 = 5000;
+        let expiry_window: i64 = SIGNED_EXPIRY_WINDOW_MS;
 
         let header = json!({
             "type": "cancel_all_orders",

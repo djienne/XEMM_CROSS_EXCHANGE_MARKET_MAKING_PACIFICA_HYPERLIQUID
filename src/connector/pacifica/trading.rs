@@ -62,11 +62,18 @@ impl OrderSide {
     }
 }
 
+/// Signed-request expiry window. Must comfortably exceed the HTTP client timeout
+/// (10s) and the WS request timeout so a slow request can never outlive its
+/// signature and be rejected as expired. Matches the Pacifica API max (30s).
+pub const SIGNED_EXPIRY_WINDOW_MS: i64 = 30_000;
+
 /// Order response from API
 #[derive(Debug, Deserialize)]
 pub struct OrderResponse {
     pub success: Option<bool>,
     pub data: Option<OrderData>,
+    /// Body-level rejection reason when `success == false`.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,7 +543,7 @@ impl PacificaTrading {
 
         // Build signature
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window = 5000; // 5 seconds
+        let expiry_window = SIGNED_EXPIRY_WINDOW_MS;
 
         let header = json!({
             "type": "create_order",
@@ -587,6 +594,20 @@ impl PacificaTrading {
         }
 
         let order_response: OrderResponse = response.json().await?;
+
+        // Body-level rejection: a 200 OK can still carry success:false (e.g.
+        // post-only-would-cross, insufficient margin). Surface the reason so the
+        // caller classifies it as a definite rejection (clear + re-quote) instead
+        // of an unknown submit (block + recovery), and never treat a rejected
+        // order as live.
+        if matches!(order_response.success, Some(false)) {
+            anyhow::bail!(
+                "Order rejected: {}",
+                order_response
+                    .error
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
 
         let order_data = order_response.data.context("No order data in response")?;
 
@@ -644,7 +665,7 @@ impl PacificaTrading {
 
         let client_order_id = Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window = 5000;
+        let expiry_window = SIGNED_EXPIRY_WINDOW_MS;
 
         let header = json!({
             "type": "create_market_order",
@@ -692,6 +713,15 @@ impl PacificaTrading {
 
         let order_response: OrderResponse = response.json().await?;
 
+        if matches!(order_response.success, Some(false)) {
+            anyhow::bail!(
+                "Market order rejected: {}",
+                order_response
+                    .error
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+
         let order_data = order_response.data.context("No order data in response")?;
         let order_id = order_data
             .order_id
@@ -720,7 +750,7 @@ impl PacificaTrading {
 
         // Build signature
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window = 5000;
+        let expiry_window = SIGNED_EXPIRY_WINDOW_MS;
 
         let header = json!({
             "type": "cancel_order",
@@ -755,6 +785,24 @@ impl PacificaTrading {
             anyhow::bail!("Order cancellation failed: {}", error_text);
         }
 
+        // A 200 OK can still carry success:false (e.g. order already gone). Parse
+        // the body and surface the failure instead of reporting a phantom success.
+        let response_text = response.text().await?;
+
+        #[derive(serde::Deserialize)]
+        struct CancelResponse {
+            success: bool,
+            error: Option<String>,
+        }
+
+        let parsed: CancelResponse = serde_json::from_str(&response_text)
+            .with_context(|| format!("Failed to parse cancel response: {}", response_text))?;
+
+        if !parsed.success {
+            let error_msg = parsed.error.unwrap_or_else(|| "Unknown error".to_string());
+            anyhow::bail!("Order cancellation failed: {}", error_msg);
+        }
+
         info!(
             "[PACIFICA] Order cancelled successfully: {}",
             client_order_id
@@ -786,7 +834,7 @@ impl PacificaTrading {
 
         // Build signature
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let expiry_window = 5000;
+        let expiry_window = SIGNED_EXPIRY_WINDOW_MS;
 
         let header = json!({
             "type": "cancel_all_orders",
