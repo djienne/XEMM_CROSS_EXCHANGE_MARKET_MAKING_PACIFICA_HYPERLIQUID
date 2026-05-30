@@ -123,15 +123,29 @@ impl OrderbookClient {
         let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
         ping_interval.tick().await; // Skip first immediate tick
 
+        // Staleness watchdog: if no inbound frame (incl. pong) arrives for several
+        // ping cycles the socket is half-open; reconnect rather than appearing
+        // healthy while no book updates flow.
+        let stale_after =
+            Duration::from_secs((self.config.ping_interval_secs.max(1)).saturating_mul(3));
+        let mut stale_check = interval(Duration::from_secs(self.config.ping_interval_secs.max(1)));
+        stale_check.tick().await;
+        let mut last_inbound = tokio::time::Instant::now();
+
         // Main event loop
         loop {
             tokio::select! {
                 // Handle incoming messages
                 msg = read.next() => {
+                    last_inbound = tokio::time::Instant::now();
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             debug!("[PACIFICA] Received message: {}", text);
-                            self.handle_message(&text, callback)?;
+                            // A single malformed frame must not tear down the whole
+                            // connection (forcing a resubscribe); log and continue.
+                            if let Err(e) = self.handle_message(&text, callback) {
+                                warn!("[PACIFICA] Skipping unparseable book frame: {}", e);
+                            }
                         }
                         Some(Ok(Message::Close(_))) => {
                             info!("[PACIFICA] Received close message from server");
@@ -166,6 +180,18 @@ impl OrderbookClient {
                         return Err(anyhow!("[PACIFICA] Failed to send ping: {}", e));
                     }
                 }
+
+                // Staleness watchdog. Return Err (not break) so `start` treats it as
+                // a connection failure and reconnects + resubscribes, rather than
+                // exiting as a graceful close.
+                _ = stale_check.tick() => {
+                    if last_inbound.elapsed() > stale_after {
+                        return Err(anyhow!(
+                            "[PACIFICA] No inbound frame for {:?}; socket stale",
+                            last_inbound.elapsed()
+                        ));
+                    }
+                }
             }
         }
 
@@ -186,7 +212,7 @@ impl OrderbookClient {
             None => {
                 debug!(
                     "[PACIFICA] Received message without channel field, ignoring: {}",
-                    if text.len() > 100 { &text[..100] } else { text }
+                    text.chars().take(100).collect::<String>()
                 );
                 return Ok(());
             }

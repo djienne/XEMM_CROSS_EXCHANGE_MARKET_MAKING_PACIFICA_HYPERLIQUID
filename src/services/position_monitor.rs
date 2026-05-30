@@ -16,9 +16,7 @@ use crate::connector::pacifica::PacificaTrading;
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::{
-    enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
-};
+use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use crate::strategy::OrderSide;
 use crate::util::log::{tag_static, Color};
 
@@ -93,6 +91,10 @@ impl PositionMonitorService {
                         }
                     }
                     Err(e) => {
+                        // Drop the baseline on a failed refresh so a stale Some(..)
+                        // cannot later be diffed against a fresh read and produce a
+                        // phantom fill of the prior order's size.
+                        *self.last_position_snapshot.lock() = None;
                         debug!(
                             "[POSITION_MONITOR] Failed to fetch baseline position: {}",
                             e
@@ -105,12 +107,42 @@ impl PositionMonitorService {
             let (order_id_opt, client_order_id, order_side, _order_size) =
                 active_order_info.unwrap();
 
+            // Is the baseline missing or stale (not refreshed since ~2x the idle
+            // poll)? If so we must re-anchor it before trusting any delta, else a
+            // stale baseline manufactures a phantom fill for this order.
+            let baseline_stale = {
+                let snap = self.last_position_snapshot.lock();
+                match snap.as_ref() {
+                    None => true,
+                    Some(s) => s.last_check.elapsed() > Duration::from_millis(4000),
+                }
+            };
+
             // Fetch current positions
             let positions_result = self.pacifica_trading.get_positions().await;
 
             match positions_result {
                 Ok(positions) => {
                     let current_position = positions.iter().find(|p| p.symbol == self.symbol);
+
+                    if baseline_stale {
+                        // Re-anchor to the authoritative current position and skip
+                        // delta detection on this tick. Subsequent ticks detect
+                        // genuine fills against this fresh baseline.
+                        let (amount, side) = current_position
+                            .map(|p| (parse(&p.amount).unwrap_or(0.0), p.side.clone()))
+                            .unwrap_or((0.0, "none".to_string()));
+                        *self.last_position_snapshot.lock() = Some(PositionSnapshot {
+                            amount,
+                            side,
+                            last_check: std::time::Instant::now(),
+                        });
+                        debug!(
+                            "[POSITION_MONITOR] Re-anchored stale baseline before delta detection"
+                        );
+                        continue;
+                    }
+
                     let last_snapshot = self.last_position_snapshot.lock().clone();
 
                     // Calculate position delta
@@ -250,20 +282,36 @@ impl PositionMonitorService {
                                 reservation = Some(r);
                                 intent
                             } else {
+                                // Synthetic id namespaced into a disjoint range (top
+                                // bit set) so it cannot collide with a real Pacifica
+                                // order_id in the aggregator map. Register through the
+                                // aggregator just like the real-id path so the
+                                // reconciler sees this hedge as pending and does not
+                                // double-hedge the same fill.
                                 let source_order_id = synthetic_source_id(
                                     &client_order_id,
                                     synthetic_nonce.fetch_add(1, Ordering::AcqRel),
-                                );
-                                let hedge_seq = synthetic_nonce.fetch_add(1, Ordering::AcqRel);
-                                HedgeIntent::from_venue_side(
+                                ) | (1u64 << 63);
+                                if !self.fill_aggregator.observe_fill(
                                     source_order_id,
-                                    hedge_seq,
-                                    HedgeSource::PositionMonitor,
-                                    HedgeVenueSide::from_maker_side(order_side),
+                                    order_side,
                                     fill_size,
                                     estimated_price,
                                     true,
-                                )
+                                ) {
+                                    debug!(
+                                        "[POSITION_MONITOR] Synthetic position fill already accounted for (id={})",
+                                        source_order_id
+                                    );
+                                    continue;
+                                }
+                                let Some(r) = self.fill_aggregator.try_reserve_hedge(source_order_id)
+                                else {
+                                    continue;
+                                };
+                                let intent: HedgeIntent = r.into();
+                                reservation = Some(r);
+                                intent
                             };
 
                             if !self.low_latency_mode {

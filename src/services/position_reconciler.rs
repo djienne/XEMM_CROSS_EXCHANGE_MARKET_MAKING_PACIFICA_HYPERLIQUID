@@ -37,8 +37,15 @@ impl PositionReconcilerService {
         // age; it is reset whenever exposure shrinks (progress) so a slow-but-
         // working hedge is not punished toward the hard-error ceiling.
         let mut unhedged_since: Option<Instant> = None;
+        // Separate, non-resettable clock for the hard terminal stop: rearmed ONLY
+        // when exposure genuinely returns to neutral/dust, never on transient
+        // progress, so a sawtooth shrinking exposure cannot starve the safety stop.
+        let mut hard_unhedged_since: Option<Instant> = None;
         let mut last_enqueued: Option<(f64, Instant)> = None;
         let mut prev_eff_net: Option<f64> = None;
+        // L11: require consecutive neutral reads before completing the cycle, so a
+        // single transiently-neutral REST sample cannot zero a live position.
+        let mut neutral_confirmations: u32 = 0;
 
         loop {
             ticker.tick().await;
@@ -79,11 +86,16 @@ impl PositionReconcilerService {
             let net = pac_pos + hl_pos;
             if net.abs() <= effective_dust {
                 unhedged_since = None;
+                hard_unhedged_since = None;
                 last_enqueued = None;
                 prev_eff_net = None;
+                neutral_confirmations = neutral_confirmations.saturating_add(1);
                 let can_complete = {
                     let state = self.bot_state.read();
                     state.active_order.is_none()
+                        // Two successive neutral ticks guard against a transiently
+                        // neutral sample zeroing a live position.
+                        && neutral_confirmations >= 2
                         && matches!(
                             run_state,
                             RunState::Reconciling | RunState::Hedging | RunState::Filled
@@ -119,6 +131,8 @@ impl PositionReconcilerService {
                 }
                 continue;
             }
+            // Net is not neutral this tick: any prior neutral streak is broken.
+            neutral_confirmations = 0;
 
             // NOTE: we intentionally do NOT early-`continue` on `RunState::Hedging`.
             // Skipping the whole tick there would also skip the hard-error timer, so
@@ -151,6 +165,7 @@ impl PositionReconcilerService {
             // the hard-error timer.
             if effective_net <= effective_dust {
                 unhedged_since = None;
+                hard_unhedged_since = None;
                 last_enqueued = None;
                 prev_eff_net = None;
                 debug!(
@@ -169,6 +184,7 @@ impl PositionReconcilerService {
                     effective_net, net, self.config.symbol
                 );
                 unhedged_since = None;
+                hard_unhedged_since = None;
                 last_enqueued = None;
                 prev_eff_net = None;
                 if !matches!(run_state, RunState::Error) {
@@ -188,12 +204,17 @@ impl PositionReconcilerService {
 
             let first_seen = *unhedged_since.get_or_insert_with(Instant::now);
             let unhedged_for = first_seen.elapsed();
+            // Hard clock: measures CONTINUOUS exposure age; only the neutral/dust
+            // reset sites clear it, so transient progress cannot rearm it.
+            let hard_first_seen = *hard_unhedged_since.get_or_insert_with(Instant::now);
+            let hard_unhedged_for = hard_first_seen.elapsed();
             let usd_exposure = if mid_price > 0.0 {
                 Some(effective_net * mid_price)
             } else {
                 None
             };
-            let limit_breach = self.exposure_limit_breach(effective_net, usd_exposure, unhedged_for);
+            let limit_breach =
+                self.exposure_limit_breach(effective_net, usd_exposure, hard_unhedged_for);
             {
                 let mut state = self.bot_state.write();
                 if limit_breach {
@@ -268,15 +289,15 @@ impl PositionReconcilerService {
         &self,
         abs_base: f64,
         usd_exposure: Option<f64>,
-        unhedged_for: Duration,
+        hard_unhedged_for: Duration,
     ) -> bool {
-        // M3: base/USD ceilings escalate immediately; the time ceiling uses the
-        // larger hard limit so a slow-but-progressing hedge stays in Reconciling.
+        // base/USD ceilings escalate immediately; the time ceiling uses the
+        // non-resettable hard clock so a sawtooth exposure cannot starve it.
         (self.config.max_unhedged_base > 0.0 && abs_base > self.config.max_unhedged_base)
             || usd_exposure
                 .map(|usd| self.config.max_unhedged_usd > 0.0 && usd > self.config.max_unhedged_usd)
                 .unwrap_or(false)
-            || unhedged_for >= Duration::from_millis(self.config.max_unhedged_hard_ms)
+            || hard_unhedged_for >= Duration::from_millis(self.config.max_unhedged_hard_ms)
     }
 
     fn should_enqueue_residual(

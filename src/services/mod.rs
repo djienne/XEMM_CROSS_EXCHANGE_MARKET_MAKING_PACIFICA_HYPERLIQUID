@@ -179,27 +179,22 @@ pub async fn enqueue_hedge_intent(
     bot_state: &Arc<RwLock<BotState>>,
     intent: HedgeIntent,
 ) -> anyhow::Result<HedgeEnqueueResult> {
-    if let Err(e) = hedge_store::append_lifecycle_update(hedge_store::HedgeLifecycleUpdate::new(
+    // Journaling is best-effort: a saturated/stalled lifecycle log must NOT abort
+    // the hedge. The authoritative exposure decision is the hedge channel state
+    // below, not whether the Created record was persisted.
+    hedge_store::try_append_lifecycle_update(hedge_store::HedgeLifecycleUpdate::new(
         &intent,
         hedge_store::HedgeIntentStatus::Created,
     ))
-    .await
-    {
-        let mut state = bot_state.write();
-        state.set_error(format!(
-            "failed to persist hedge intent before enqueue: {}",
-            e
-        ));
-        anyhow::bail!("failed to persist hedge intent before enqueue: {}", e);
-    }
+    .await;
 
     match hedge_tx.try_send(intent.clone()) {
         Ok(()) => {
-            hedge_store::append_lifecycle_update(hedge_store::HedgeLifecycleUpdate::new(
+            hedge_store::try_append_lifecycle_update(hedge_store::HedgeLifecycleUpdate::new(
                 &intent,
                 hedge_store::HedgeIntentStatus::Queued,
             ))
-            .await?;
+            .await;
             Ok(HedgeEnqueueResult::Queued)
         }
         Err(mpsc::error::TrySendError::Full(intent)) => {
@@ -211,7 +206,7 @@ pub async fn enqueue_hedge_intent(
                 hedge_store::HedgeIntentStatus::QueueFull,
             );
             update.reason = Some("hedge queue full".to_string());
-            hedge_store::append_lifecycle_update(update).await?;
+            hedge_store::try_append_lifecycle_update(update).await;
             let mut state = bot_state.write();
             state.mark_reconciling();
             Ok(HedgeEnqueueResult::PersistedButNotQueued {
@@ -224,7 +219,7 @@ pub async fn enqueue_hedge_intent(
                 hedge_store::HedgeIntentStatus::QueueClosed,
             );
             update.reason = Some("hedge queue closed".to_string());
-            hedge_store::append_lifecycle_update(update).await?;
+            hedge_store::try_append_lifecycle_update(update).await;
             let mut state = bot_state.write();
             state.set_error("hedge queue closed; intent persisted".to_string());
             Ok(HedgeEnqueueResult::PersistedButNotQueued {

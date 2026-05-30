@@ -122,6 +122,16 @@ pub async fn append_lifecycle_update(update: HedgeLifecycleUpdate<'_>) -> Result
     append_lifecycle_line_to_path(DEFAULT_HEDGE_LIFECYCLE_PATH, line).await
 }
 
+/// Best-effort lifecycle write that NEVER fails the caller. Journaling is a
+/// non-critical observability concern; a saturated/closed log channel or a
+/// stalled disk must not abort a hedge decision (which would let a non-trading
+/// subsystem wedge the trading subsystem). Drops are logged.
+pub async fn try_append_lifecycle_update(update: HedgeLifecycleUpdate<'_>) {
+    if let Err(e) = append_lifecycle_update(update).await {
+        tracing::warn!("hedge lifecycle journal write dropped (non-fatal): {}", e);
+    }
+}
+
 #[cfg(test)]
 async fn append_lifecycle_update_to_path(
     path: impl AsRef<Path>,

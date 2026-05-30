@@ -314,6 +314,15 @@ impl PacificaWsTrading {
             let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
             keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            // Staleness watchdog: reconnect if no inbound frame (incl. pong) for
+            // several keepalive cycles, so a half-open socket does not silently
+            // stall hedge cancellations while appearing connected.
+            let stale_after = KEEPALIVE_INTERVAL.saturating_mul(3);
+            let mut stale_check = tokio::time::interval(KEEPALIVE_INTERVAL);
+            stale_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            stale_check.tick().await;
+            let mut last_inbound = tokio::time::Instant::now();
+
             // Pump until one side fails.
             let dc_reason: String = loop {
                 tokio::select! {
@@ -339,6 +348,7 @@ impl PacificaWsTrading {
                         }
                     }
                     frame = read.next() => {
+                        last_inbound = tokio::time::Instant::now();
                         match frame {
                             Some(Ok(Message::Text(text))) => {
                                 Self::dispatch_incoming(&text, &pending);
@@ -351,6 +361,11 @@ impl PacificaWsTrading {
                             Some(Err(e)) => break format!("read error: {}", e),
                             None => break "stream ended".to_string(),
                             _ => {}
+                        }
+                    }
+                    _ = stale_check.tick() => {
+                        if last_inbound.elapsed() > stale_after {
+                            break "stale connection (no inbound)".to_string();
                         }
                     }
                 }

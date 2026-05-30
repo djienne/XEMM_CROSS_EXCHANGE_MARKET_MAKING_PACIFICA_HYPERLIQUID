@@ -1290,23 +1290,41 @@ impl XemmBot {
         // Wait up to 5 s for the hedge service to either signal `shutdown_tx`
         // (normal exit path) or timeout. We tolerate the timeout to avoid hanging
         // the process indefinitely if something is stuck on the Hyperliquid side.
-        match tokio::time::timeout(Duration::from_secs(5), shutdown_rx.recv()).await {
-            Ok(Some(())) => info!(
-                "{} {} Hedge service drained cleanly",
-                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
-                "OK".green().bold()
-            ),
-            Ok(None) => info!(
-                "{} {} Hedge service already exited",
-                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
-                "OK".green().bold()
-            ),
-            Err(_) => warn!(
-                "{} {} Hedge drain timed out after 5s - check data/unhedged_positions.jsonl",
-                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
-                "WARN".yellow().bold()
-            ),
-        }
+        // Track whether the hedge service actually finished draining. If it only
+        // timed out, a mid-flight hedge may still be settling, so the post-drain
+        // exposure read is unreliable and must not trigger a false "unresolved
+        // exposure" bail (which would wedge the next startup in Reconciling).
+        let drain_confirmed = match tokio::time::timeout(
+            Duration::from_secs(5),
+            shutdown_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(())) => {
+                info!(
+                    "{} {} Hedge service drained cleanly",
+                    tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
+                    "OK".green().bold()
+                );
+                true
+            }
+            Ok(None) => {
+                info!(
+                    "{} {} Hedge service already exited",
+                    tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
+                    "OK".green().bold()
+                );
+                true
+            }
+            Err(_) => {
+                warn!(
+                    "{} {} Hedge drain timed out after 5s - check data/unhedged_positions.jsonl",
+                    tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
+                    "WARN".yellow().bold()
+                );
+                false
+            }
+        };
 
         info!("");
         info!(
@@ -1336,16 +1354,27 @@ impl XemmBot {
             ),
         }
 
-        if let Ok((pacifica_position, hyperliquid_position)) = self.signed_positions().await {
-            let net = pacifica_position + hyperliquid_position;
-            if net.abs() > self.config.neutral_dust_base {
-                self.persist_unresolved_exposure(net).await;
-                anyhow::bail!(
-                    "Shutdown left unresolved net exposure {:.8} {}",
-                    net,
-                    self.config.symbol
-                );
+        // Only treat residual net as "unresolved exposure" when the hedge service
+        // confirmed it drained; a timed-out drain means a hedge may still be in
+        // flight, so a non-neutral reading here would be a false positive.
+        if drain_confirmed {
+            if let Ok((pacifica_position, hyperliquid_position)) = self.signed_positions().await {
+                let net = pacifica_position + hyperliquid_position;
+                if net.abs() > self.config.neutral_dust_base {
+                    self.persist_unresolved_exposure(net).await;
+                    anyhow::bail!(
+                        "Shutdown left unresolved net exposure {:.8} {}",
+                        net,
+                        self.config.symbol
+                    );
+                }
             }
+        } else {
+            warn!(
+                "{} {} Skipping exposure bail after drain timeout; hedge may still be settling (the hedge service persists any genuinely-failed hedge to data/unhedged_positions.jsonl)",
+                tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
+                "WARN".yellow().bold()
+            );
         }
 
         // Final state check

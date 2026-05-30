@@ -354,10 +354,20 @@ impl FillDetectionClient {
         // Set up ping interval
         let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
 
+        // Staleness watchdog: a half-open fill socket can report ready while no
+        // fills arrive. Reconnect if no inbound frame (incl. pong) for several
+        // ping cycles so fills are not silently missed.
+        let stale_after =
+            Duration::from_secs(self.config.ping_interval_secs.max(1).saturating_mul(3));
+        let mut stale_check = interval(Duration::from_secs(self.config.ping_interval_secs.max(1)));
+        stale_check.tick().await;
+        let mut last_inbound = tokio::time::Instant::now();
+
         loop {
             tokio::select! {
                 // Handle incoming messages
                 msg = read.next() => {
+                    last_inbound = tokio::time::Instant::now();
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             if let Err(e) = self.handle_message(&text, callback) {
@@ -389,6 +399,18 @@ impl FillDetectionClient {
                     let ping_json = serde_json::to_string(&ping_msg)?;
                     write.send(Message::Text(ping_json)).await?;
                     debug!("Sent ping");
+                }
+
+                // Staleness watchdog. Return Err so `start` reconnects + re-runs the
+                // reconcile hook + re-subscribes (a graceful break would not).
+                _ = stale_check.tick() => {
+                    if last_inbound.elapsed() > stale_after {
+                        self.ready.store(false, Ordering::Release);
+                        return Err(anyhow::anyhow!(
+                            "[PACIFICA_FILL] No inbound frame for {:?}; socket stale",
+                            last_inbound.elapsed()
+                        ));
+                    }
                 }
             }
         }
