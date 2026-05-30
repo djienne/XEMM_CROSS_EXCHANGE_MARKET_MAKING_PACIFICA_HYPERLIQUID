@@ -553,6 +553,9 @@ impl XemmBot {
             trade_gate: self.trade_gate.clone(),
             cancel_demand: cancel_demand.clone(),
             config: self.config.clone(),
+            fill_aggregator: self.fill_aggregator.clone(),
+            processed_fills: self.processed_fills.clone(),
+            hedge_tx: self.hedge_tx.clone(),
         });
         {
             // Fail-closed: owns the cancel-intent Receiver, which cannot be
@@ -764,7 +767,7 @@ impl XemmBot {
             cancel_demand.clone(),
         );
         let order_monitor_service = Arc::new(order_monitor_service);
-        spawn_monitor_tasks(order_monitor_service);
+        spawn_monitor_tasks(order_monitor_service, self.trade_gate.clone());
 
         // Safety Monitor (health/gate updater, restartable via factory).
         {
@@ -1105,6 +1108,10 @@ impl XemmBot {
                                     let order_id_display = order_id_opt.unwrap_or(0);
                                     let submitted_price = order_data.submitted_price.unwrap_or(opp.pacifica_price);
                                     let submitted_size = order_data.submitted_size.unwrap_or(opp.size);
+                                    // Display the locally-generated UUID (always a
+                                    // 36-char ASCII string), never the server echo:
+                                    // a short/non-char-boundary `returned_cloid`
+                                    // would panic these byte slices in the live path.
                                     info!(
                                         "{} {} Placed {} #{} @ {} | cloid: {}...{}",
                                         tag(&self.config.symbol, "ORDER", Color::BrightYellow),
@@ -1112,8 +1119,8 @@ impl XemmBot {
                                         opp.direction.as_str().bright_yellow(),
                                         order_id_display,
                                         format!("${:.4}", submitted_price).cyan().bold(),
-                                        &returned_cloid[..8],
-                                        &returned_cloid[returned_cloid.len()-4..]
+                                        &client_order_id[..8],
+                                        &client_order_id[client_order_id.len() - 4..]
                                     );
 
                                     let mut state = self.bot_state.write();

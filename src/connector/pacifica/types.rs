@@ -173,6 +173,10 @@ pub enum OrderEvent {
     Expired,
     PostOnlyRejected,
     SelfTradePrevented,
+    /// Any event the server adds in the future: parse-tolerant so a new value
+    /// never fails the whole frame (handled as "unknown" by `to_fill_event`).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Order status
@@ -184,6 +188,10 @@ pub enum OrderStatus {
     Filled,
     Cancelled,
     Rejected,
+    /// Any status the server adds in the future: parse-tolerant. `to_fill_event`
+    /// maps it to `None` (no fill emitted), so it can never be mis-hedged.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Order update data
@@ -201,7 +209,8 @@ pub struct OrderUpdate {
     pub side: String, // "bid" or "ask"
     #[serde(rename = "p")]
     pub avg_filled_price: String,
-    #[serde(rename = "ip")]
+    // Non-fill-critical: tolerate absence so a fill in the same frame is not lost.
+    #[serde(rename = "ip", default)]
     pub initial_price: String,
     #[serde(rename = "a")]
     pub original_amount: String,
@@ -221,7 +230,8 @@ pub struct OrderUpdate {
     pub reduce_only: bool,
     #[serde(rename = "ut")]
     pub updated_at: u64, // milliseconds
-    #[serde(rename = "ct")]
+    // Non-fill-critical: tolerate absence so a fill in the same frame is not lost.
+    #[serde(rename = "ct", default)]
     pub created_at: u64, // milliseconds
 }
 

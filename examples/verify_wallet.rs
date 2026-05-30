@@ -9,8 +9,14 @@ async fn main() -> anyhow::Result<()> {
     let hl_wallet = std::env::var("HL_WALLET")?;
     let hl_private_key = std::env::var("HL_PRIVATE_KEY")?;
 
+    // SECURITY: never print the private key. Only show that it loaded and a short,
+    // non-sensitive prefix so the output can be safely captured (nohup/docker/CI).
     println!("HL_WALLET from .env: {}", hl_wallet);
-    println!("HL_PRIVATE_KEY from .env: {}", hl_private_key);
+    println!(
+        "HL_PRIVATE_KEY from .env: loaded (len={}, prefix={}...)",
+        hl_private_key.len(),
+        hl_private_key.get(..4).unwrap_or("")
+    );
     println!();
 
     // Try parsing with LocalWallet::from_str

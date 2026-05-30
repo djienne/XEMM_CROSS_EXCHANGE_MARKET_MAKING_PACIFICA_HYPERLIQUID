@@ -10,8 +10,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use super::types::{
-    AccountOrderUpdatesResponse, AccountOrderUpdatesSubscribe, AccountPositionsResponse,
-    AccountPositionsSubscribe, FillEvent, PingMessage,
+    AccountOrderUpdatesSubscribe, AccountPositionsResponse, AccountPositionsSubscribe, FillEvent,
+    OrderUpdate, PingMessage,
 };
 
 /// Configuration for fill detection client
@@ -410,27 +410,42 @@ impl FillDetectionClient {
                     debug!("Received pong");
                 }
                 "account_order_updates" => {
-                    // Parse as account order updates response
-                    let updates: AccountOrderUpdatesResponse = serde_json::from_str(text)?;
-                    debug!("Received {} order update(s)", updates.data.len());
+                    // Parse each update independently from the already-decoded
+                    // envelope. A single malformed/unknown sibling update must NOT
+                    // drop the whole frame, which could discard a `Filled` event
+                    // that shares the batch (=> missed hedge / naked exposure).
+                    let items = response
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    debug!("Received {} order update(s)", items.len());
 
                     // Update last order fill time for cross-validation
                     *self.last_order_fill_time.lock() = Instant::now();
 
-                    // Process each order update
-                    for update in updates.data {
-                        debug!(
-                            "Order update - ID: {}, Status: {:?}, Event: {:?}, Filled: {}/{}",
-                            update.order_id,
-                            update.order_status,
-                            update.order_event,
-                            update.filled_amount,
-                            update.original_amount
-                        );
-
-                        // Convert to fill event and call callback if applicable
-                        if let Some(fill_event) = update.to_fill_event() {
-                            callback(fill_event);
+                    for item in items {
+                        match serde_json::from_value::<OrderUpdate>(item.clone()) {
+                            Ok(update) => {
+                                debug!(
+                                    "Order update - ID: {}, Status: {:?}, Event: {:?}, Filled: {}/{}",
+                                    update.order_id,
+                                    update.order_status,
+                                    update.order_event,
+                                    update.filled_amount,
+                                    update.original_amount
+                                );
+                                if let Some(fill_event) = update.to_fill_event() {
+                                    callback(fill_event);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[PACIFICA_FILL] Skipping unparseable order update \
+                                     (sibling fills preserved): {} | raw={}",
+                                    e, item
+                                );
+                            }
                         }
                     }
                 }

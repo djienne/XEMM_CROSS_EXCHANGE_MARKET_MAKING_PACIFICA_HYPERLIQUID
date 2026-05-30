@@ -102,6 +102,10 @@ EXCLUDE_PATTERNS = [
     'deploy.py',
     '**/*.pyc',  # Python bytecode
     '__pycache__/',  # Python cache
+    # Defense-in-depth: never ship credential-handling dev utilities to the host.
+    # (The prints themselves are already scrubbed; this keeps the files off the VPS.)
+    '**/verify_wallet.rs',
+    '**/verify_wallet.js',
 ]
 
 

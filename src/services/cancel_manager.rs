@@ -6,12 +6,17 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use fast_float::parse;
+
 use crate::bot::{BotState, BotStatus, RunState};
 use crate::config::Config;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::services::fill_aggregator::{FillAggregator, HedgeReservation};
+use crate::services::fill_dedup::{FillDedup, FillKey};
 use crate::services::metrics;
 use crate::services::order_monitor::SharedOrderSnapshot;
 use crate::services::trade_gate::{GateReason, TradeGate};
+use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use crate::util::cancel::dual_cancel;
 use crate::util::rate_limit::is_rate_limit_error;
 
@@ -120,6 +125,11 @@ pub struct CancelManagerService {
     pub trade_gate: Arc<TradeGate>,
     pub cancel_demand: Arc<CancelDemand>,
     pub config: Config,
+    /// Shared fill pipeline, so a fill that races a cancel can be routed to the
+    /// hedge path instead of being silently dropped as a no-op cancel.
+    pub fill_aggregator: Arc<FillAggregator>,
+    pub processed_fills: Arc<FillDedup>,
+    pub hedge_tx: mpsc::Sender<HedgeIntent>,
 }
 
 impl CancelManagerService {
@@ -204,7 +214,16 @@ impl CancelManagerService {
 
             match self.verify_no_open_orders(&intent.symbol).await {
                 Ok(true) => {
-                    self.clear_after_verified_cancel();
+                    // The order is gone from the book. Before concluding it was
+                    // cancelled, verify it did not actually FILL (cancel-vs-fill
+                    // race): a filled order disappearing would otherwise be cleared
+                    // as a no-op cancel, dropping the fast hedge path and leaving
+                    // naked exposure. If a fill is found we route it to the hedge
+                    // pipeline and let that path own the state (do not clear here).
+                    let routed = self.route_fill_if_any(&intent.symbol).await;
+                    if !routed {
+                        self.clear_after_verified_cancel();
+                    }
                     self.trade_gate.allow(GateReason::OpenOrderExists);
                     self.trade_gate.allow(GateReason::OpenOrderUnknown);
                     self.trade_gate.allow(GateReason::CancelPending);
@@ -250,6 +269,112 @@ impl CancelManagerService {
         Ok(!orders.iter().any(|order| order.symbol == symbol))
     }
 
+    /// Cancel-vs-fill guard: when the active order has vanished from the book,
+    /// check trade history for the order's CLOID. If it actually filled, route the
+    /// fill to the hedge pipeline and return `true` so the caller does NOT clear
+    /// the active order (the fill/hedge path owns the state from here).
+    ///
+    /// Idempotent against the WS/REST/position fill layers via the shared
+    /// `FillAggregator` (cumulative-keyed) and `processed_fills` dedup, so this can
+    /// never double-hedge a fill another layer already claimed.
+    async fn route_fill_if_any(&self, symbol: &str) -> bool {
+        let Some((cloid, order_id_opt, side, size)) = ({
+            let state = self.bot_state.read();
+            state
+                .active_order
+                .as_ref()
+                .map(|o| (o.client_order_id.clone(), o.order_id, o.side, o.size))
+        }) else {
+            return false;
+        };
+
+        let trades = match self
+            .rest
+            .get_trade_history(Some(symbol), Some(100), None, None)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // Could not confirm; treat as not-routed so the slow REST fill
+                // detector / reconciler remain the backstop. Do not clear yet:
+                // leave the verify loop's caller to decide (it will clear only on a
+                // genuine no-fill cancel). Returning false here means we may clear,
+                // but the REST fill detector + reconciler still catch a missed fill.
+                warn!(
+                    "[CANCEL] Trade-history fill check failed for {}: {}",
+                    cloid, e
+                );
+                return false;
+            }
+        };
+
+        let mut cumulative = 0.0;
+        let mut notional = 0.0;
+        let mut order_id = order_id_opt.unwrap_or(0);
+        for trade in trades
+            .iter()
+            .filter(|t| t.client_order_id.as_deref() == Some(cloid.as_str()))
+        {
+            let qty: f64 = parse(&trade.amount).unwrap_or(0.0);
+            let px: f64 = parse(&trade.entry_price).unwrap_or(0.0);
+            if qty <= 0.0 {
+                continue;
+            }
+            cumulative += qty;
+            notional += qty * px.max(0.0);
+            order_id = trade.order_id;
+        }
+
+        if cumulative <= 0.0 {
+            return false; // genuine cancel, no fill
+        }
+        let avg_price = if notional > 0.0 {
+            notional / cumulative
+        } else {
+            0.0
+        };
+
+        // If another layer already accounted for this cumulative, defer to it: do
+        // not clear (it owns the fill/hedge state), but do not re-hedge either.
+        if !self.fill_aggregator.observe_fill_with_target(
+            order_id,
+            side,
+            cumulative,
+            avg_price,
+            true,
+            Some(size),
+        ) {
+            return true;
+        }
+        if !self
+            .processed_fills
+            .insert_if_new(FillKey::from_cloid_cumulative(cloid.clone(), cumulative))
+        {
+            return true;
+        }
+        let Some(reservation) = self.fill_aggregator.try_reserve_hedge(order_id) else {
+            return true;
+        };
+
+        {
+            let mut state = self.bot_state.write();
+            state.mark_filled(reservation.size, reservation.side);
+        }
+        warn!(
+            "[CANCEL] Cancel-vs-fill race: order {} actually filled {} @ ${:.4}; routing to hedge",
+            cloid, reservation.size, reservation.avg_price
+        );
+        enqueue_reserved_hedge(
+            &self.fill_aggregator,
+            &self.hedge_tx,
+            &self.bot_state,
+            reservation,
+            "cancel-vs-fill",
+        )
+        .await;
+        true
+    }
+
     fn clear_after_verified_cancel(&self) {
         self.trade_gate.mark_cancel_now();
         self.order_snapshot.set(None);
@@ -259,6 +384,38 @@ impl CancelManagerService {
             BotStatus::OrderPlaced | BotStatus::Cancelling | BotStatus::CancelPending
         ) {
             state.clear_active_order();
+        }
+    }
+}
+
+async fn enqueue_reserved_hedge(
+    aggregator: &FillAggregator,
+    hedge_tx: &mpsc::Sender<HedgeIntent>,
+    bot_state: &Arc<RwLock<BotState>>,
+    reservation: HedgeReservation,
+    context: &str,
+) -> bool {
+    let intent: HedgeIntent = reservation.into();
+    match enqueue_hedge_intent(hedge_tx, bot_state, intent).await {
+        Ok(HedgeEnqueueResult::Queued) => {
+            aggregator.commit_queued(reservation);
+            true
+        }
+        Ok(HedgeEnqueueResult::PersistedButNotQueued { reason }) => {
+            aggregator.release_reservation(reservation);
+            warn!(
+                "[CANCEL] Hedge not queued for {}; released reservation: {}",
+                context, reason
+            );
+            false
+        }
+        Err(e) => {
+            aggregator.release_reservation(reservation);
+            warn!(
+                "[CANCEL] Hedge enqueue failed for {}; released reservation: {}",
+                context, e
+            );
+            false
         }
     }
 }

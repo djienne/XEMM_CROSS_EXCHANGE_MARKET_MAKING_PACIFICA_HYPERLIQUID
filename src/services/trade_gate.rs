@@ -108,6 +108,14 @@ impl TradeGate {
 
     #[inline]
     pub fn is_blocked(&self, reason: GateReason) -> bool {
+        // The fail-closed latch is authoritative for ServiceDown: once set it can
+        // never be cleared by `mark_service_up`'s bit manipulation, closing the
+        // race where a restartable recovery clears the bit while the latch is set.
+        if reason == GateReason::ServiceDown
+            && self.service_down_latched.load(Ordering::Acquire)
+        {
+            return true;
+        }
         self.reasons_bits() & reason.bit() != 0
     }
 
@@ -140,7 +148,12 @@ impl TradeGate {
             // and set the bit between our load and our `allow`, which would leave
             // the bit clear while a task is actually down. Re-assert it if so. The
             // count is the source of truth; this keeps the mirrored bit coherent.
-            if self.service_down.load(Ordering::Acquire) != 0 {
+            // Also re-assert from the latch in case a concurrent
+            // `latch_service_down` set it between our checks (defense in depth; the
+            // read path already treats the latch as authoritative).
+            if self.service_down.load(Ordering::Acquire) != 0
+                || self.service_down_latched.load(Ordering::Acquire)
+            {
                 self.block(GateReason::ServiceDown);
             }
         }
@@ -220,7 +233,10 @@ impl TradeGate {
         if !self.cancel_grace_elapsed(cancel_grace) {
             return false;
         }
-        self.reasons_bits() == 0
+        // The set-once fail-closed latch is a hard gate independent of the
+        // mirrored ServiceDown bit, so a concurrent `mark_service_up` clearing the
+        // bit can never un-halt quoting after a fail-closed task has died.
+        self.reasons_bits() == 0 && !self.service_down_latched.load(Ordering::Acquire)
     }
 
     pub fn describe(&self) -> Vec<&'static str> {
@@ -316,5 +332,77 @@ mod tests {
             Duration::from_millis(500),
             Duration::from_secs(0),
         ));
+    }
+
+    #[test]
+    fn latch_is_authoritative_even_if_bit_cleared() {
+        // Simulate the lost-update race outcome directly: latch set, but the
+        // mirrored ServiceDown bit cleared and the count at zero (as a racing
+        // mark_service_up could leave it). The read path must still halt.
+        let gate = TradeGate::new();
+        gate.latch_service_down();
+        // Forcibly clear the bit and zero the count, mimicking the race result.
+        gate.allow(GateReason::ServiceDown);
+        assert_eq!(gate.service_down.load(Ordering::Acquire), 0);
+        assert_eq!(gate.reasons_bits() & GateReason::ServiceDown.bit(), 0);
+
+        assert!(
+            gate.is_blocked(GateReason::ServiceDown),
+            "latch must force ServiceDown blocked regardless of the bit"
+        );
+        // Clear the remaining initial reasons so only the latch could gate.
+        for reason in [
+            GateReason::OpenOrderUnknown,
+            GateReason::PositionUnknown,
+            GateReason::QuoteStale,
+            GateReason::FillWsDown,
+            GateReason::PriceWsDown,
+        ] {
+            gate.allow(reason);
+        }
+        assert!(
+            !gate.allow_quote(
+                RunState::Idle,
+                Some(quote(QuoteSource::Stream)),
+                Some(quote(QuoteSource::Stream)),
+                Duration::from_millis(500),
+                Duration::from_secs(0),
+            ),
+            "quoting must stay halted while the fail-closed latch is set"
+        );
+    }
+
+    #[test]
+    fn concurrent_latch_and_service_up_keeps_gate_blocked() {
+        use std::sync::Arc;
+        use std::thread;
+        // Stress the actual race: a fail-closed task latching down concurrently
+        // with a restartable task's recovery must never leave quoting allowed.
+        for _ in 0..2_000 {
+            let gate = TradeGate::new();
+            for reason in [
+                GateReason::OpenOrderUnknown,
+                GateReason::PositionUnknown,
+                GateReason::QuoteStale,
+                GateReason::FillWsDown,
+                GateReason::PriceWsDown,
+            ] {
+                gate.allow(reason);
+            }
+            // One restartable task is down (count=1, bit set).
+            gate.mark_service_down();
+
+            let g1 = Arc::clone(&gate);
+            let g2 = Arc::clone(&gate);
+            let t1 = thread::spawn(move || g1.mark_service_up());
+            let t2 = thread::spawn(move || g2.latch_service_down());
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert!(
+                gate.is_blocked(GateReason::ServiceDown),
+                "ServiceDown must remain blocked after a latch races a recovery"
+            );
+        }
     }
 }

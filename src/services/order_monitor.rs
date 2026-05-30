@@ -9,6 +9,8 @@ use tracing::info;
 use crate::bot::{BotState, BotStatus, RunState};
 use crate::config::Config;
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
+use crate::services::supervisor::{spawn_supervised_with_factory, RestartPolicy};
+use crate::services::trade_gate::TradeGate;
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::price::{now_ns, prices_valid, SharedQuote};
 
@@ -408,15 +410,29 @@ pub fn should_cancel_for_profit_drop(
 // STARTUP HELPER
 // ============================================================================
 
-/// Spawn all monitor tasks
-pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>) {
-    // Hot path monitor (1kHz)
-    let service_clone = Arc::clone(&service);
-    tokio::spawn(async move {
-        service_clone.run_monitor_loop().await;
-    });
+/// Spawn all monitor tasks.
+///
+/// The hot-path cancel-trigger loop is the critical one: if it dies, maker orders
+/// are no longer cancelled on age/profit deterioration and rest on the book at
+/// adverse prices. It is therefore supervised (a death marks `ServiceDown`, which
+/// blocks new placement, then restarts). The profit logger is logging-only and
+/// stays best-effort.
+pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>, trade_gate: Arc<TradeGate>) {
+    // Hot path monitor (1kHz) — supervised, restartable.
+    spawn_supervised_with_factory(
+        "order_monitor",
+        trade_gate,
+        RestartPolicy::default(),
+        {
+            let service = Arc::clone(&service);
+            move || {
+                let service = Arc::clone(&service);
+                async move { service.run_monitor_loop().await }
+            }
+        },
+    );
 
-    // Profit logger (0.5 Hz)
+    // Profit logger (0.5 Hz) — best-effort (logging only).
     let service_clone = Arc::clone(&service);
     tokio::spawn(async move {
         service_clone.run_profit_logger().await;
