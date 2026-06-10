@@ -17,6 +17,9 @@ services:
     environment:
       - RUST_LOG=info
       - RUST_BACKTRACE=1
+      # Bound the tokio worker pool explicitly: the workload is two WS read
+      # loops + event-driven evaluation, which two workers serve comfortably.
+      - TOKIO_WORKER_THREADS=2
     
     # Volume mounts
     volumes:
@@ -49,14 +52,15 @@ services:
     # Network mode (use host network or create custom network)
     # network_mode: "host"  # Uncomment if you need host network access
     
-    # Resource limits (optional - adjust as needed)
+    # Resource limits. 2 CPUs so the WS read loops, signing, and the hedge
+    # executor never queue behind each other on a single core (latency tail).
     deploy:
       resources:
         limits:
-          cpus: '1.0'
+          cpus: '2.0'
           memory: 512M
         reservations:
-          cpus: '0.5'
+          cpus: '1.0'
           memory: 256M
 
 # Optional: Create a custom network

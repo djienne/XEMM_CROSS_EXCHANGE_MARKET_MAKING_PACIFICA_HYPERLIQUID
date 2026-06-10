@@ -227,14 +227,37 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 
 1. **Pacifica Orderbook (WebSocket)** - Real-time bid/ask feed
 2. **Hyperliquid Orderbook (WebSocket)** - Real-time bid/ask feed
-3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations (primary + position delta)
+3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations (primary + position delta); a single ordered processor task consumes fill events
 4. **Pacifica REST API Polling** - Fallback orderbook data (every 2s)
 5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
 6. **REST API Fill Detection** - Backup fill polling (every 500ms)
 7. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
-8. **Order Monitoring** - Profit tracking and order refresh (~1ms / 1 kHz)
+8. **Order Monitoring** - Profit tracking and order refresh (event-driven on book updates, 5ms fallback tick)
 9. **Hedge Execution** - Executes Hyperliquid hedge after fill
-10. **Main Opportunity Loop** - Evaluates and places orders (~1ms / 1 kHz, gated)
+10. **Main Opportunity Loop** - Evaluates and places orders (event-driven on book updates, 10ms fallback tick, gated)
+
+### Operational Invariants (do not change casually)
+
+- **`panic = "unwind"` must stay** (it is the cargo default; do NOT set
+  `panic = "abort"` in `[profile.release]`). Both supervisors detect task
+  panics via `JoinError` to drive the fail-closed `ServiceDown` latch and the
+  restart-with-backoff logic; abort would bypass that entire safety design.
+- **The fill WebSocket reconnects forever** (`max_attempts: None` internally).
+  A healthy connection (≥10s uptime) resets the attempt budget; server-side
+  closes are reconnect triggers, never a permanent stop. Quoting is gated by
+  `FillWsDown` during gaps and the reconcile hook replays missed fills on
+  reconnect. Only a genuine panic latches the fail-closed `ServiceDown` stop.
+- **`./data` must be volume-mounted in Docker.** `data/unresolved_exposure.jsonl`
+  (shutdown exposure marker) and `data/hedge_lifecycle.jsonl` (hedge intent
+  journal) are the durable audit/recovery records; startup additionally
+  re-checks live venue positions unconditionally.
+- **Unknown-outcome hedges are quarantined**, not retried by the order-based
+  paths: if a hedge submit ends uncertain (response lost, orderStatus
+  inconclusive), the quantity is excluded from residual re-emission and only
+  the position reconciler (venue truth, ~1s cadence) recovers it. This is what
+  makes a double-hedge of an actually-filled uncertain attempt impossible.
+- **`shutdown_drain_timeout_secs`** (default 5) bounds how long shutdown waits
+  for in-flight hedges to settle before final cancellation.
 
 ## Configuration Parameters
 
@@ -254,6 +277,8 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
 | `hyperliquid_use_ws_for_hedge` | true | Use WebSocket for hedge execution (faster) vs REST |
 | `pacifica_rest_poll_interval_secs` | 2 | REST API fallback polling interval in seconds |
+| `pacifica_ws_request_timeout_ms` | 2000 | Pacifica trading-WS request/response timeout (placement is post-only, so tighter is safe) |
+| `shutdown_drain_timeout_secs` | 5 | How long shutdown waits for in-flight hedges to drain |
 
 ## Trading Workflow
 
