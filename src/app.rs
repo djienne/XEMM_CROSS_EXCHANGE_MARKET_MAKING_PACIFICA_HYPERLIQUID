@@ -602,6 +602,7 @@ impl XemmBot {
             baseline_updater,
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
+            trade_gate: self.trade_gate.clone(),
             low_latency_mode: self.config.low_latency_mode,
         };
         // Fail-closed for now: the FillDetectionClient is non-Clone and its

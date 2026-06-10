@@ -13,6 +13,8 @@ use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent
 use crate::services::fill_aggregator::{FillAggregator, HedgeReservation};
 use crate::services::fill_dedup::{FillDedup, FillKey};
 use crate::services::metrics;
+use crate::services::supervisor::spawn_supervised_fail_closed;
+use crate::services::trade_gate::TradeGate;
 use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use crate::strategy::OrderSide;
 use crate::util::log::{tag_static, Color};
@@ -31,7 +33,376 @@ pub struct FillDetectionService {
     pub baseline_updater: PositionBaselineUpdater,
     pub atomic_status: Arc<std::sync::atomic::AtomicU8>,
     pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
+    pub trade_gate: Arc<TradeGate>,
     pub low_latency_mode: bool,
+}
+
+/// Single ordered consumer for fill events.
+///
+/// The WS read callback does nothing but push the event into an unbounded
+/// channel (unbounded deliberately: events are rate-limited by real order
+/// activity and dropping one risks a missed hedge); this processor handles
+/// them strictly in arrival order. That replaces the previous
+/// tokio::spawn-per-event design, which paid a scheduling hop per fill AND
+/// could reorder a Cancelled event's state cleanup ahead of its own
+/// residual-fill check (the cleanup clearing `active_order` made the residual
+/// path's `is_our_order` test fail).
+struct FillEventProcessor {
+    bot_state: Arc<RwLock<BotState>>,
+    hedge_tx: mpsc::Sender<HedgeIntent>,
+    cancel_tx: mpsc::Sender<CancelIntent>,
+    cancel_demand: Arc<CancelDemand>,
+    symbol: String,
+    processed_fills: Arc<FillDedup>,
+    fill_aggregator: Arc<FillAggregator>,
+    baseline_updater: PositionBaselineUpdater,
+    atomic_status: Arc<std::sync::atomic::AtomicU8>,
+    order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
+    low_latency_mode: bool,
+}
+
+impl FillEventProcessor {
+    /// True when `cloid` matches the currently tracked active order.
+    fn is_our_order(&self, client_order_id: &Option<String>) -> bool {
+        self.bot_state
+            .read()
+            .active_order
+            .as_ref()
+            .and_then(|order| {
+                client_order_id
+                    .as_ref()
+                    .map(|cloid| order.client_order_id == *cloid)
+            })
+            .unwrap_or(false)
+    }
+
+    async fn process(&self, fill_event: FillEvent) {
+        match fill_event {
+            FillEvent::FullFill {
+                order_id,
+                symbol: fill_symbol,
+                side,
+                filled_amount,
+                avg_price,
+                client_order_id,
+                ..
+            } => {
+                let fill_detect_start = std::time::Instant::now();
+                if !self.low_latency_mode {
+                    info!(
+                        "{} {} FULL FILL: {} {} {} @ {} (cloid: {})",
+                        tag_static("FILL_DETECTION", Color::Magenta),
+                        "OK".green().bold(),
+                        side.bright_yellow(),
+                        filled_amount.bright_white(),
+                        fill_symbol.bright_white().bold(),
+                        avg_price.cyan(),
+                        client_order_id.as_deref().unwrap_or("None")
+                    );
+                }
+
+                if !self.is_our_order(&client_order_id) {
+                    return;
+                }
+
+                let Some(order_side) = order_side_from_str(&side) else {
+                    error!(
+                        "{} {} Unknown side: {}",
+                        tag_static("FILL_DETECTION", Color::Magenta),
+                        "FAIL".red().bold(),
+                        side
+                    );
+                    return;
+                };
+                let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
+                let avg_px: f64 = parse(&avg_price).unwrap_or(0.0);
+
+                if !self
+                    .fill_aggregator
+                    .observe_fill(order_id, order_side, filled_size, avg_px, true)
+                {
+                    debug!(
+                        "[FILL_DETECTION] Full fill already accounted for (order_id={})",
+                        order_id
+                    );
+                    return;
+                }
+
+                let dedup_cloid = client_order_id
+                    .clone()
+                    .unwrap_or_else(|| order_id.to_string());
+                if !self
+                    .processed_fills
+                    .insert_if_new(FillKey::from_cloid_cumulative(dedup_cloid, filled_size))
+                {
+                    debug!(
+                        "[FILL_DETECTION] Full fill already processed (order_id={}, cloid={:?})",
+                        order_id, client_order_id
+                    );
+                    return;
+                }
+
+                let Some(reservation) = self.fill_aggregator.try_reserve_hedge(order_id) else {
+                    debug!(
+                        "[FILL_DETECTION] Full fill residual no longer reservable (order_id={})",
+                        order_id
+                    );
+                    return;
+                };
+
+                {
+                    let mut state = self.bot_state.write();
+                    state.mark_filled(reservation.size, order_side);
+                }
+
+                request_cancel(
+                    &self.cancel_tx,
+                    &self.cancel_demand,
+                    self.symbol.clone(),
+                    CancelReason::PartialFill,
+                );
+                self.baseline_updater
+                    .update_baseline(&self.symbol, &side, filled_size, avg_px);
+
+                if !self.low_latency_mode {
+                    info!(
+                        "{} {} Hedge triggered in {:.1}ms",
+                        format!("[{}]", self.symbol).bright_white().bold(),
+                        "Order filled".green().bold(),
+                        fill_detect_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
+                enqueue_reserved_hedge(
+                    &self.fill_aggregator,
+                    &self.hedge_tx,
+                    &self.bot_state,
+                    reservation,
+                    "full fill",
+                )
+                .await;
+            }
+            FillEvent::PartialFill {
+                order_id,
+                symbol: fill_symbol,
+                side,
+                filled_amount,
+                original_amount,
+                avg_price,
+                client_order_id,
+                ..
+            } => {
+                let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
+                let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
+                let notional_value = filled_size * fill_price;
+                if !self.low_latency_mode {
+                    info!(
+                        "{} {} PARTIAL FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {}",
+                        tag_static("FILL_DETECTION", Color::Magenta),
+                        "FAST".yellow().bold(),
+                        side.bright_yellow(),
+                        filled_amount.bright_white(),
+                        fill_symbol.bright_white().bold(),
+                        avg_price.cyan(),
+                        filled_amount.bright_white(),
+                        original_amount,
+                        format!("${:.2}", notional_value).cyan().bold()
+                    );
+                }
+
+                if !self.is_our_order(&client_order_id) {
+                    return;
+                }
+
+                let Some(order_side) = order_side_from_str(&side) else {
+                    error!(
+                        "{} {} Unknown side: {}",
+                        tag_static("FILL_DETECTION", Color::Magenta),
+                        "FAIL".red().bold(),
+                        side
+                    );
+                    return;
+                };
+                let target_size: f64 = parse(&original_amount).unwrap_or(0.0);
+                if !self.fill_aggregator.observe_fill_with_target(
+                    order_id,
+                    order_side,
+                    filled_size,
+                    fill_price,
+                    false,
+                    Some(target_size),
+                ) {
+                    debug!(
+                        "[FILL_DETECTION] Partial fill accumulated (order_id={}, cumulative=${:.2})",
+                        order_id, notional_value
+                    );
+                    return;
+                }
+
+                let dedup_cloid = client_order_id
+                    .clone()
+                    .unwrap_or_else(|| order_id.to_string());
+                if !self
+                    .processed_fills
+                    .insert_if_new(FillKey::from_cloid_cumulative(dedup_cloid, filled_size))
+                {
+                    debug!(
+                        "[FILL_DETECTION] Partial fill already processed (order_id={}, cloid={:?})",
+                        order_id, client_order_id
+                    );
+                    return;
+                }
+
+                let Some(reservation) = self.fill_aggregator.try_reserve_hedge(order_id) else {
+                    return;
+                };
+                warn!(
+                    "{} {} Partial-fill threshold reached (order_id={}): hedging {} @ ${:.4}",
+                    tag_static("FILL_DETECTION", Color::Magenta),
+                    "WARN".yellow().bold(),
+                    order_id,
+                    reservation.size,
+                    reservation.avg_price
+                );
+
+                {
+                    let mut state = self.bot_state.write();
+                    state.mark_filled(reservation.size, reservation.side);
+                }
+
+                request_cancel(
+                    &self.cancel_tx,
+                    &self.cancel_demand,
+                    self.symbol.clone(),
+                    CancelReason::PartialFill,
+                );
+                self.baseline_updater.update_baseline(
+                    &self.symbol,
+                    &side,
+                    reservation.size,
+                    reservation.avg_price,
+                );
+
+                enqueue_reserved_hedge(
+                    &self.fill_aggregator,
+                    &self.hedge_tx,
+                    &self.bot_state,
+                    reservation,
+                    "partial fill",
+                )
+                .await;
+            }
+            FillEvent::Cancelled {
+                order_id,
+                client_order_id,
+                side,
+                filled_amount,
+                reason,
+                ..
+            } => {
+                debug!(
+                    "[FILL_DETECTION] Order cancelled: {} (reason: {}, filled_amount: {})",
+                    client_order_id.as_deref().unwrap_or("None"),
+                    reason,
+                    filled_amount
+                );
+
+                // Residual-fill check FIRST, state cleanup second: the cleanup
+                // clears `active_order`, which would make the residual path's
+                // is_our_order test fail if it ran first (the old per-event
+                // spawns raced exactly that way).
+                let filled_so_far: f64 = parse(&filled_amount).unwrap_or(0.0);
+                if filled_so_far > 0.0 && self.is_our_order(&client_order_id) {
+                    if let Some(order_side) = order_side_from_str(&side) {
+                        if self.fill_aggregator.observe_fill(
+                            order_id,
+                            order_side,
+                            filled_so_far,
+                            0.0,
+                            true,
+                        ) {
+                            let dedup_key = client_order_id
+                                .clone()
+                                .map(|cloid| FillKey::from_cloid_cumulative(cloid, filled_so_far))
+                                .unwrap_or_else(|| {
+                                    FillKey::from_order_cumulative(order_id, filled_so_far)
+                                });
+                            if self.processed_fills.insert_if_new(dedup_key) {
+                                if let Some(reservation) =
+                                    self.fill_aggregator.try_reserve_hedge(order_id)
+                                {
+                                    warn!(
+                                        "[FILL_DETECTION] Cancellation left {} filled on order_id={}, emitting hedge",
+                                        reservation.size, order_id
+                                    );
+                                    enqueue_reserved_hedge(
+                                        &self.fill_aggregator,
+                                        &self.hedge_tx,
+                                        &self.bot_state,
+                                        reservation,
+                                        "cancel residual",
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // State cleanup (previously its own unordered spawn).
+                {
+                    let mut state = self.bot_state.write();
+                    let is_our_order = state
+                        .active_order
+                        .as_ref()
+                        .and_then(|order| {
+                            client_order_id
+                                .as_ref()
+                                .map(|id| order.client_order_id == *id)
+                        })
+                        .unwrap_or(false);
+
+                    if !is_our_order {
+                        return;
+                    }
+
+                    match &state.status {
+                        BotStatus::OrderPlaced | BotStatus::Cancelling => {
+                            state.clear_active_order();
+                            crate::services::order_monitor::sync_atomic_status(
+                                &self.atomic_status,
+                                &state.status,
+                            );
+                            self.order_snapshot.set(None);
+                            debug!("[BOT] Active order cancelled, returning to Idle");
+                        }
+                        BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
+                            debug!(
+                                "[BOT] Cancellation confirmed for {:?}; hedge path owns state",
+                                state.status
+                            );
+                        }
+                        BotStatus::Idle
+                        | BotStatus::Error(_)
+                        | BotStatus::Placing
+                        | BotStatus::Reconciling
+                        | BotStatus::PlacementUnknown
+                        | BotStatus::CancelPending
+                        | BotStatus::HedgeUnknown
+                        | BotStatus::ShuttingDown => {
+                            debug!(
+                                "[BOT] Cancellation received in {:?} state (ignoring)",
+                                state.status
+                            );
+                        }
+                    }
+                }
+            }
+            FillEvent::PositionFill { .. } => {
+                debug!("[FILL_DETECTION] Position fill event handled by position monitor");
+            }
+        }
+    }
 }
 
 impl FillDetectionService {
@@ -130,409 +501,40 @@ impl FillDetectionService {
             fill_client.set_reconcile_hook(hook);
         }
 
-        let bot_state = self.bot_state.clone();
-        let hedge_tx = self.hedge_tx.clone();
-        let cancel_tx = self.cancel_tx.clone();
-        let cancel_demand = self.cancel_demand.clone();
-        let symbol = self.symbol.clone();
-        let processed_fills = self.processed_fills.clone();
-        let fill_aggregator = self.fill_aggregator.clone();
-        let baseline_updater = self.baseline_updater.clone();
-        let atomic_status = self.atomic_status.clone();
-        let order_snapshot = self.order_snapshot.clone();
-        let low_latency_mode = self.low_latency_mode;
+        // Single ordered consumer (see FillEventProcessor docs). Unbounded
+        // channel: a dropped fill event risks a missed hedge, and real order
+        // flow bounds the rate.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<FillEvent>();
+        let processor = FillEventProcessor {
+            bot_state: self.bot_state.clone(),
+            hedge_tx: self.hedge_tx.clone(),
+            cancel_tx: self.cancel_tx.clone(),
+            cancel_demand: self.cancel_demand.clone(),
+            symbol: self.symbol.clone(),
+            processed_fills: self.processed_fills.clone(),
+            fill_aggregator: self.fill_aggregator.clone(),
+            baseline_updater: self.baseline_updater.clone(),
+            atomic_status: self.atomic_status.clone(),
+            order_snapshot: self.order_snapshot.clone(),
+            low_latency_mode: self.low_latency_mode,
+        };
+        // Fail-closed: the processor owns the (non-clonable) event receiver; if
+        // it dies, fills are no longer turned into hedges, so quoting must halt.
+        spawn_supervised_fail_closed(
+            "fill_event_processor",
+            self.trade_gate.clone(),
+            async move {
+                while let Some(event) = event_rx.recv().await {
+                    processor.process(event).await;
+                }
+            },
+        );
 
+        // The WS read callback does nothing but forward: no locks, no parsing,
+        // no spawned task per event.
         fill_client
-            .start(move |fill_event| match fill_event {
-                FillEvent::FullFill {
-                    order_id,
-                    symbol: fill_symbol,
-                    side,
-                    filled_amount,
-                    avg_price,
-                    client_order_id,
-                    ..
-                } => {
-                    if !low_latency_mode {
-                        info!(
-                            "{} {} FULL FILL: {} {} {} @ {} (cloid: {})",
-                            tag_static("FILL_DETECTION", Color::Magenta),
-                            "OK".green().bold(),
-                            side.bright_yellow(),
-                            filled_amount.bright_white(),
-                            fill_symbol.bright_white().bold(),
-                            avg_price.cyan(),
-                            client_order_id.as_deref().unwrap_or("None")
-                        );
-                    }
-
-                    let bot_state = bot_state.clone();
-                    let hedge_tx = hedge_tx.clone();
-                    let cancel_tx = cancel_tx.clone();
-                    let cancel_demand = cancel_demand.clone();
-                    let processed_fills = processed_fills.clone();
-                    let fill_aggregator = fill_aggregator.clone();
-                    let baseline_updater = baseline_updater.clone();
-                    let symbol = symbol.clone();
-
-                    tokio::spawn(async move {
-                        let fill_detect_start = std::time::Instant::now();
-                        let is_our_order = bot_state
-                            .read()
-                            .active_order
-                            .as_ref()
-                            .and_then(|order| {
-                                client_order_id
-                                    .as_ref()
-                                    .map(|cloid| order.client_order_id == *cloid)
-                            })
-                            .unwrap_or(false);
-                        if !is_our_order {
-                            return;
-                        }
-
-                        let Some(order_side) = order_side_from_str(&side) else {
-                            error!(
-                                "{} {} Unknown side: {}",
-                                tag_static("FILL_DETECTION", Color::Magenta),
-                                "FAIL".red().bold(),
-                                side
-                            );
-                            return;
-                        };
-                        let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
-                        let avg_px: f64 = parse(&avg_price).unwrap_or(0.0);
-
-                        if !fill_aggregator.observe_fill(
-                            order_id,
-                            order_side,
-                            filled_size,
-                            avg_px,
-                            true,
-                        ) {
-                            debug!(
-                                "[FILL_DETECTION] Full fill already accounted for (order_id={})",
-                                order_id
-                            );
-                            return;
-                        }
-
-                        let dedup_cloid = client_order_id
-                            .clone()
-                            .unwrap_or_else(|| order_id.to_string());
-                        if !processed_fills
-                            .insert_if_new(FillKey::from_cloid_cumulative(dedup_cloid, filled_size))
-                        {
-                            debug!(
-                                "[FILL_DETECTION] Full fill already processed (order_id={}, cloid={:?})",
-                                order_id, client_order_id
-                            );
-                            return;
-                        }
-
-                        let Some(reservation) = fill_aggregator.try_reserve_hedge(order_id) else {
-                            debug!(
-                                "[FILL_DETECTION] Full fill residual no longer reservable (order_id={})",
-                                order_id
-                            );
-                            return;
-                        };
-
-                        {
-                            let mut state = bot_state.write();
-                            state.mark_filled(reservation.size, order_side);
-                        }
-
-                        request_cancel(
-                            &cancel_tx,
-                            &cancel_demand,
-                            symbol.clone(),
-                            CancelReason::PartialFill,
-                        );
-                        baseline_updater.update_baseline(&symbol, &side, filled_size, avg_px);
-
-                        if !low_latency_mode {
-                            info!(
-                                "{} {} Hedge triggered in {:.1}ms",
-                                format!("[{}]", symbol).bright_white().bold(),
-                                "Order filled".green().bold(),
-                                fill_detect_start.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-
-                        enqueue_reserved_hedge(
-                            &fill_aggregator,
-                            &hedge_tx,
-                            &bot_state,
-                            reservation,
-                            "full fill",
-                        )
-                        .await;
-                    });
-                }
-                FillEvent::PartialFill {
-                    order_id,
-                    symbol: fill_symbol,
-                    side,
-                    filled_amount,
-                    original_amount,
-                    avg_price,
-                    client_order_id,
-                    ..
-                } => {
-                    let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
-                    let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
-                    let notional_value = filled_size * fill_price;
-                    if !low_latency_mode {
-                        info!(
-                            "{} {} PARTIAL FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {}",
-                            tag_static("FILL_DETECTION", Color::Magenta),
-                            "FAST".yellow().bold(),
-                            side.bright_yellow(),
-                            filled_amount.bright_white(),
-                            fill_symbol.bright_white().bold(),
-                            avg_price.cyan(),
-                            filled_amount.bright_white(),
-                            original_amount,
-                            format!("${:.2}", notional_value).cyan().bold()
-                        );
-                    }
-
-                    let bot_state = bot_state.clone();
-                    let hedge_tx = hedge_tx.clone();
-                    let cancel_tx = cancel_tx.clone();
-                    let cancel_demand = cancel_demand.clone();
-                    let processed_fills = processed_fills.clone();
-                    let fill_aggregator = fill_aggregator.clone();
-                    let baseline_updater = baseline_updater.clone();
-                    let symbol = symbol.clone();
-
-                    tokio::spawn(async move {
-                        let is_our_order = bot_state
-                            .read()
-                            .active_order
-                            .as_ref()
-                            .and_then(|order| {
-                                client_order_id
-                                    .as_ref()
-                                    .map(|cloid| order.client_order_id == *cloid)
-                            })
-                            .unwrap_or(false);
-                        if !is_our_order {
-                            return;
-                        }
-
-                        let Some(order_side) = order_side_from_str(&side) else {
-                            error!(
-                                "{} {} Unknown side: {}",
-                                tag_static("FILL_DETECTION", Color::Magenta),
-                                "FAIL".red().bold(),
-                                side
-                            );
-                            return;
-                        };
-                        let target_size: f64 = parse(&original_amount).unwrap_or(0.0);
-                        if !fill_aggregator.observe_fill_with_target(
-                            order_id,
-                            order_side,
-                            filled_size,
-                            fill_price,
-                            false,
-                            Some(target_size),
-                        ) {
-                            debug!(
-                                "[FILL_DETECTION] Partial fill accumulated (order_id={}, cumulative=${:.2})",
-                                order_id, notional_value
-                            );
-                            return;
-                        }
-
-                        let dedup_cloid = client_order_id
-                            .clone()
-                            .unwrap_or_else(|| order_id.to_string());
-                        if !processed_fills
-                            .insert_if_new(FillKey::from_cloid_cumulative(dedup_cloid, filled_size))
-                        {
-                            debug!(
-                                "[FILL_DETECTION] Partial fill already processed (order_id={}, cloid={:?})",
-                                order_id, client_order_id
-                            );
-                            return;
-                        }
-
-                        let Some(reservation) = fill_aggregator.try_reserve_hedge(order_id) else {
-                            return;
-                        };
-                        warn!(
-                            "{} {} Partial-fill threshold reached (order_id={}): hedging {} @ ${:.4}",
-                            tag_static("FILL_DETECTION", Color::Magenta),
-                            "WARN".yellow().bold(),
-                            order_id,
-                            reservation.size,
-                            reservation.avg_price
-                        );
-
-                        {
-                            let mut state = bot_state.write();
-                            state.mark_filled(reservation.size, reservation.side);
-                        }
-
-                        request_cancel(
-                            &cancel_tx,
-                            &cancel_demand,
-                            symbol.clone(),
-                            CancelReason::PartialFill,
-                        );
-                        baseline_updater.update_baseline(
-                            &symbol,
-                            &side,
-                            reservation.size,
-                            reservation.avg_price,
-                        );
-
-                        enqueue_reserved_hedge(
-                            &fill_aggregator,
-                            &hedge_tx,
-                            &bot_state,
-                            reservation,
-                            "partial fill",
-                        )
-                        .await;
-                    });
-                }
-                FillEvent::Cancelled {
-                    order_id,
-                    client_order_id,
-                    side,
-                    filled_amount,
-                    reason,
-                    ..
-                } => {
-                    debug!(
-                        "[FILL_DETECTION] Order cancelled: {} (reason: {}, filled_amount: {})",
-                        client_order_id.as_deref().unwrap_or("None"),
-                        reason,
-                        filled_amount
-                    );
-
-                    let bot_state_for_residual = bot_state.clone();
-                    let hedge_tx_for_residual = hedge_tx.clone();
-                    let processed_for_residual = processed_fills.clone();
-                    let aggregator_for_residual = fill_aggregator.clone();
-                    let residual_client_order_id = client_order_id.clone();
-                    tokio::spawn(async move {
-                        let filled_so_far: f64 = parse(&filled_amount).unwrap_or(0.0);
-                        if filled_so_far <= 0.0 {
-                            return;
-                        }
-
-                        let is_our_order = bot_state_for_residual
-                            .read()
-                            .active_order
-                            .as_ref()
-                            .and_then(|order| {
-                                residual_client_order_id
-                                    .as_ref()
-                                    .map(|cloid| order.client_order_id == *cloid)
-                            })
-                            .unwrap_or(false);
-                        if !is_our_order {
-                            return;
-                        }
-
-                        let Some(order_side) = order_side_from_str(&side) else {
-                            return;
-                        };
-                        if !aggregator_for_residual.observe_fill(
-                            order_id,
-                            order_side,
-                            filled_so_far,
-                            0.0,
-                            true,
-                        ) {
-                            return;
-                        }
-
-                        let dedup_key = residual_client_order_id
-                            .clone()
-                            .map(|cloid| FillKey::from_cloid_cumulative(cloid, filled_so_far))
-                            .unwrap_or_else(|| {
-                                FillKey::from_order_cumulative(order_id, filled_so_far)
-                            });
-                        if !processed_for_residual.insert_if_new(dedup_key) {
-                            return;
-                        }
-
-                        let Some(reservation) =
-                            aggregator_for_residual.try_reserve_hedge(order_id)
-                        else {
-                            return;
-                        };
-                        warn!(
-                            "[FILL_DETECTION] Cancellation left {} filled on order_id={}, emitting hedge",
-                            reservation.size, order_id
-                        );
-                        enqueue_reserved_hedge(
-                            &aggregator_for_residual,
-                            &hedge_tx_for_residual,
-                            &bot_state_for_residual,
-                            reservation,
-                            "cancel residual",
-                        )
-                        .await;
-                    });
-
-                    let bot_state = bot_state.clone();
-                    let cloid = client_order_id.clone();
-                    let atomic_status = atomic_status.clone();
-                    let order_snapshot = order_snapshot.clone();
-                    tokio::spawn(async move {
-                        let mut state = bot_state.write();
-                        let is_our_order = state
-                            .active_order
-                            .as_ref()
-                            .and_then(|order| cloid.as_ref().map(|id| order.client_order_id == *id))
-                            .unwrap_or(false);
-
-                        if !is_our_order {
-                            return;
-                        }
-
-                        match &state.status {
-                            BotStatus::OrderPlaced | BotStatus::Cancelling => {
-                                state.clear_active_order();
-                                crate::services::order_monitor::sync_atomic_status(
-                                    &atomic_status,
-                                    &state.status,
-                                );
-                                order_snapshot.set(None);
-                                debug!("[BOT] Active order cancelled, returning to Idle");
-                            }
-                            BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
-                                debug!(
-                                    "[BOT] Cancellation confirmed for {:?}; hedge path owns state",
-                                    state.status
-                                );
-                            }
-                            BotStatus::Idle
-                            | BotStatus::Error(_)
-                            | BotStatus::Placing
-                            | BotStatus::Reconciling
-                            | BotStatus::PlacementUnknown
-                            | BotStatus::CancelPending
-                            | BotStatus::HedgeUnknown
-                            | BotStatus::ShuttingDown => {
-                                debug!(
-                                    "[BOT] Cancellation received in {:?} state (ignoring)",
-                                    state.status
-                                );
-                            }
-                        }
-                    });
-                }
-                FillEvent::PositionFill { .. } => {
-                    debug!("[FILL_DETECTION] Position fill event handled by position monitor");
-                }
+            .start(move |fill_event| {
+                let _ = event_tx.send(fill_event);
             })
             .await
             .ok();
