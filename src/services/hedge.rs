@@ -19,12 +19,15 @@ use crate::connector::hyperliquid::types::{
     WsPostRequestInner, WsPostResponse,
 };
 use crate::connector::hyperliquid::HyperliquidTrading;
+use crate::connector::pacifica::PacificaTrading;
+use crate::market_rules::fallback_rules;
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::{FillAggregator, HedgeSettlement};
 use crate::services::hedge_store::{self, HedgeIntentStatus, HedgeLifecycleUpdate};
 use crate::services::metrics;
 use crate::services::post_trade_auditor::PostTradeAuditEvent;
-use crate::services::{HedgeIntent, HedgeVenueSide};
+use crate::services::{HedgeIntent, HedgeSource, HedgeVenueSide};
+use crate::strategy::OrderSide;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
@@ -42,6 +45,9 @@ pub struct HedgeService {
     pub hyperliquid_prices: Arc<SharedQuote>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
+    /// Used only to revalidate Reconciler-sourced intents against fresh venue
+    /// positions before execution; maker-fill intents never touch it.
+    pub pacifica_trading: Arc<PacificaTrading>,
     pub fill_aggregator: Arc<FillAggregator>,
     pub audit_tx: mpsc::Sender<PostTradeAuditEvent>,
     pub cancel_tx: mpsc::Sender<CancelIntent>,
@@ -193,6 +199,16 @@ impl HedgeService {
 
                 // Main hedge event processing
                 Some(event) = self.hedge_rx.recv() => {
+            // Reconciler-sourced intents carry no aggregator reservation and can
+            // be stale by the time the serial executor reaches them (the exposure
+            // they were minted for may already be covered). Revalidate against
+            // fresh venue positions and clamp or skip before submitting.
+            // Maker-fill / position-monitor intents are reservation-protected and
+            // skip this REST round-trip entirely.
+            let event = match self.revalidate_reconciler_intent(event).await {
+                Some(event) => event,
+                None => continue,
+            };
             let hedge_side = event.hedge_side;
             let side = event.audit_maker_side();
             let size = event.size;
@@ -309,18 +325,19 @@ impl HedgeService {
                         Some("Hyperliquid prices unavailable for hedge".to_string());
                     let _ = hedge_store::append_lifecycle_update(failed_update).await;
 
-                    self.fill_aggregator.settle_hedge(HedgeSettlement::unknown(
+                    // Nothing was submitted: this is a definitive non-fill, not an
+                    // uncertain outcome. Settle as rejected so the residual
+                    // re-exposes immediately (idle flush / reconciler retry)
+                    // instead of entering the unknown quarantine.
+                    self.fill_aggregator.settle_hedge(HedgeSettlement::rejected(
                         event.source_order_id,
                         size,
                         0.0,
                     ));
-                    metrics::risk_metrics()
-                        .hedge_unknown_count
-                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
                     {
                         let mut state = self.bot_state.write();
-                        state.mark_hedge_unknown();
+                        state.mark_reconciling();
                     }
 
                     continue;
@@ -1127,18 +1144,153 @@ impl HedgeService {
         }
     }
 
+    /// Pure classification: true only when an `orderStatus` result PROVES the
+    /// cloid produced no fill (rejected, or canceled with at most dust filled).
+    /// `Unknown` is never proof: after a duplicate-cloid rejection the order
+    /// demonstrably exists at HL, so "unknownOid" can only be index lag — and
+    /// escalating on it is exactly the double-submit hazard. Liveness without
+    /// escalation: resubmitting the same cloid yields DupCloid until orderStatus
+    /// resolves to a real terminal status; if it never resolves, attempts
+    /// exhaust into the unknown-settlement quarantine and the position
+    /// reconciler recovers from venue truth.
+    fn definitively_unfilled(query: &OrderStatusQuery, dust: f64) -> bool {
+        match query {
+            OrderStatusQuery::Rejected { .. } => true,
+            OrderStatusQuery::Canceled { filled_sz, .. } => *filled_sz <= dust,
+            OrderStatusQuery::Filled { .. }
+            | OrderStatusQuery::Resting { .. }
+            | OrderStatusQuery::Unknown => false,
+        }
+    }
+
     /// True only when Hyperliquid authoritatively confirms the cloid produced no
-    /// fill (rejected, never-seen, or canceled with only dust filled), so it is
-    /// safe to escalate to a fresh cloid. Returns `false` on any uncertainty
-    /// (filled/resting/network error) so we never escalate into a double-submit.
+    /// fill, so it is safe to escalate to a fresh cloid. Returns `false` on any
+    /// uncertainty (filled/resting/unknown/network error) so we never escalate
+    /// into a double-submit. A single delayed re-query absorbs orderStatus
+    /// propagation lag so a genuinely-rejected order still escalates promptly.
     async fn cloid_definitively_unfilled(&self, cloid: &str) -> bool {
         let dust = self.config.neutral_dust_base.max(1e-9);
+        let first = match self.hyperliquid_trading.query_order_status(cloid).await {
+            Ok(query) => query,
+            Err(_) => return false,
+        };
+        if !matches!(first, OrderStatusQuery::Unknown) {
+            return Self::definitively_unfilled(&first, dust);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
         match self.hyperliquid_trading.query_order_status(cloid).await {
-            Ok(OrderStatusQuery::Rejected { .. }) => true,
-            Ok(OrderStatusQuery::Unknown) => true,
-            Ok(OrderStatusQuery::Canceled { filled_sz, .. }) => filled_sz <= dust,
-            // Filled / Resting / network error -> not definitively unfilled.
-            _ => false,
+            Ok(query) => Self::definitively_unfilled(&query, dust),
+            Err(_) => false,
+        }
+    }
+
+    /// Pure clamp/skip decision for a Reconciler-sourced intent against fresh
+    /// venue truth. Returns the size still worth hedging, or `None` when the
+    /// exposure is neutral, covered by same-side in-flight reservations, or the
+    /// required direction no longer matches the intent.
+    fn validate_reconciler_size(
+        net: f64,
+        pending_same_side: f64,
+        hedge_side: HedgeVenueSide,
+        intent_size: f64,
+        dust: f64,
+    ) -> Option<f64> {
+        if net.abs() <= dust {
+            return None;
+        }
+        let required_side = if net > 0.0 {
+            HedgeVenueSide::Sell
+        } else {
+            HedgeVenueSide::Buy
+        };
+        if hedge_side != required_side {
+            return None;
+        }
+        let uncovered = (net.abs() - pending_same_side.max(0.0)).max(0.0);
+        let size = intent_size.min(uncovered);
+        if size <= dust {
+            return None;
+        }
+        Some(size)
+    }
+
+    /// Executor-side guard for Reconciler-sourced intents (which carry no
+    /// aggregator reservation). Returns the (possibly clamped) intent to
+    /// execute, or `None` when it should be skipped. On a position-fetch error
+    /// the intent passes through at its original size: exposure recovery must
+    /// not stall on a transient REST failure (a duplicate then requires BOTH a
+    /// >5s-busy executor AND a simultaneous REST outage, and the reconciler
+    /// nets any over-hedge from venue truth).
+    async fn revalidate_reconciler_intent(&self, mut event: HedgeIntent) -> Option<HedgeIntent> {
+        if event.source != HedgeSource::Reconciler {
+            return Some(event);
+        }
+
+        let (pacifica, hyperliquid) = match crate::services::signed_positions(
+            &self.pacifica_trading,
+            &self.hyperliquid_trading,
+            &self.config.symbol,
+        )
+        .await
+        {
+            Ok(positions) => positions,
+            Err(e) => {
+                warn!(
+                    "{} {} Reconciler-intent revalidation could not fetch positions ({}); executing at original size {}",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    "WARN".yellow().bold(),
+                    e,
+                    event.size
+                );
+                return Some(event);
+            }
+        };
+
+        let net = pacifica + hyperliquid;
+        let maker_side = if net > 0.0 {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        let pending = self.fill_aggregator.pending_qty_for_side(maker_side);
+        let dust = self
+            .config
+            .neutral_dust_base
+            .max(fallback_rules(&self.config.symbol).min_size);
+
+        match Self::validate_reconciler_size(net, pending, event.hedge_side, event.size, dust) {
+            Some(size) => {
+                if (size - event.size).abs() > f64::EPSILON {
+                    warn!(
+                        "{} {} Reconciler intent clamped from {} to {} (net {:.8}, pending {:.8})",
+                        tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                        "WARN".yellow().bold(),
+                        event.size,
+                        size,
+                        net,
+                        pending
+                    );
+                }
+                event.size = size;
+                Some(event)
+            }
+            None => {
+                let mut update = HedgeLifecycleUpdate::new(&event, HedgeIntentStatus::Skipped);
+                update.target_qty = Some(event.size);
+                update.reason = Some(format!(
+                    "reconciler intent stale: net={:.8}, pending_same_side={:.8}",
+                    net, pending
+                ));
+                hedge_store::try_append_lifecycle_update(update).await;
+                info!(
+                    "{} {} Skipping stale reconciler intent for {} (net {:.8} already neutral/covered)",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    "OK".green().bold(),
+                    event.size,
+                    net
+                );
+                None
+            }
         }
     }
 
@@ -1427,6 +1579,102 @@ mod tests {
             "Order could not immediately match against any resting orders."
         ));
         assert!(!HedgeService::is_duplicate_cloid_error("tick rejected"));
+    }
+
+    #[test]
+    fn definitively_unfilled_classification_matrix() {
+        let dust = 0.01;
+        assert!(HedgeService::definitively_unfilled(
+            &OrderStatusQuery::Rejected {
+                oid: 1,
+                status: "rejected".to_string()
+            },
+            dust
+        ));
+        assert!(HedgeService::definitively_unfilled(
+            &OrderStatusQuery::Canceled {
+                oid: 2,
+                status: "canceled".to_string(),
+                filled_sz: 0.005,
+                avg_px: 100.0
+            },
+            dust
+        ));
+        // Canceled with a real partial fill is NOT unfilled.
+        assert!(!HedgeService::definitively_unfilled(
+            &OrderStatusQuery::Canceled {
+                oid: 3,
+                status: "canceled".to_string(),
+                filled_sz: 0.2,
+                avg_px: 100.0
+            },
+            dust
+        ));
+        assert!(!HedgeService::definitively_unfilled(
+            &OrderStatusQuery::Filled {
+                filled_sz: 0.5,
+                avg_px: 100.0,
+                oid: 4
+            },
+            dust
+        ));
+        assert!(!HedgeService::definitively_unfilled(
+            &OrderStatusQuery::Resting {
+                oid: 5,
+                remaining_sz: 0.5
+            },
+            dust
+        ));
+        // Unknown is never proof of no-fill: escalating on it after a
+        // duplicate-cloid rejection is the double-submit hazard.
+        assert!(!HedgeService::definitively_unfilled(
+            &OrderStatusQuery::Unknown,
+            dust
+        ));
+    }
+
+    #[test]
+    fn reconciler_size_validation_clamps_and_skips() {
+        use HedgeVenueSide::{Buy, Sell};
+        let dust = 0.01;
+
+        // Net long 1.0, nothing pending: Sell intent passes at full size.
+        assert_eq!(
+            HedgeService::validate_reconciler_size(1.0, 0.0, Sell, 1.0, dust),
+            Some(1.0)
+        );
+        // Net shrank to 0.4 since the intent was minted: clamp.
+        assert_eq!(
+            HedgeService::validate_reconciler_size(0.4, 0.0, Sell, 1.0, dust),
+            Some(0.4)
+        );
+        // Same-side pending already covers most of it: clamp to the remainder.
+        let clamped = HedgeService::validate_reconciler_size(1.0, 0.7, Sell, 1.0, dust).unwrap();
+        assert!((clamped - 0.3).abs() < 1e-9);
+        // Fully covered by pending: skip.
+        assert_eq!(
+            HedgeService::validate_reconciler_size(1.0, 1.0, Sell, 1.0, dust),
+            None
+        );
+        // Exposure already neutral: skip.
+        assert_eq!(
+            HedgeService::validate_reconciler_size(0.005, 0.0, Sell, 1.0, dust),
+            None
+        );
+        // Direction flipped (net short now requires a Buy hedge): skip the Sell.
+        assert_eq!(
+            HedgeService::validate_reconciler_size(-1.0, 0.0, Sell, 1.0, dust),
+            None
+        );
+        assert_eq!(
+            HedgeService::validate_reconciler_size(-1.0, 0.0, Buy, 1.0, dust),
+            Some(1.0)
+        );
+        // Remainder below dust: skip rather than submit an unfillable sliver.
+        assert_eq!(
+            HedgeService::validate_reconciler_size(1.0, 0.995, Sell, 1.0, dust),
+            None
+        );
     }
 
     #[test]

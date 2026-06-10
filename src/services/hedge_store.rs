@@ -22,6 +22,9 @@ pub enum HedgeIntentStatus {
     Complete,
     Error,
     Unknown,
+    /// Intent was dropped before submission because executor-side revalidation
+    /// found the exposure already neutral/covered (reconciler-sourced intents).
+    Skipped,
 }
 
 impl HedgeIntentStatus {
@@ -37,6 +40,7 @@ impl HedgeIntentStatus {
             Self::Complete => "complete",
             Self::Error => "error",
             Self::Unknown => "unknown",
+            Self::Skipped => "skipped",
         }
     }
 }

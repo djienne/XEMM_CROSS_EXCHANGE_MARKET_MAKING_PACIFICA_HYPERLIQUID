@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use xemm_rust::bot::BotState;
-use xemm_rust::services::fill_aggregator::FillAggregator;
+use xemm_rust::services::fill_aggregator::{FillAggregator, HedgeSettlement};
 use xemm_rust::services::fill_dedup::{FillDedup, FillKey};
 use xemm_rust::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use xemm_rust::strategy::OrderSide;
@@ -128,6 +128,56 @@ fn idle_partial_then_later_terminal_emits_residual() {
         .expect("later terminal fill should emit residual");
     assert!((second.size - 0.6).abs() < 1e-9);
     assert!(second.terminal);
+}
+
+/// An uncertain hedge outcome (submit ack lost, orderStatus inconclusive) must
+/// NOT be re-emitted by the order-based paths: neither a reserve nor the idle
+/// flusher may produce a second intent for quarantined quantity. Only the
+/// position reconciler (venue truth) recovers it, then retires the quarantine.
+#[test]
+fn unknown_settlement_never_reemits_through_order_paths() {
+    let agg = FillAggregator::new(1_000.0);
+
+    // Full fill emits a hedge decision; the hedge executor reserves it.
+    let d = agg
+        .on_fill(55, OrderSide::Buy, 1.0, 100.0, true)
+        .expect("terminal fill should emit");
+
+    // Hedge attempts exhaust with an uncertain outcome.
+    agg.settle_hedge(HedgeSettlement::unknown(55, d.size, 0.0));
+
+    // No order-based path may re-emit the quarantined quantity...
+    assert!(agg.try_reserve_hedge(55).is_none());
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(
+        agg.flush_idle().is_empty(),
+        "idle flush must not re-emit unknown-settled quantity"
+    );
+    assert!(agg.on_fill(55, OrderSide::Buy, 1.0, 100.0, true).is_none());
+
+    // ...until the reconciler confirms neutrality and retires the quarantine.
+    agg.resolve_unknowns_on_neutral();
+    let state = agg.snapshot(55).unwrap();
+    assert!(state.unverified_unknown_qty.abs() < 1e-9);
+    assert!(state.residual().abs() < 1e-9);
+    assert!(agg.try_reserve_hedge(55).is_none());
+}
+
+/// A genuinely rejected hedge (definitive non-fill) keeps the prompt retry
+/// path: the residual re-exposes immediately and the idle flusher re-emits.
+#[test]
+fn rejected_settlement_reexposes_residual_promptly() {
+    let agg = FillAggregator::new(1_000.0);
+    let d = agg
+        .on_fill(56, OrderSide::Sell, 1.0, 100.0, true)
+        .expect("terminal fill should emit");
+
+    agg.settle_hedge(HedgeSettlement::rejected(56, d.size, 0.0));
+
+    let retry = agg
+        .try_reserve_hedge(56)
+        .expect("rejected settlement must allow prompt re-hedge");
+    assert!((retry.size - 1.0).abs() < 1e-9);
 }
 
 #[tokio::test]

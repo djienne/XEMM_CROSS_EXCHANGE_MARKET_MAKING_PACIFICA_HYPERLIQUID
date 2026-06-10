@@ -90,6 +90,13 @@ impl PositionReconcilerService {
                 last_enqueued = None;
                 prev_eff_net = None;
                 neutral_confirmations = neutral_confirmations.saturating_add(1);
+                if neutral_confirmations >= 2 {
+                    // Venue truth confirms neutrality across two reads: any
+                    // unknown-settled hedge quantity is resolved (it either
+                    // filled or this loop netted it), so retire the quarantine
+                    // and let the aggregator GC those entries.
+                    self.fill_aggregator.resolve_unknowns_on_neutral();
+                }
                 let can_complete = {
                     let state = self.bot_state.read();
                     state.active_order.is_none()
@@ -383,5 +390,21 @@ mod tests {
             0.01,
             Duration::from_secs(5),
         ));
+    }
+
+    #[test]
+    fn neutral_double_confirmation_resolves_unknown_quarantine() {
+        use crate::services::fill_aggregator::HedgeSettlement;
+
+        let agg = FillAggregator::new(1000.0);
+        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        agg.settle_hedge(HedgeSettlement::unknown(1, d.size, 0.0));
+        assert!(agg.snapshot(1).unwrap().unverified_unknown_qty > 0.0);
+
+        // Mirrors the reconciler's neutral branch after two confirmations.
+        agg.resolve_unknowns_on_neutral();
+        let state = agg.snapshot(1).unwrap();
+        assert!(state.unverified_unknown_qty.abs() < 1e-9);
+        assert!((state.cumulative_hedged_confirmed - 1.0).abs() < 1e-9);
     }
 }

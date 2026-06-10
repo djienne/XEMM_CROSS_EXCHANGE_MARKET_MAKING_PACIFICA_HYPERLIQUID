@@ -10,7 +10,11 @@ use crate::strategy::OrderSide;
 ///
 /// The important invariant is residual based:
 /// cumulative_filled - cumulative_hedged_confirmed - cumulative_hedge_pending
-/// is the only quantity eligible for a new hedge intent.
+/// - unverified_unknown_qty is the only quantity eligible for a new hedge
+/// intent. Unknown-settled quantity is quarantined out of the residual so the
+/// order-based re-emission paths (idle flush / try_reserve) can never
+/// double-hedge an uncertain attempt that actually filled; the position
+/// reconciler, which reasons from venue-position truth, owns its recovery.
 #[derive(Debug, Clone, Copy)]
 pub struct OrderFillState {
     pub order_id: u64,
@@ -18,6 +22,10 @@ pub struct OrderFillState {
     pub cumulative_filled: f64,
     pub cumulative_hedged_confirmed: f64,
     pub cumulative_hedge_pending: f64,
+    /// Quantity whose hedge outcome is uncertain (submit ack lost and
+    /// orderStatus could not confirm either way). Excluded from `residual()`;
+    /// resolved by `resolve_unknowns_on_neutral` once positions read neutral.
+    pub unverified_unknown_qty: f64,
     pub avg_price: f64,
     pub terminal: bool,
     pub last_updated: Instant,
@@ -30,7 +38,10 @@ pub struct OrderFillState {
 impl OrderFillState {
     #[inline]
     pub fn residual(&self) -> f64 {
-        (self.cumulative_filled - self.cumulative_hedged_confirmed - self.cumulative_hedge_pending)
+        (self.cumulative_filled
+            - self.cumulative_hedged_confirmed
+            - self.cumulative_hedge_pending
+            - self.unverified_unknown_qty)
             .max(0.0)
     }
 }
@@ -237,13 +248,15 @@ impl FillAggregator {
         if !g.contains_key(&order_id) && g.len() >= self.max_entries {
             // Only evict a FULLY-SETTLED entry. Never drop a live accumulator:
             // doing so would lose its reserved-hedge accounting (pending qty /
-            // settle_hedge), which could cause a duplicate or re-emitted hedge.
+            // settle_hedge / unknown quarantine), which could cause a duplicate
+            // or re-emitted hedge.
             let evictable = g
                 .iter()
                 .filter(|(_, s)| {
                     s.terminal
                         && s.residual() <= dust
                         && s.cumulative_hedge_pending <= f64::EPSILON
+                        && s.unverified_unknown_qty <= f64::EPSILON
                 })
                 .min_by_key(|(_, s)| s.created_at)
                 .map(|(id, _)| *id);
@@ -259,6 +272,7 @@ impl FillAggregator {
             cumulative_filled: 0.0,
             cumulative_hedged_confirmed: 0.0,
             cumulative_hedge_pending: 0.0,
+            unverified_unknown_qty: 0.0,
             avg_price: 0.0,
             terminal: false,
             last_updated: now,
@@ -379,7 +393,29 @@ impl FillAggregator {
             entry.cumulative_hedge_pending -= reserved;
             entry.cumulative_hedged_confirmed += filled;
             if settlement.status == HedgeSettlementStatus::Unknown {
+                // Quarantine the unconfirmed remainder instead of letting it
+                // fall back into the residual: the hedge may actually have
+                // filled (orderStatus lag), so an order-based re-emit would
+                // risk a double hedge. The position reconciler nets genuine
+                // exposure and `resolve_unknowns_on_neutral` retires the
+                // quarantine once venue positions read neutral.
+                entry.unverified_unknown_qty += reserved - filled;
                 entry.last_unknown_hedge = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Retire all unknown-settled quarantine once venue positions confirm
+    /// neutrality: whether the uncertain hedge filled or the reconciler netted
+    /// the exposure, the order-based ledger must stop tracking it. Called by
+    /// the position reconciler after two consecutive neutral reads.
+    pub fn resolve_unknowns_on_neutral(&self) {
+        let mut g = self.inner.lock();
+        for entry in g.values_mut() {
+            if entry.unverified_unknown_qty > 0.0 {
+                entry.cumulative_hedged_confirmed += entry.unverified_unknown_qty;
+                entry.unverified_unknown_qty = 0.0;
+                entry.last_unknown_hedge = None;
             }
         }
     }
@@ -400,6 +436,8 @@ impl FillAggregator {
     }
 
     /// Remove terminal accumulators whose exposure has been fully hedged.
+    /// Entries with quarantined unknown quantity are never collected — they
+    /// must survive until `resolve_unknowns_on_neutral` retires them.
     pub fn gc(&self, ttl: Duration) {
         let now = Instant::now();
         let mut g = self.inner.lock();
@@ -408,6 +446,7 @@ impl FillAggregator {
             !(acc.terminal
                 && acc.residual() <= dust
                 && acc.cumulative_hedge_pending <= f64::EPSILON
+                && acc.unverified_unknown_qty <= f64::EPSILON
                 && now.duration_since(acc.created_at) >= ttl)
         });
     }
@@ -629,5 +668,67 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         agg.gc(Duration::from_millis(1));
         assert_eq!(agg.len(), 0);
+    }
+
+    #[test]
+    fn unknown_settlement_quarantines_qty_from_reemission() {
+        let agg = FillAggregator::new(1000.0);
+        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        assert!((d.size - 1.0).abs() < 1e-9);
+
+        // Uncertain outcome: nothing confirmed, qty must NOT reappear as residual.
+        agg.settle_hedge(HedgeSettlement::unknown(1, d.size, 0.0));
+        let state = agg.snapshot(1).unwrap();
+        assert!((state.unverified_unknown_qty - 1.0).abs() < 1e-9);
+        assert!(state.residual().abs() < 1e-9);
+        assert!(agg.try_reserve_hedge(1).is_none());
+        assert!(agg.flush_idle().is_empty());
+        // A duplicate cumulative observation must not re-emit either.
+        assert!(agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).is_none());
+    }
+
+    #[test]
+    fn unknown_settlement_with_partial_confirm_quarantines_only_remainder() {
+        let agg = FillAggregator::new(1000.0);
+        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        agg.settle_hedge(HedgeSettlement::unknown(1, d.size, 0.4));
+        let state = agg.snapshot(1).unwrap();
+        assert!((state.cumulative_hedged_confirmed - 0.4).abs() < 1e-9);
+        assert!((state.unverified_unknown_qty - 0.6).abs() < 1e-9);
+        assert!(state.residual().abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolve_unknowns_on_neutral_retires_quarantine_and_allows_gc() {
+        let agg = FillAggregator::new(1000.0);
+        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
+        agg.settle_hedge(HedgeSettlement::unknown(1, d.size, 0.0));
+
+        // Quarantined entries must survive GC.
+        std::thread::sleep(Duration::from_millis(5));
+        agg.gc(Duration::from_millis(1));
+        assert_eq!(agg.len(), 1);
+
+        agg.resolve_unknowns_on_neutral();
+        let state = agg.snapshot(1).unwrap();
+        assert!(state.unverified_unknown_qty.abs() < 1e-9);
+        assert!((state.cumulative_hedged_confirmed - 1.0).abs() < 1e-9);
+        assert!(state.last_unknown_hedge.is_none());
+
+        agg.gc(Duration::from_millis(1));
+        assert_eq!(agg.len(), 0);
+    }
+
+    #[test]
+    fn new_fill_after_unknown_settlement_exposes_only_new_qty() {
+        // Emergency notional 50 lets the 0.6 @ $100 partial emit non-terminally.
+        let agg = FillAggregator::new(50.0);
+        let d = agg.on_fill(1, OrderSide::Buy, 0.6, 100.0, false).unwrap();
+        assert!((d.size - 0.6).abs() < 1e-9);
+        agg.settle_hedge(HedgeSettlement::unknown(1, d.size, 0.0));
+
+        // Later cumulative growth re-exposes ONLY the new quantity.
+        let second = agg.on_fill(1, OrderSide::Buy, 1.0, 101.0, true).unwrap();
+        assert!((second.size - 0.4).abs() < 1e-9);
     }
 }

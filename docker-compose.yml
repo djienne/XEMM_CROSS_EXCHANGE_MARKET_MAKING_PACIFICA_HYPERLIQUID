@@ -26,6 +26,10 @@ services:
       - ./.env:/app/.env:ro
       # Mount logs directory (optional)
       - ./logs:/app/logs
+      # Persist exposure/hedge journals (unresolved_exposure.jsonl,
+      # hedge_lifecycle.jsonl) across container recreation - the startup
+      # exposure recovery depends on these surviving a restart.
+      - ./data:/app/data
     
     # Logging configuration
     logging:

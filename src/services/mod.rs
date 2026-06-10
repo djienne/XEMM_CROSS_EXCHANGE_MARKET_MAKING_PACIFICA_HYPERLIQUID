@@ -23,7 +23,47 @@ use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 use crate::bot::BotState;
+use crate::connector::hyperliquid::HyperliquidTrading;
+use crate::connector::pacifica::PacificaTrading;
 use crate::strategy::OrderSide;
+
+/// Signed per-venue positions for `symbol`: `(pacifica, hyperliquid)`.
+///
+/// Pacifica reports unsigned amounts with a side ("bid" = long, "ask" = short);
+/// Hyperliquid's `szi` is already signed. Shared by the reconciler, safety
+/// monitor, hedge executor, and shutdown path so every exposure decision uses
+/// the same sign convention.
+pub async fn signed_positions(
+    pacifica: &PacificaTrading,
+    hyperliquid: &HyperliquidTrading,
+    symbol: &str,
+) -> anyhow::Result<(f64, f64)> {
+    let pacifica_positions = pacifica.get_positions().await?;
+    let pacifica_position = pacifica_positions
+        .iter()
+        .find(|position| position.symbol == symbol)
+        .map(|position| {
+            let amount: f64 = fast_float::parse(&position.amount).unwrap_or(0.0);
+            match position.side.as_str() {
+                "bid" => amount,
+                "ask" => -amount,
+                _ => 0.0,
+            }
+        })
+        .unwrap_or(0.0);
+
+    let user_state = hyperliquid
+        .get_user_state(&hyperliquid.account_address())
+        .await?;
+    let hyperliquid_position = user_state
+        .asset_positions
+        .iter()
+        .find(|ap| ap.position.coin == symbol)
+        .map(|ap| fast_float::parse(&ap.position.szi).unwrap_or(0.0))
+        .unwrap_or(0.0);
+
+    Ok((pacifica_position, hyperliquid_position))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HedgeSource {

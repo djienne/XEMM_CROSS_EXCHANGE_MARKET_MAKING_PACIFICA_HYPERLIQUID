@@ -483,7 +483,7 @@ impl XemmBot {
     /// Run the bot - spawn all services and execute main loop
     pub async fn run(mut self) -> Result<()> {
         hedge_store::start_lifecycle_logger(16_384);
-        self.recover_unresolved_exposure_on_startup().await;
+        self.startup_exposure_check().await;
 
         // ===================================================
         // SPAWN ALL SERVICES
@@ -901,6 +901,7 @@ impl XemmBot {
             hyperliquid_prices: self.hyperliquid_prices.clone(),
             config: self.config.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
+            pacifica_trading: self.pacifica_trading.clone(),
             fill_aggregator: self.fill_aggregator.clone(),
             audit_tx,
             cancel_tx: cancel_tx.clone(),
@@ -1318,7 +1319,7 @@ impl XemmBot {
         // exposure read is unreliable and must not trigger a false "unresolved
         // exposure" bail (which would wedge the next startup in Reconciling).
         let drain_confirmed = match tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(self.config.shutdown_drain_timeout_secs),
             shutdown_rx.recv(),
         )
         .await
@@ -1341,9 +1342,10 @@ impl XemmBot {
             }
             Err(_) => {
                 warn!(
-                    "{} {} Hedge drain timed out after 5s - check data/unhedged_positions.jsonl",
+                    "{} {} Hedge drain timed out after {}s - check data/hedge_lifecycle.jsonl for in-flight hedge status",
                     tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
-                    "WARN".yellow().bold()
+                    "WARN".yellow().bold(),
+                    self.config.shutdown_drain_timeout_secs
                 );
                 false
             }
@@ -1394,7 +1396,7 @@ impl XemmBot {
             }
         } else {
             warn!(
-                "{} {} Skipping exposure bail after drain timeout; hedge may still be settling (the hedge service persists any genuinely-failed hedge to data/unhedged_positions.jsonl)",
+                "{} {} Skipping exposure bail after drain timeout; hedge may still be settling (every hedge attempt is journaled to data/hedge_lifecycle.jsonl, and the next startup re-checks live positions)",
                 tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
                 "WARN".yellow().bold()
             );
@@ -1512,26 +1514,33 @@ impl XemmBot {
         }
     }
 
-    async fn recover_unresolved_exposure_on_startup(&self) {
+    /// Unconditional startup exposure gate.
+    ///
+    /// Previously this only ran when `data/unresolved_exposure.jsonl` existed,
+    /// but a crash never writes that file (and without a data volume it does
+    /// not survive container recreation), so the check is now always performed
+    /// from live venue positions. The TradeGate already boots blocked on
+    /// `PositionUnknown`, so this is defense-in-depth plus a loud operator
+    /// signal, not the only line of defense.
+    async fn startup_exposure_check(&self) {
         let path = std::path::Path::new("data/unresolved_exposure.jsonl");
-        if tokio::fs::metadata(path).await.is_err() {
-            return;
-        }
+        let marker_exists = tokio::fs::metadata(path).await.is_ok();
 
         match self.signed_positions().await {
             Ok((pacifica_position, hyperliquid_position)) => {
                 let net = pacifica_position + hyperliquid_position;
                 if net.abs() > self.config.neutral_dust_base {
                     warn!(
-                        "{} {} Startup found unresolved exposure file and live net exposure {:.8}; quoting stays blocked for reconciliation",
+                        "{} {} Startup found live net exposure {:.8} (unresolved-exposure marker file {}); quoting stays blocked for reconciliation",
                         tag_static("INIT", Color::Cyan),
                         "WARN".yellow().bold(),
-                        net
+                        net,
+                        if marker_exists { "present" } else { "absent" }
                     );
                     self.trade_gate.block(GateReason::NetExposure);
                     let mut state = self.bot_state.write();
                     state.mark_reconciling();
-                } else {
+                } else if marker_exists {
                     // Exposure is already flat: the file is stale, clear it so it
                     // does not get re-checked on every future startup.
                     if tokio::fs::remove_file(path).await.is_ok() {
@@ -1546,7 +1555,7 @@ impl XemmBot {
             }
             Err(e) => {
                 warn!(
-                    "{} {} Startup could not verify unresolved exposure file: {}",
+                    "{} {} Startup could not verify venue positions: {}; quoting stays blocked until the safety monitor confirms them",
                     tag_static("INIT", Color::Cyan),
                     "WARN".yellow().bold(),
                     e
@@ -1556,95 +1565,12 @@ impl XemmBot {
         }
     }
 
-    #[allow(dead_code)]
-    async fn pre_place_safety_check(&self) -> bool {
-        match self.pacifica_trading.get_open_orders().await {
-            Ok(orders)
-                if orders
-                    .iter()
-                    .any(|order| order.symbol == self.config.symbol) =>
-            {
-                warn!(
-                    "{} {} Placement safety gate found existing Pacifica open orders; cancelling and entering reconciliation",
-                    tag(&self.config.symbol, "SAFETY", Color::Yellow),
-                    "WARN".yellow().bold()
-                );
-                let _ = self
-                    .pacifica_trading
-                    .cancel_all_orders(false, Some(&self.config.symbol), false)
-                    .await;
-                let mut state = self.bot_state.write();
-                state.mark_reconciling();
-                return false;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(
-                    "{} {} Placement safety gate could not verify Pacifica open orders: {}",
-                    tag(&self.config.symbol, "SAFETY", Color::Yellow),
-                    "WARN".yellow().bold(),
-                    e
-                );
-                return false;
-            }
-        }
-
-        let (pacifica_position, hyperliquid_position) = match self.signed_positions().await {
-            Ok(positions) => positions,
-            Err(e) => {
-                warn!(
-                    "{} {} Placement safety gate could not verify positions: {}",
-                    tag(&self.config.symbol, "SAFETY", Color::Yellow),
-                    "WARN".yellow().bold(),
-                    e
-                );
-                return false;
-            }
-        };
-
-        let net_position = pacifica_position + hyperliquid_position;
-        if net_position.abs() > self.config.neutral_dust_base {
-            warn!(
-                "{} {} Placement blocked: net exposure {:.8} exceeds dust {}",
-                tag(&self.config.symbol, "SAFETY", Color::Yellow),
-                "WARN".yellow().bold(),
-                net_position,
-                self.config.neutral_dust_base
-            );
-            let mut state = self.bot_state.write();
-            state.mark_reconciling();
-            return false;
-        }
-
-        true
-    }
-
     async fn signed_positions(&self) -> Result<(f64, f64)> {
-        let pacifica_positions = self.pacifica_trading.get_positions().await?;
-        let pacifica_position = pacifica_positions
-            .iter()
-            .find(|position| position.symbol == self.config.symbol)
-            .map(|position| {
-                let amount = position.amount.parse::<f64>().unwrap_or(0.0);
-                match position.side.as_str() {
-                    "bid" => amount,
-                    "ask" => -amount,
-                    _ => 0.0,
-                }
-            })
-            .unwrap_or(0.0);
-
-        let hyperliquid_state = self
-            .hyperliquid_trading
-            .get_user_state(&self.hyperliquid_trading.account_address())
-            .await?;
-        let hyperliquid_position = hyperliquid_state
-            .asset_positions
-            .iter()
-            .find(|position| position.position.coin == self.config.symbol)
-            .map(|position| position.position.szi.parse::<f64>().unwrap_or(0.0))
-            .unwrap_or(0.0);
-
-        Ok((pacifica_position, hyperliquid_position))
+        crate::services::signed_positions(
+            &self.pacifica_trading,
+            &self.hyperliquid_trading,
+            &self.config.symbol,
+        )
+        .await
     }
 }

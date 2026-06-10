@@ -96,7 +96,6 @@ impl SafetyMonitorService {
     async fn update_positions(&self) {
         match self.signed_positions().await {
             Ok((pacifica, hyperliquid)) => {
-                self.trade_gate.allow(GateReason::PositionUnknown);
                 let net = pacifica + hyperliquid;
                 // L1: residuals below the exchange minimum order size cannot be
                 // hedged on-venue, so treat them as neutral here too (consistent
@@ -105,8 +104,13 @@ impl SafetyMonitorService {
                     .config
                     .neutral_dust_base
                     .max(fallback_rules(&self.config.symbol).min_size);
+                // Order matters: assert NetExposure BEFORE clearing
+                // PositionUnknown so there is no instant where both bits are
+                // clear while net exposure exists (the 1 kHz placement loop
+                // could interleave exactly there).
                 self.trade_gate
                     .set(GateReason::NetExposure, net.abs() > effective_dust);
+                self.trade_gate.allow(GateReason::PositionUnknown);
                 if net.abs() > effective_dust
                     && RunState::load(&self.atomic_status) == RunState::Idle
                 {
@@ -250,31 +254,11 @@ impl SafetyMonitorService {
     }
 
     async fn signed_positions(&self) -> anyhow::Result<(f64, f64)> {
-        let pacifica_positions = self.pacifica_trading.get_positions().await?;
-        let pacifica_position = pacifica_positions
-            .iter()
-            .find(|position| position.symbol == self.config.symbol)
-            .map(|position| {
-                let amount = parse(&position.amount).unwrap_or(0.0);
-                match position.side.as_str() {
-                    "bid" => amount,
-                    "ask" => -amount,
-                    _ => 0.0,
-                }
-            })
-            .unwrap_or(0.0);
-
-        let hyperliquid_state = self
-            .hyperliquid_trading
-            .get_user_state(&self.hyperliquid_trading.account_address())
-            .await?;
-        let hyperliquid_position = hyperliquid_state
-            .asset_positions
-            .iter()
-            .find(|position| position.position.coin == self.config.symbol)
-            .map(|position| parse(&position.position.szi).unwrap_or(0.0))
-            .unwrap_or(0.0);
-
-        Ok((pacifica_position, hyperliquid_position))
+        crate::services::signed_positions(
+            &self.pacifica_trading,
+            &self.hyperliquid_trading,
+            &self.config.symbol,
+        )
+        .await
     }
 }

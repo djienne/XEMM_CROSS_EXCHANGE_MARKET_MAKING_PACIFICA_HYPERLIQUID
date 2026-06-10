@@ -158,6 +158,11 @@ pub struct Config {
     /// Permit startup to continue if stale Pacifica order cancellation fails.
     #[serde(default = "default_allow_startup_with_cancel_failure")]
     pub allow_startup_with_cancel_failure: bool,
+
+    /// How long shutdown waits for the hedge service to drain in-flight
+    /// hedge events before proceeding with final cancellation.
+    #[serde(default = "default_shutdown_drain_timeout_secs")]
+    pub shutdown_drain_timeout_secs: u64,
 }
 
 // Default values
@@ -305,6 +310,10 @@ fn default_allow_startup_with_cancel_failure() -> bool {
     false
 }
 
+fn default_shutdown_drain_timeout_secs() -> u64 {
+    5
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -346,6 +355,7 @@ impl Default for Config {
             hedge_retry_base_delay_ms: default_hedge_retry_base_delay_ms(),
             hedge_retry_max_delay_ms: default_hedge_retry_max_delay_ms(),
             allow_startup_with_cancel_failure: default_allow_startup_with_cancel_failure(),
+            shutdown_drain_timeout_secs: default_shutdown_drain_timeout_secs(),
         }
     }
 }
@@ -536,6 +546,10 @@ impl Config {
         anyhow::ensure!(
             self.hedge_retry_base_delay_ms > 0 && self.hedge_retry_max_delay_ms > 0,
             "Hedge retry delays must be positive"
+        );
+        anyhow::ensure!(
+            self.shutdown_drain_timeout_secs >= 1,
+            "Shutdown drain timeout must be at least 1 second"
         );
 
         Ok(())
