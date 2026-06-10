@@ -236,28 +236,21 @@ impl HedgeService {
 
             // *** CRITICAL: CANCEL ALL ORDERS BEFORE HEDGE ***
             // Extra safety: cancel again in case fill detection missed anything
-            // or there was a race condition.
-            // MOVED TO BACKGROUND TASK to avoid blocking hedge execution latency.
-            let symbol_bg = self.config.symbol.clone();
-            let cancel_tx_bg = self.cancel_tx.clone();
-            let cancel_demand_bg = self.cancel_demand.clone();
-            let low_latency_mode = self.config.low_latency_mode;
-
-            tokio::spawn(async move {
-                if !low_latency_mode {
-                    info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
-                        tag(&symbol_bg, "HEDGE", Color::BrightMagenta),
-                        "FAST".yellow().bold()
-                    );
-                }
-
-                request_cancel(
-                    &cancel_tx_bg,
-                    &cancel_demand_bg,
-                    symbol_bg,
-                    CancelReason::Safety,
+            // or there was a race condition. `request_cancel` is two atomic ops
+            // plus a non-blocking try_send (the cancel manager does the actual
+            // I/O), so it runs inline - no spawn needed.
+            if !self.config.low_latency_mode {
+                info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    "FAST".yellow().bold()
                 );
-            });
+            }
+            request_cancel(
+                &self.cancel_tx,
+                &self.cancel_demand,
+                self.config.symbol.clone(),
+                CancelReason::Safety,
+            );
 
             // Update status
             {

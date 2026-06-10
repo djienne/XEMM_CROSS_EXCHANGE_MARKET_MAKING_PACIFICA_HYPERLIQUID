@@ -3,7 +3,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -224,6 +224,9 @@ pub struct PositionResponse {
 /// Pacifica trading client
 pub struct PacificaTrading {
     credentials: PacificaCredentials,
+    /// Ed25519 key decoded once; previously every signed request re-decoded
+    /// the bs58 private key and re-derived the key per call.
+    signing_key: OnceLock<SigningKey>,
     rest_url: String,
     client: reqwest::Client,
     market_info_cache: Arc<Mutex<Option<HashMap<String, MarketInfo>>>>,
@@ -235,15 +238,44 @@ impl PacificaTrading {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10)) // Max 10s per request
             .connect_timeout(std::time::Duration::from_secs(5)) // Max 5s to connect
+            .tcp_nodelay(true)
+            .pool_idle_timeout(None) // keep warm connections alive between calls
             .build()
             .context("Failed to build HTTP client")?;
 
         Ok(Self {
             credentials,
+            signing_key: OnceLock::new(),
             rest_url: MAINNET_REST_URL.to_string(),
             client,
             market_info_cache: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Lazily decode and cache the Ed25519 signing key.
+    fn signing_key(&self) -> Result<&SigningKey> {
+        if let Some(key) = self.signing_key.get() {
+            return Ok(key);
+        }
+        let private_key_bytes = bs58::decode(&self.credentials.private_key)
+            .into_vec()
+            .context("Failed to decode private key")?;
+        // Solana/Pacifica private keys are 64 bytes (32 bytes seed + 32 bytes
+        // public key); Ed25519 SigningKey needs only the seed.
+        if private_key_bytes.len() != 64 {
+            anyhow::bail!(
+                "Invalid private key length: expected 64 bytes, got {}",
+                private_key_bytes.len()
+            );
+        }
+        let seed_bytes: [u8; 32] = private_key_bytes[0..32]
+            .try_into()
+            .context("Failed to extract seed from private key")?;
+        let _ = self.signing_key.set(SigningKey::from_bytes(&seed_bytes));
+        Ok(self
+            .signing_key
+            .get()
+            .expect("signing key initialized above"))
     }
 
     /// Fetch market info for all symbols
@@ -421,29 +453,8 @@ impl PacificaTrading {
         // Canonicalize JSON (sort keys alphabetically)
         let canonical = canonicalize_json(&message);
 
-        // Decode private key from base58
-        let private_key_bytes = bs58::decode(&self.credentials.private_key)
-            .into_vec()
-            .context("Failed to decode private key")?;
-
-        // Solana/Pacifica private keys are 64 bytes (32 bytes seed + 32 bytes public key)
-        // Ed25519 SigningKey needs only the first 32 bytes (the seed)
-        if private_key_bytes.len() != 64 {
-            anyhow::bail!(
-                "Invalid private key length: expected 64 bytes, got {}",
-                private_key_bytes.len()
-            );
-        }
-
-        let seed_bytes: [u8; 32] = private_key_bytes[0..32]
-            .try_into()
-            .context("Failed to extract seed from private key")?;
-
-        // Create signing key from seed
-        let signing_key = SigningKey::from_bytes(&seed_bytes);
-
-        // Sign the message
-        let signature = signing_key.sign(canonical.as_bytes());
+        // Sign with the cached key
+        let signature = self.signing_key()?.sign(canonical.as_bytes());
 
         // Encode signature as base58
         Ok(bs58::encode(signature.to_bytes()).into_string())

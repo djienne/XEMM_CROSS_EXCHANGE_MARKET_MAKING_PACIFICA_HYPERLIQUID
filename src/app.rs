@@ -757,6 +757,7 @@ impl XemmBot {
             let hedge_tx = self.hedge_tx.clone();
             let pacifica_trading = self.pacifica_trading.clone();
             let hyperliquid_trading = self.hyperliquid_trading.clone();
+            let hyperliquid_prices = self.hyperliquid_prices.clone();
             let fill_aggregator = self.fill_aggregator.clone();
             let config = self.config.clone();
             spawn_supervised_with_factory(
@@ -769,6 +770,7 @@ impl XemmBot {
                         hedge_tx: hedge_tx.clone(),
                         pacifica_trading: pacifica_trading.clone(),
                         hyperliquid_trading: hyperliquid_trading.clone(),
+                        hyperliquid_prices: hyperliquid_prices.clone(),
                         fill_aggregator: fill_aggregator.clone(),
                         config: config.clone(),
                     };

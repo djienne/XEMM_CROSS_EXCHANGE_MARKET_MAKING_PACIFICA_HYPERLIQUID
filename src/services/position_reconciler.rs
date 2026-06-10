@@ -17,6 +17,7 @@ use crate::services::{
     enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
 };
 use crate::strategy::OrderSide;
+use crate::util::price::SharedQuote;
 
 /// Slow safety loop that reconciles net exposure across exchanges.
 pub struct PositionReconcilerService {
@@ -24,6 +25,9 @@ pub struct PositionReconcilerService {
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
+    /// Shared HL top-of-book cache: the USD-exposure estimate reads this
+    /// (lock-free) instead of issuing a REST l2 snapshot every tick.
+    pub hyperliquid_prices: Arc<SharedQuote>,
     pub fill_aggregator: Arc<FillAggregator>,
     pub config: Config,
 }
@@ -320,6 +324,16 @@ impl PositionReconcilerService {
     }
 
     async fn estimate_mid_price(&self) -> Option<f64> {
+        // Cache first: this prices a USD-exposure *estimate* for limit checks,
+        // so a few seconds of staleness is fine and saves a REST round-trip
+        // per non-neutral tick. REST only as fallback when the stream is cold.
+        if let Some(snap) = self
+            .hyperliquid_prices
+            .usable_snapshot(Duration::from_secs(3))
+        {
+            return Some((snap.bid + snap.ask) / 2.0);
+        }
+
         let Ok(Some((bid, ask))) = self
             .hyperliquid_trading
             .get_l2_snapshot(&self.config.symbol)

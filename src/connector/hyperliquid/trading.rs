@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use ethers::signers::{LocalWallet, Signer};
-use ethers::types::transaction::eip712::TypedData;
 use ethers::types::H256;
 use ethers::utils::keccak256;
 use reqwest::Client;
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
@@ -59,11 +58,24 @@ pub struct HyperliquidTrading {
     meta_cache: Arc<RwLock<Option<MetaResponse>>>,
     /// Wall-clock ms when `meta_cache` was last populated (0 = never).
     meta_fetched_at: AtomicU64,
+    /// Hot-path cache of `(coin, asset_id, AssetMeta)` for the single traded
+    /// symbol. Avoids cloning the entire asset universe out of `meta_cache`
+    /// on every order build (3x per hedge before this existed).
+    asset_cache: parking_lot::RwLock<Option<(String, u32, AssetMeta)>>,
+    /// `account_address()` result, computed once (env var reads take a
+    /// process-global lock and this is called on every position/status check).
+    account_address_cache: OnceLock<String>,
     is_testnet: bool,
     /// Monotonic nonce source: strictly increasing, fast-forwarded to wall-clock
     /// ms but never going backward, so two signed actions in the same millisecond
     /// (or across a clock step-back) cannot collide.
     nonce: AtomicU64,
+    /// Precomputed EIP-712 constants: the domain, Agent type hash, and source
+    /// hash never change for the life of the client, so per-signature work
+    /// reduces to two keccaks over fixed-size buffers + the ECDSA sign.
+    eip712_domain_separator: [u8; 32],
+    eip712_agent_type_hash: [u8; 32],
+    eip712_source_hash: [u8; 32],
 }
 
 impl HyperliquidTrading {
@@ -89,17 +101,77 @@ impl HyperliquidTrading {
         let wallet = LocalWallet::from_str(&credentials.private_key)
             .context("Failed to create wallet from private key")?;
 
+        // Bounded HTTP: a hung REST hedge submit / orderStatus query must fail
+        // in seconds, not stall the serial hedge executor for the OS TCP
+        // timeout (minutes). The error path treats a timeout as an uncertain
+        // submit and retries with the SAME cloid, so this is idempotency-safe.
+        // pool_idle_timeout(None) keeps the warm TLS connection alive between
+        // calls (the reconciler polls every 1s, so it never actually idles).
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(None)
+            .build()
+            .context("Failed to build Hyperliquid HTTP client")?;
+
+        let source = if is_testnet { "b" } else { "a" };
+
         Ok(Self {
             credentials,
             info_url,
             exchange_url,
-            client: Client::new(),
+            client,
             wallet,
             meta_cache: Arc::new(RwLock::new(None)),
             meta_fetched_at: AtomicU64::new(0),
+            asset_cache: parking_lot::RwLock::new(None),
+            account_address_cache: OnceLock::new(),
             is_testnet,
             nonce: AtomicU64::new(now_ms()),
+            eip712_domain_separator: Self::compute_domain_separator(),
+            eip712_agent_type_hash: keccak256(b"Agent(string source,bytes32 connectionId)"),
+            eip712_source_hash: keccak256(source.as_bytes()),
         })
+    }
+
+    /// EIP-712 domain separator for Hyperliquid's phantom-agent domain:
+    /// `{name: "Exchange", version: "1", chainId: 1337, verifyingContract: 0x0}`.
+    /// Constant for the life of the process, so computed once.
+    fn compute_domain_separator() -> [u8; 32] {
+        let type_hash = keccak256(
+            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        let name_hash = keccak256(b"Exchange");
+        let version_hash = keccak256(b"1");
+        let mut chain_id = [0u8; 32];
+        chain_id[24..].copy_from_slice(&1337u64.to_be_bytes());
+        let verifying_contract = [0u8; 32]; // address(0), left-padded
+
+        let mut encoded = Vec::with_capacity(160);
+        encoded.extend_from_slice(&type_hash);
+        encoded.extend_from_slice(&name_hash);
+        encoded.extend_from_slice(&version_hash);
+        encoded.extend_from_slice(&chain_id);
+        encoded.extend_from_slice(&verifying_contract);
+        keccak256(&encoded)
+    }
+
+    /// EIP-712 digest for `Agent { source, connectionId }` using the
+    /// precomputed domain separator / type hash / source hash.
+    fn eip712_agent_digest(&self, connection_id: H256) -> [u8; 32] {
+        let mut struct_encoded = [0u8; 96];
+        struct_encoded[0..32].copy_from_slice(&self.eip712_agent_type_hash);
+        struct_encoded[32..64].copy_from_slice(&self.eip712_source_hash);
+        struct_encoded[64..96].copy_from_slice(connection_id.as_bytes());
+        let struct_hash = keccak256(struct_encoded);
+
+        let mut digest_input = [0u8; 66];
+        digest_input[0] = 0x19;
+        digest_input[1] = 0x01;
+        digest_input[2..34].copy_from_slice(&self.eip712_domain_separator);
+        digest_input[34..66].copy_from_slice(&struct_hash);
+        keccak256(digest_input)
     }
 
     /// Returns true when this client is configured for testnet.
@@ -177,28 +249,47 @@ impl HyperliquidTrading {
         Ok(meta)
     }
 
-    /// Get asset ID from coin name
-    pub async fn get_asset_id(&self, coin: &str) -> Result<u32> {
-        let meta = self.get_meta().await?;
+    /// True when the cached meta (and therefore the per-symbol asset cache)
+    /// has outlived `META_TTL_MS` and should be refreshed.
+    fn meta_stale(&self) -> bool {
+        now_ms().saturating_sub(self.meta_fetched_at.load(Ordering::Relaxed)) >= META_TTL_MS
+    }
 
+    /// Refresh the per-symbol asset cache from (possibly re-fetched) meta.
+    async fn refresh_asset_cache(&self, coin: &str) -> Result<(u32, AssetMeta)> {
+        let meta = self.get_meta().await?;
         let asset_index = meta
             .universe
             .iter()
             .position(|asset| asset.name == coin)
             .with_context(|| format!("Asset {} not found in meta", coin))?;
-
-        Ok(asset_index as u32)
+        let asset = meta.universe[asset_index].clone();
+        *self.asset_cache.write() = Some((coin.to_string(), asset_index as u32, asset.clone()));
+        Ok((asset_index as u32, asset))
     }
 
-    /// Get asset metadata (szDecimals, etc.)
-    pub async fn get_asset_info(&self, coin: &str) -> Result<AssetMeta> {
-        let meta = self.get_meta().await?;
+    /// Get asset ID from coin name (per-symbol cached; no universe clone).
+    pub async fn get_asset_id(&self, coin: &str) -> Result<u32> {
+        if !self.meta_stale() {
+            if let Some((cached_coin, asset_id, _)) = self.asset_cache.read().as_ref() {
+                if cached_coin == coin {
+                    return Ok(*asset_id);
+                }
+            }
+        }
+        self.refresh_asset_cache(coin).await.map(|(id, _)| id)
+    }
 
-        meta.universe
-            .iter()
-            .find(|asset| asset.name == coin)
-            .cloned()
-            .with_context(|| format!("Asset {} not found in meta", coin))
+    /// Get asset metadata (szDecimals, etc.) (per-symbol cached).
+    pub async fn get_asset_info(&self, coin: &str) -> Result<AssetMeta> {
+        if !self.meta_stale() {
+            if let Some((cached_coin, _, asset)) = self.asset_cache.read().as_ref() {
+                if cached_coin == coin {
+                    return Ok(asset.clone());
+                }
+            }
+        }
+        self.refresh_asset_cache(coin).await.map(|(_, asset)| asset)
     }
 
     /// Get L2 orderbook snapshot via info endpoint
@@ -363,7 +454,12 @@ impl HyperliquidTrading {
         Ok(H256::from(hash))
     }
 
-    /// Sign an action using EIP-712
+    /// Sign an action using EIP-712.
+    ///
+    /// The digest is computed manually from precomputed constants (see
+    /// `eip712_agent_digest`) instead of rebuilding a `TypedData` JSON
+    /// structure per call; digest parity with the `TypedData` path is pinned
+    /// by `eip712_manual_digest_matches_typed_data` below.
     async fn sign_action(
         &self,
         action: &Action,
@@ -373,41 +469,8 @@ impl HyperliquidTrading {
         // Construct connection ID
         let connection_id = Self::construct_connection_id(action, nonce, vault_address)?;
 
-        // Construct EIP-712 domain
-        let domain = json!({
-            "chainId": 1337,
-            "name": "Exchange",
-            "verifyingContract": "0x0000000000000000000000000000000000000000",
-            "version": "1"
-        });
-
-        // Construct EIP-712 types
-        let types = json!({
-            "Agent": [
-                { "name": "source", "type": "string" },
-                { "name": "connectionId", "type": "bytes32" }
-            ]
-        });
-
-        // Construct phantom agent
-        // source: "a" for mainnet, "b" for testnet
-        let source = if self.is_testnet { "b" } else { "a" };
-
-        let message = json!({
-            "source": source,
-            "connectionId": format!("0x{}", hex::encode(connection_id.as_bytes()))
-        });
-
-        // Create EIP-712 typed data
-        let typed_data = TypedData {
-            domain: serde_json::from_value(domain)?,
-            types: serde_json::from_value(types)?,
-            primary_type: "Agent".to_string(),
-            message: serde_json::from_value(message)?,
-        };
-
-        // Sign the typed data
-        let sig = self.wallet.sign_typed_data(&typed_data).await?;
+        let digest = self.eip712_agent_digest(connection_id);
+        let sig = self.wallet.sign_hash(H256::from(digest))?;
 
         // Convert r and s from U256 to 32-byte arrays
         let mut r_bytes = [0u8; 32];
@@ -538,7 +601,9 @@ impl HyperliquidTrading {
 
         let size_str = Self::round_size(size, asset_info.sz_decimals);
 
-        info!(
+        // debug (not info): this runs on every hedge submit attempt - the
+        // latency-critical fill->hedge path must not pay for log formatting.
+        debug!(
             "[HYPERLIQUID] Market order {} {} {} at limit {} (mid: {:.2}, slippage: {}%, szDecimals: {})",
             if is_buy { "BUY" } else { "SELL" },
             size_str,
@@ -902,9 +967,96 @@ impl HyperliquidTrading {
     /// Honors the `HL_WALLET` env var (the *account* being traded, which may
     /// differ from the key-derived *signing* wallet for agent/API-wallet
     /// setups) and falls back to the derived address. All services must use
-    /// this so position/exposure checks agree on a single account.
+    /// this so position/exposure checks agree on a single account. Resolved
+    /// once and cached: env reads take a process-global lock and this is on
+    /// every position/orderStatus call.
     pub fn account_address(&self) -> String {
-        std::env::var("HL_WALLET").unwrap_or_else(|_| self.get_wallet_address())
+        self.account_address_cache
+            .get_or_init(|| std::env::var("HL_WALLET").unwrap_or_else(|_| self.get_wallet_address()))
+            .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::types::transaction::eip712::{Eip712, TypedData};
+
+    fn test_client(is_testnet: bool) -> HyperliquidTrading {
+        HyperliquidTrading::new(
+            HyperliquidCredentials {
+                // Well-known throwaway dev key (anvil account 0); never funded.
+                private_key:
+                    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                        .to_string(),
+            },
+            is_testnet,
+        )
+        .unwrap()
+    }
+
+    /// Golden parity: the manual precomputed-constant digest must equal the
+    /// digest the previous `TypedData`-based implementation produced. Pins the
+    /// L4 optimization against the reference encoder for both networks.
+    #[test]
+    fn eip712_manual_digest_matches_typed_data() {
+        for is_testnet in [false, true] {
+            let client = test_client(is_testnet);
+
+            let action = Action {
+                type_: "order".to_string(),
+                orders: vec![Order {
+                    a: 5,
+                    b: true,
+                    p: "123.45".to_string(),
+                    s: "0.5".to_string(),
+                    r: false,
+                    t: OrderType {
+                        limit: LimitOrderType {
+                            tif: TimeInForce::Ioc,
+                        },
+                    },
+                    c: Some("0x000102030405060708090a0b0c0d0e0f".to_string()),
+                }],
+                grouping: "na".to_string(),
+            };
+            let connection_id =
+                HyperliquidTrading::construct_connection_id(&action, 1_234_567, None).unwrap();
+
+            // Reference digest via the exact TypedData construction the
+            // pre-optimization sign_action used.
+            let source = if is_testnet { "b" } else { "a" };
+            let typed_data = TypedData {
+                domain: serde_json::from_value(json!({
+                    "chainId": 1337,
+                    "name": "Exchange",
+                    "verifyingContract": "0x0000000000000000000000000000000000000000",
+                    "version": "1"
+                }))
+                .unwrap(),
+                types: serde_json::from_value(json!({
+                    "Agent": [
+                        { "name": "source", "type": "string" },
+                        { "name": "connectionId", "type": "bytes32" }
+                    ]
+                }))
+                .unwrap(),
+                primary_type: "Agent".to_string(),
+                message: serde_json::from_value(json!({
+                    "source": source,
+                    "connectionId": format!("0x{}", hex::encode(connection_id.as_bytes()))
+                }))
+                .unwrap(),
+            };
+            let reference = typed_data.encode_eip712().unwrap();
+
+            let manual = client.eip712_agent_digest(connection_id);
+            assert_eq!(
+                reference, manual,
+                "EIP-712 digest mismatch (testnet={})",
+                is_testnet
+            );
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
@@ -35,6 +35,9 @@ type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
 /// JSON through a channel and await a matching response via `oneshot`.
 pub struct PacificaWsTrading {
     credentials: PacificaCredentials,
+    /// Ed25519 key decoded once; previously every order/cancel re-decoded the
+    /// bs58 private key and re-derived the key (SHA-512 expansion) per call.
+    signing_key: OnceLock<SigningKey>,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<String>,
     pending: PendingMap,
     connected: Arc<AtomicBool>,
@@ -64,10 +67,35 @@ impl PacificaWsTrading {
 
         Self {
             credentials,
+            signing_key: OnceLock::new(),
             outbound_tx,
             pending,
             connected,
         }
+    }
+
+    /// Lazily decode and cache the Ed25519 signing key.
+    fn signing_key(&self) -> Result<&SigningKey> {
+        if let Some(key) = self.signing_key.get() {
+            return Ok(key);
+        }
+        let private_key_bytes = bs58::decode(&self.credentials.private_key)
+            .into_vec()
+            .context("Failed to decode private key")?;
+        if private_key_bytes.len() != 64 {
+            anyhow::bail!(
+                "Invalid private key length: expected 64 bytes, got {}",
+                private_key_bytes.len()
+            );
+        }
+        let seed_bytes: [u8; 32] = private_key_bytes[0..32]
+            .try_into()
+            .context("Failed to extract 32-byte seed")?;
+        let _ = self.signing_key.set(SigningKey::from_bytes(&seed_bytes));
+        Ok(self
+            .signing_key
+            .get()
+            .expect("signing key initialized above"))
     }
 
     /// Returns true if the underlying WebSocket is currently connected.
@@ -433,21 +461,7 @@ impl PacificaWsTrading {
         }
         let canonical = canonicalize_json(&message);
 
-        let private_key_bytes = bs58::decode(&self.credentials.private_key)
-            .into_vec()
-            .context("Failed to decode private key")?;
-        if private_key_bytes.len() != 64 {
-            anyhow::bail!(
-                "Invalid private key length: expected 64 bytes, got {}",
-                private_key_bytes.len()
-            );
-        }
-        let seed_bytes: [u8; 32] = private_key_bytes[0..32]
-            .try_into()
-            .context("Failed to extract 32-byte seed")?;
-
-        let signing_key = SigningKey::from_bytes(&seed_bytes);
-        let signature = signing_key.sign(canonical.as_bytes());
+        let signature = self.signing_key()?.sign(canonical.as_bytes());
         Ok(bs58::encode(signature.to_bytes()).into_string())
     }
 }

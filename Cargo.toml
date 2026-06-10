@@ -15,6 +15,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+mimalloc = "0.1"
 anyhow = "1.0"
 thiserror = "1.0"
 futures-util = "0.3"
@@ -45,3 +47,12 @@ harness = false
 [[bench]]
 name = "price_quote"
 harness = false
+
+# Latency-critical binary: pay the compile-time cost for codegen quality.
+# `panic` stays "unwind" (the default) deliberately - both supervisors detect
+# task panics via JoinError to drive the fail-closed latch / restart logic;
+# panic=abort would bypass that entire safety design.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
