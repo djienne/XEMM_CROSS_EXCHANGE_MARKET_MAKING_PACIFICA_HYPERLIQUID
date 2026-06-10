@@ -46,13 +46,32 @@ impl OrderbookClient {
         })
     }
 
-    /// Start the client and call the callback for each top-of-book update
+    /// Legacy String-typed callback wrapper (examples/tools). The bot's hot
+    /// path uses `start_top_of_book` directly.
     ///
     /// # Arguments
     /// * `callback` - Function called on each update with (best_bid, best_ask, coin, timestamp)
     pub async fn start<F>(&mut self, mut callback: F) -> Result<()>
     where
         F: FnMut(String, String, String, u64) + Send + 'static,
+    {
+        let coin = self.config.coin.clone();
+        self.start_top_of_book(move |bid, ask, ts| {
+            callback(bid.to_string(), ask.to_string(), coin.clone(), ts)
+        })
+        .await
+    }
+
+    /// Start the client with an f64 top-of-book callback (hot path).
+    ///
+    /// Each l2Book frame is parsed in a single pass that extracts only the
+    /// best level per side (deeper levels are skipped without allocation).
+    ///
+    /// # Arguments
+    /// * `callback` - Function called with (best_bid, best_ask, exchange_timestamp_ms)
+    pub async fn start_top_of_book<F>(&mut self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(f64, f64, u64) + Send + 'static,
     {
         let mut reconnect_count = 0;
 
@@ -92,7 +111,7 @@ impl OrderbookClient {
     /// Connect to WebSocket and run the main loop
     async fn connect_and_run<F>(&mut self, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64) + Send + 'static,
+        F: FnMut(f64, f64, u64) + Send + 'static,
     {
         info!("[HYPERLIQUID] Connecting to {}", self.ws_url);
 
@@ -143,7 +162,7 @@ impl OrderbookClient {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             // Errors are already handled gracefully in handle_message
-                            self.handle_message(&text, callback).await.ok();
+                            self.handle_message(&text, callback).ok();
                         }
                         Some(Ok(Message::Ping(data))) => {
                             debug!("[HYPERLIQUID] Received ping, sending pong");
@@ -192,11 +211,26 @@ impl OrderbookClient {
     }
 
     /// Handle incoming WebSocket message
-    async fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
+    fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64) + Send + 'static,
+        F: FnMut(f64, f64, u64) + Send + 'static,
     {
-        // Try to parse as generic response first
+        // Hot path: nearly every frame on this socket is an l2Book frame.
+        // Parse it directly in ONE pass that extracts only the top level per
+        // side straight to f64 (deeper levels are skipped without allocation).
+        // The envelope parse below runs only for the rare pong/ack frames.
+        if let Ok(frame) = serde_json::from_str::<L2BookTopFrame>(text) {
+            if frame.channel == "l2Book" {
+                if let (Some(bid), Some(ask)) =
+                    (frame.data.levels.best_bid, frame.data.levels.best_ask)
+                {
+                    callback(bid, ask, frame.data.time);
+                }
+                return Ok(());
+            }
+        }
+
+        // Rare path: pong / subscription acks / unknown frames.
         let response: WebSocketResponse = match serde_json::from_str(text) {
             Ok(r) => r,
             Err(e) => {
@@ -207,27 +241,6 @@ impl OrderbookClient {
         };
 
         match response.channel.as_str() {
-            "l2Book" => {
-                // Parse L2 book subscription response
-                match serde_json::from_str::<L2BookSubscriptionResponse>(text) {
-                    Ok(l2_response) => {
-                        let book_data = &l2_response.data;
-
-                        // Extract top of book
-                        if let Some(tob) = book_data.get_top_of_book() {
-                            debug!(
-                                "[HYPERLIQUID] TOB: Bid={} Ask={} ({} @ {})",
-                                tob.best_bid, tob.best_ask, tob.coin, tob.timestamp
-                            );
-
-                            callback(tob.best_bid, tob.best_ask, tob.coin, tob.timestamp);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[HYPERLIQUID] Failed to parse L2 book subscription: {}", e);
-                    }
-                }
-            }
             "post" => {
                 // Keep for backward compatibility or other post requests
                 debug!("[HYPERLIQUID] Received post response (unexpected for subscription model)");
@@ -265,7 +278,7 @@ impl crate::services::price_source::PriceStream for OrderbookClient {
         &mut self,
         mut cb: crate::services::price_source::BookCallback,
     ) -> anyhow::Result<()> {
-        self.start(move |bid, ask, coin, ts| cb(bid, ask, coin, ts))
+        self.start_top_of_book(move |bid, ask, ts| cb(bid, ask, ts))
             .await
     }
 }

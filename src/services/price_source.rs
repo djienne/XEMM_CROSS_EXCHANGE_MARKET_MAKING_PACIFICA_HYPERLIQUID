@@ -10,15 +10,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use fast_float::parse;
 use tokio::time::interval;
 use tracing::{debug, error, info};
 
 use crate::util::price::{QuoteSource, SharedQuote};
 
-/// Callback the connector pushes (bid, ask, symbol, ts) through. Boxed so
-/// the trait below can stay object-safe across different client types.
-pub type BookCallback = Box<dyn FnMut(String, String, String, u64) + Send + 'static>;
+/// Callback the connector pushes (bid, ask, exchange_ts_ms) through. Prices
+/// arrive already parsed to f64 by the connector's single-pass frame parser.
+/// Boxed so the trait below can stay object-safe across client types.
+pub type BookCallback = Box<dyn FnMut(f64, f64, u64) + Send + 'static>;
 
 /// WebSocket / streaming source of top-of-book updates.
 ///
@@ -50,10 +50,8 @@ impl<C: PriceStream> PriceStreamService<C> {
         let label = self.client.label();
         info!("[{}] Starting price stream", label);
         let prices = self.prices.clone();
-        let cb: BookCallback = Box::new(move |bid, ask, _sym, _ts| {
-            let b: f64 = parse(&bid).unwrap_or(0.0);
-            let a: f64 = parse(&ask).unwrap_or(0.0);
-            prices.store_with_source(b, a, _ts, QuoteSource::Stream);
+        let cb: BookCallback = Box::new(move |bid, ask, ts| {
+            prices.store_with_source(bid, ask, ts, QuoteSource::Stream);
         });
         if let Err(e) = self.client.run_with(cb).await {
             error!("[{}] Price stream exited: {}", label, e);

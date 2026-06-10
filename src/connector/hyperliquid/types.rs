@@ -168,6 +168,127 @@ impl L2BookData {
     }
 }
 
+// ============================================================================
+// Hot-path top-of-book frame (single-pass, minimal allocation)
+// ============================================================================
+
+/// Hot-path l2Book frame: parses ONLY the best level per side, straight to
+/// f64, skipping deeper levels without allocating them. Mirrors the Pacifica
+/// `BookTopFrame`; the full `L2BookSubscriptionResponse` remains for
+/// depth-aware tooling.
+#[derive(Debug, Deserialize)]
+pub struct L2BookTopFrame {
+    pub channel: String,
+    pub data: L2BookTopData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct L2BookTopData {
+    pub time: u64,
+    pub levels: L2TopOfBookLevels,
+}
+
+/// `[bids, asks]` where only each side's first (best) level price is kept.
+#[derive(Debug)]
+pub struct L2TopOfBookLevels {
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for L2TopOfBookLevels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LevelsVisitor;
+        impl<'de> serde::de::Visitor<'de> for LevelsVisitor {
+            type Value = L2TopOfBookLevels;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("[[bid levels], [ask levels]]")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let best_bid = seq.next_element::<L2SideTopPrice>()?.and_then(|s| s.0);
+                let best_ask = seq.next_element::<L2SideTopPrice>()?.and_then(|s| s.0);
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(L2TopOfBookLevels { best_bid, best_ask })
+            }
+        }
+        deserializer.deserialize_seq(LevelsVisitor)
+    }
+}
+
+/// One side's level array; keeps only the first level's price.
+struct L2SideTopPrice(Option<f64>);
+
+impl<'de> Deserialize<'de> for L2SideTopPrice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SideVisitor;
+        impl<'de> serde::de::Visitor<'de> for SideVisitor {
+            type Value = L2SideTopPrice;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of book levels")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let first = seq.next_element::<L2TopLevelPrice>()?;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(L2SideTopPrice(first.map(|level| level.px)))
+            }
+        }
+        deserializer.deserialize_seq(SideVisitor)
+    }
+}
+
+/// A single book level, extracting only `px` as f64; other fields skipped.
+#[derive(Deserialize)]
+struct L2TopLevelPrice {
+    #[serde(
+        rename = "px",
+        deserialize_with = "crate::connector::pacifica::f64_from_str_or_number"
+    )]
+    px: f64,
+}
+
+#[cfg(test)]
+mod l2_book_top_frame_tests {
+    use super::*;
+
+    #[test]
+    fn l2_book_top_frame_extracts_best_levels_only() {
+        let frame: L2BookTopFrame = serde_json::from_str(
+            r#"{"channel":"l2Book","data":{"coin":"SOL","time":777,"levels":[[{"px":"100.5","sz":"10","n":3},{"px":"100.4","sz":"5","n":1}],[{"px":"100.6","sz":"7","n":2}]]}}"#,
+        )
+        .unwrap();
+        assert_eq!(frame.channel, "l2Book");
+        assert_eq!(frame.data.time, 777);
+        assert_eq!(frame.data.levels.best_bid, Some(100.5));
+        assert_eq!(frame.data.levels.best_ask, Some(100.6));
+    }
+
+    #[test]
+    fn non_book_frames_fail_l2_top_parse() {
+        assert!(serde_json::from_str::<L2BookTopFrame>(
+            r#"{"channel":"subscriptionResponse","data":{"method":"subscribe"}}"#
+        )
+        .is_err());
+        assert!(
+            serde_json::from_str::<L2BookTopFrame>(r#"{"channel":"pong"}"#).is_err()
+        );
+    }
+}
+
 /// Time in force for orders
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]

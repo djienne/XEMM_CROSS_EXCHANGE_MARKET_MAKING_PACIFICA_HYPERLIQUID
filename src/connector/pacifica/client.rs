@@ -49,13 +49,32 @@ impl OrderbookClient {
         Ok(Self { config, ws_url })
     }
 
-    /// Start the client with a callback for top of book updates
+    /// Legacy String-typed callback wrapper (examples/tools). The bot's hot
+    /// path uses `start_top_of_book` directly.
     ///
     /// # Arguments
     /// * `callback` - Function called with (best_bid_price, best_ask_price, symbol, timestamp)
     pub async fn start<F>(&mut self, mut callback: F) -> Result<()>
     where
         F: FnMut(String, String, String, u64) + Send + 'static,
+    {
+        let symbol = self.config.symbol.clone();
+        self.start_top_of_book(move |bid, ask, ts| {
+            callback(bid.to_string(), ask.to_string(), symbol.clone(), ts)
+        })
+        .await
+    }
+
+    /// Start the client with an f64 top-of-book callback (hot path).
+    ///
+    /// Each book frame is parsed in a single pass that extracts only the best
+    /// level per side (deeper levels are skipped without allocation).
+    ///
+    /// # Arguments
+    /// * `callback` - Function called with (best_bid, best_ask, exchange_timestamp_ms)
+    pub async fn start_top_of_book<F>(&mut self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(f64, f64, u64) + Send + 'static,
     {
         let mut reconnect_count = 0;
 
@@ -97,7 +116,7 @@ impl OrderbookClient {
     /// Internal method to connect and run the WebSocket client
     async fn connect_and_run<F>(&self, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64),
+        F: FnMut(f64, f64, u64),
     {
         info!("[PACIFICA] Connecting to {}", self.ws_url);
 
@@ -201,50 +220,42 @@ impl OrderbookClient {
     /// Handle incoming WebSocket messages
     fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64),
+        F: FnMut(f64, f64, u64),
     {
-        // First try to parse as generic response to check channel
-        let response: WebSocketResponse = serde_json::from_str(text)?;
+        // Hot path: nearly every frame on this socket is a book frame. Parse it
+        // directly in ONE pass that extracts only the top level per side
+        // straight to f64 (deeper levels are skipped without allocation). The
+        // envelope parse below runs only for the rare pong/ack frames.
+        if let Ok(frame) = serde_json::from_str::<BookTopFrame>(text) {
+            if frame.channel == "book" {
+                if let (Some(bid), Some(ask)) =
+                    (frame.data.levels.best_bid, frame.data.levels.best_ask)
+                {
+                    callback(bid, ask, frame.data.timestamp);
+                } else {
+                    warn!("[PACIFICA] Incomplete top of book data received");
+                }
+                return Ok(());
+            }
+        }
 
-        // Handle messages without channel field
-        let channel = match response.channel {
-            Some(ch) => ch,
+        // Rare path: pong / subscription acks / unknown frames.
+        let response: WebSocketResponse = serde_json::from_str(text)?;
+        match response.channel.as_deref() {
+            Some("pong") => {
+                debug!("[PACIFICA] Received pong response");
+            }
+            Some(other) => {
+                debug!("[PACIFICA] Received unknown channel: {}", other);
+            }
             None => {
                 debug!(
                     "[PACIFICA] Received message without channel field, ignoring: {}",
                     text.chars().take(100).collect::<String>()
                 );
-                return Ok(());
-            }
-        };
-
-        match channel.as_str() {
-            "pong" => {
-                debug!("[PACIFICA] Received pong response");
-                Ok(())
-            }
-            "book" => {
-                // Parse as orderbook response
-                let orderbook_response: OrderbookResponse = serde_json::from_str(text)?;
-                let orderbook_data = orderbook_response.data;
-
-                // Extract top of book
-                let tob = orderbook_data.get_top_of_book();
-
-                // Call the callback with top of book data
-                if let (Some(bid), Some(ask)) = (tob.best_bid, tob.best_ask) {
-                    callback(bid.price, ask.price, tob.symbol, tob.timestamp);
-                } else {
-                    warn!("[PACIFICA] Incomplete top of book data received");
-                }
-
-                Ok(())
-            }
-            other => {
-                debug!("[PACIFICA] Received unknown channel: {}", other);
-                Ok(())
             }
         }
+        Ok(())
     }
 }
 
@@ -266,7 +277,7 @@ impl crate::services::price_source::PriceStream for OrderbookClient {
         &mut self,
         mut cb: crate::services::price_source::BookCallback,
     ) -> anyhow::Result<()> {
-        self.start(move |bid, ask, sym, ts| cb(bid, ask, sym, ts))
+        self.start_top_of_book(move |bid, ask, ts| cb(bid, ask, ts))
             .await
     }
 }

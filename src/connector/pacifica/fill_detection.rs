@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -469,7 +470,9 @@ impl FillDetectionClient {
                     *self.last_order_fill_time.lock() = Instant::now();
 
                     for item in items {
-                        match serde_json::from_value::<OrderUpdate>(item.clone()) {
+                        // Deserialize from &Value (no clone): the raw item is
+                        // still available for the error log below.
+                        match OrderUpdate::deserialize(&item) {
                             Ok(update) => {
                                 debug!(
                                     "Order update - ID: {}, Status: {:?}, Event: {:?}, Filled: {}/{}",

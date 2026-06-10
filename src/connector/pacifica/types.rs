@@ -90,6 +90,168 @@ impl OrderbookData {
     }
 }
 
+// ============================================================================
+// Hot-path top-of-book frame (single-pass, minimal allocation)
+// ============================================================================
+
+/// Hot-path book frame: parses ONLY the best level per side, straight to f64,
+/// skipping deeper levels without allocating them. This is the
+/// highest-frequency message in the system; the full `OrderbookResponse`
+/// (every level as `String`s) remains for depth-aware tooling.
+#[derive(Debug, Deserialize)]
+pub struct BookTopFrame {
+    pub channel: String,
+    pub data: BookTopData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BookTopData {
+    #[serde(rename = "l")]
+    pub levels: TopOfBookLevels,
+    #[serde(rename = "t")]
+    pub timestamp: u64,
+}
+
+/// `[bids, asks]` where only each side's first (best) level price is kept.
+#[derive(Debug)]
+pub struct TopOfBookLevels {
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for TopOfBookLevels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LevelsVisitor;
+        impl<'de> serde::de::Visitor<'de> for LevelsVisitor {
+            type Value = TopOfBookLevels;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("[[bid levels], [ask levels]]")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let best_bid = seq.next_element::<SideTopPrice>()?.and_then(|side| side.0);
+                let best_ask = seq.next_element::<SideTopPrice>()?.and_then(|side| side.0);
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(TopOfBookLevels { best_bid, best_ask })
+            }
+        }
+        deserializer.deserialize_seq(LevelsVisitor)
+    }
+}
+
+/// One side's level array; keeps only the first level's price and skips the
+/// remaining levels without allocating them.
+struct SideTopPrice(Option<f64>);
+
+impl<'de> Deserialize<'de> for SideTopPrice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SideVisitor;
+        impl<'de> serde::de::Visitor<'de> for SideVisitor {
+            type Value = SideTopPrice;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of book levels")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let first = seq.next_element::<TopLevelPrice>()?;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(SideTopPrice(first.map(|level| level.p)))
+            }
+        }
+        deserializer.deserialize_seq(SideVisitor)
+    }
+}
+
+/// A single book level, extracting only `p` (price) as f64. Other fields
+/// (`a`, `n`, ...) are skipped by serde's default unknown-field handling.
+#[derive(Deserialize)]
+struct TopLevelPrice {
+    #[serde(rename = "p", deserialize_with = "f64_from_str_or_number")]
+    p: f64,
+}
+
+/// Accepts a price encoded as a JSON string (the exchange wire format) or a
+/// bare number, parsing straight to f64 without an intermediate String.
+pub(crate) fn f64_from_str_or_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct PriceVisitor;
+    impl serde::de::Visitor<'_> for PriceVisitor {
+        type Value = f64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a price as string or number")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<f64, E> {
+            fast_float::parse(v).map_err(|_| E::custom("invalid price string"))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f64, E> {
+            Ok(v)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+    }
+    deserializer.deserialize_any(PriceVisitor)
+}
+
+#[cfg(test)]
+mod book_top_frame_tests {
+    use super::*;
+
+    #[test]
+    fn book_top_frame_extracts_best_levels_only() {
+        let frame: BookTopFrame = serde_json::from_str(
+            r#"{"channel":"book","data":{"l":[[{"a":"10","n":3,"p":"100.5"},{"a":"5","n":1,"p":"100.4"}],[{"a":"7","n":2,"p":"100.6"},{"a":"9","n":4,"p":"100.7"}]],"s":"SOL","t":1234}}"#,
+        )
+        .unwrap();
+        assert_eq!(frame.channel, "book");
+        assert_eq!(frame.data.timestamp, 1234);
+        assert_eq!(frame.data.levels.best_bid, Some(100.5));
+        assert_eq!(frame.data.levels.best_ask, Some(100.6));
+    }
+
+    #[test]
+    fn book_top_frame_handles_empty_sides() {
+        let frame: BookTopFrame = serde_json::from_str(
+            r#"{"channel":"book","data":{"l":[[],[{"a":"7","n":2,"p":"100.6"}]],"s":"SOL","t":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(frame.data.levels.best_bid, None);
+        assert_eq!(frame.data.levels.best_ask, Some(100.6));
+    }
+
+    #[test]
+    fn non_book_frames_fail_book_parse_but_envelope_succeeds() {
+        let pong = r#"{"channel":"pong"}"#;
+        assert!(serde_json::from_str::<BookTopFrame>(pong).is_err());
+        let envelope: WebSocketResponse = serde_json::from_str(pong).unwrap();
+        assert_eq!(envelope.channel.as_deref(), Some("pong"));
+    }
+}
+
 impl SubscribeMessage {
     pub fn new(symbol: String, agg_level: u32) -> Self {
         Self {
