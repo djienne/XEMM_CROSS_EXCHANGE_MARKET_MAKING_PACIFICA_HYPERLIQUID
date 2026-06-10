@@ -62,6 +62,12 @@ pub fn quote_usable(snapshot: QuoteSnapshot, now_ns: u64, max_age_ns: u64) -> bo
 /// mutex. Writers reserve the sequence by making it odd, publish all fields,
 /// then make it even. REST fallback writes do not overwrite a fresh streaming
 /// quote, preventing a slower poll from replacing a good WebSocket update.
+///
+/// A `watch`-based wake channel is bumped after every publish so consumers
+/// can `await` quote changes instead of polling on a fixed tick. The seqlock
+/// remains the data path; the watch carries no data, only the wake.
+/// (`watch` rather than `Notify`: `changed()` cannot lose a wake that lands
+/// between a snapshot read and the await, which `notify_waiters` can.)
 pub struct AtomicQuote {
     seq: AtomicU64,
     bid_bits: AtomicU64,
@@ -69,6 +75,7 @@ pub struct AtomicQuote {
     exchange_ts_ms: AtomicU64,
     recv_ns: AtomicU64,
     source: AtomicU64,
+    wake: tokio::sync::watch::Sender<u64>,
 }
 
 /// Backward-compatible name used by existing services.
@@ -87,7 +94,14 @@ impl AtomicQuote {
             exchange_ts_ms: AtomicU64::new(0),
             recv_ns: AtomicU64::new(0),
             source: AtomicU64::new(QuoteSource::Unknown as u64),
+            wake: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// Subscribe to publish wake-ups. `changed().await` resolves whenever a
+    /// new quote has been stored since the receiver last observed one.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.wake.subscribe()
     }
 
     #[inline]
@@ -180,6 +194,8 @@ impl AtomicQuote {
         self.recv_ns.store(now, Ordering::Release);
         self.source.store(source as u64, Ordering::Release);
         self.seq.store(seq + 2, Ordering::Release);
+        // Wake event-driven consumers (no-op cost when none are waiting).
+        self.wake.send_replace(seq + 2);
     }
 
     /// Return a coherent, fresh snapshot.
@@ -298,6 +314,28 @@ mod tests {
         q.store(100.0, 100.05);
         assert!(q.usable_snapshot(Duration::from_secs(1)).is_some());
         assert!(q.usable_snapshot(Duration::from_nanos(0)).is_none());
+    }
+
+    #[tokio::test]
+    async fn store_wakes_subscribers() {
+        let q = SharedQuote::empty();
+        let mut rx = q.subscribe();
+
+        // No store yet: the wake must still be pending.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.changed())
+                .await
+                .is_err(),
+            "no wake expected before a store"
+        );
+
+        q.store(100.0, 100.05);
+        tokio::time::timeout(Duration::from_millis(100), rx.changed())
+            .await
+            .expect("store must wake the subscriber")
+            .expect("sender alive");
+        let (b, a) = q.load();
+        assert_eq!((b, a), (100.0, 100.05));
     }
 
     #[test]

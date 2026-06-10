@@ -163,6 +163,12 @@ pub struct Config {
     /// hedge events before proceeding with final cancellation.
     #[serde(default = "default_shutdown_drain_timeout_secs")]
     pub shutdown_drain_timeout_secs: u64,
+
+    /// Pacifica trading-WebSocket request/response timeout (ms). Placement is
+    /// post-only, so a tight timeout is safe: an abandoned request falls into
+    /// the PlacementUnknown recovery path, which verifies and adopts/clears.
+    #[serde(default = "default_pacifica_ws_request_timeout_ms")]
+    pub pacifica_ws_request_timeout_ms: u64,
 }
 
 // Default values
@@ -314,6 +320,10 @@ fn default_shutdown_drain_timeout_secs() -> u64 {
     5
 }
 
+fn default_pacifica_ws_request_timeout_ms() -> u64 {
+    2_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -356,6 +366,7 @@ impl Default for Config {
             hedge_retry_max_delay_ms: default_hedge_retry_max_delay_ms(),
             allow_startup_with_cancel_failure: default_allow_startup_with_cancel_failure(),
             shutdown_drain_timeout_secs: default_shutdown_drain_timeout_secs(),
+            pacifica_ws_request_timeout_ms: default_pacifica_ws_request_timeout_ms(),
         }
     }
 }
@@ -550,6 +561,10 @@ impl Config {
         anyhow::ensure!(
             self.shutdown_drain_timeout_secs >= 1,
             "Shutdown drain timeout must be at least 1 second"
+        );
+        anyhow::ensure!(
+            (100..=10_000).contains(&self.pacifica_ws_request_timeout_ms),
+            "Pacifica WS request timeout must be within 100..=10000 ms"
         );
 
         Ok(())

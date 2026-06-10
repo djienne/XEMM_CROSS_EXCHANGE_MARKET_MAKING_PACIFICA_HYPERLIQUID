@@ -38,6 +38,8 @@ pub struct PacificaWsTrading {
     /// Ed25519 key decoded once; previously every order/cancel re-decoded the
     /// bs58 private key and re-derived the key (SHA-512 expansion) per call.
     signing_key: OnceLock<SigningKey>,
+    /// Per-request response timeout (see `with_request_timeout`).
+    request_timeout: Duration,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<String>,
     pending: PendingMap,
     connected: Arc<AtomicBool>,
@@ -68,10 +70,20 @@ impl PacificaWsTrading {
         Self {
             credentials,
             signing_key: OnceLock::new(),
+            request_timeout: REQUEST_TIMEOUT,
             outbound_tx,
             pending,
             connected,
         }
+    }
+
+    /// Override the request/response round-trip timeout (default 2s).
+    /// Placement is post-only, so a tighter timeout is safe: an abandoned
+    /// request falls into the PlacementUnknown recovery path, which verifies
+    /// via open-orders/trade-history and adopts or clears the order.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// Lazily decode and cache the Ed25519 signing key.
@@ -294,7 +306,7 @@ impl PacificaWsTrading {
             anyhow::bail!("Pacifica WS outbound channel closed");
         }
 
-        match timeout(REQUEST_TIMEOUT, rx).await {
+        match timeout(self.request_timeout, rx).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => {
                 self.pending.lock().remove(&request_id);
@@ -302,7 +314,10 @@ impl PacificaWsTrading {
             }
             Err(_) => {
                 self.pending.lock().remove(&request_id);
-                anyhow::bail!("Pacifica WS request timed out after {:?}", REQUEST_TIMEOUT)
+                anyhow::bail!(
+                    "Pacifica WS request timed out after {:?}",
+                    self.request_timeout
+                )
             }
         }
     }

@@ -300,8 +300,12 @@ impl XemmBot {
         );
 
         // Initialize WebSocket trading client for ultra-fast cancellations
-        let pacifica_ws_trading =
-            Arc::new(PacificaWsTrading::new(pacifica_credentials.clone(), false)); // false = mainnet
+        let pacifica_ws_trading = Arc::new(
+            PacificaWsTrading::new(pacifica_credentials.clone(), false) // false = mainnet
+                .with_request_timeout(Duration::from_millis(
+                    config.pacifica_ws_request_timeout_ms,
+                )),
+        );
 
         let hyperliquid_trading = Arc::new(
             HyperliquidTrading::new(hyperliquid_credentials, false)
@@ -936,11 +940,16 @@ impl XemmBot {
         );
         info!("");
 
-        // 1 kHz evaluation cadence. Skip (don't burst) missed ticks: the body
-        // awaits REST/WS placement I/O, and bursting accumulated ticks afterward
-        // would spin the CPU without improving reaction time.
-        let mut eval_interval = interval(Duration::from_millis(1));
-        eval_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Event-driven evaluation: wake on every book update from either venue
+        // (via the seqlock's watch wake channel) instead of polling at 1 kHz.
+        // Reaction to a price move drops from ~0.5ms average tick-alignment
+        // latency to scheduler wake latency, and the idle CPU burn disappears.
+        // The coarse fallback tick keeps gate / rate-limit housekeeping alive
+        // when no book flow arrives.
+        let mut pac_wake = self.pacifica_prices.subscribe();
+        let mut hl_wake = self.hyperliquid_prices.subscribe();
+        let mut fallback_tick = interval(Duration::from_millis(10));
+        fallback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let rate_limits = RateLimitBook::new();
 
         let sigint = signal::ctrl_c();
@@ -979,7 +988,16 @@ impl XemmBot {
                     break;
                 }
 
-                _ = eval_interval.tick() => {
+                // Wake on either venue's book update, or the fallback tick.
+                // `changed()` cannot miss an update that lands while the body
+                // below is executing - it completes immediately on re-poll.
+                _ = async {
+                    tokio::select! {
+                        _ = pac_wake.changed() => {},
+                        _ = hl_wake.changed() => {},
+                        _ = fallback_tick.tick() => {},
+                    }
+                } => {
                     let run_state = RunState::load(&self.atomic_status);
                     if run_state.is_terminal() {
                         break;

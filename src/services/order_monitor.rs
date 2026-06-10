@@ -237,17 +237,23 @@ impl OrderMonitorService {
 
     /// Main monitoring loop - LATENCY CRITICAL
     ///
-    /// This loop runs at 1kHz and must complete each iteration in <1ms.
-    /// All I/O operations are delegated to separate tasks via channels.
+    /// Event-driven: wakes on every Hyperliquid book update (profit
+    /// deterioration is book-driven), with a 5ms fallback tick bounding
+    /// age-expiry detection latency. All I/O is delegated via channels.
     pub async fn run_monitor_loop(&self) {
-        let mut monitor_interval = interval(Duration::from_millis(1));
+        let mut hl_wake = self.hyperliquid_prices.subscribe();
+        let mut fallback_tick = interval(Duration::from_millis(5));
+        fallback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Timing thresholds
         let age_threshold = Duration::from_secs(self.config.order_refresh_interval_secs);
         let profit_threshold = self.config.profit_cancel_threshold_bps;
 
         loop {
-            monitor_interval.tick().await;
+            tokio::select! {
+                _ = hl_wake.changed() => {},
+                _ = fallback_tick.tick() => {},
+            }
 
             // FAST PATH: Lock-free status check
             let status = self.atomic_status.load(Ordering::Acquire);
