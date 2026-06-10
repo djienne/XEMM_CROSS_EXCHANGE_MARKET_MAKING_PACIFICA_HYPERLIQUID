@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
 
     let fill_config = FillDetectionConfig {
         account: pacifica_creds.account.clone(),
-        reconnect_attempts: 3,
+        max_attempts: Some(3),
         ping_interval_secs: 15,
         enable_position_fill_detection: true, // Enable position-based fill detection
     };

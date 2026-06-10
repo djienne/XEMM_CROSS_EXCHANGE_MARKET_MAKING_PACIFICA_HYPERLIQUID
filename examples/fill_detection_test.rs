@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     // Start fill detection client in background
     let fill_detection_config = FillDetectionConfig {
         account: credentials.account.clone(),
-        reconnect_attempts: 5,
+        max_attempts: Some(5),
         ping_interval_secs: 30,
         enable_position_fill_detection: true,
     };

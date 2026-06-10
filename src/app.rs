@@ -552,7 +552,11 @@ impl XemmBot {
         }
         let fill_config = FillDetectionConfig {
             account: self.pacifica_credentials.account.clone(),
-            reconnect_attempts: self.config.reconnect_attempts,
+            // Unbounded: the fill stream is fail-closed (a permanent exit
+            // latches ServiceDown and halts quoting until manual restart), so
+            // it must keep reconnecting; FillWsDown gates quoting during gaps
+            // and the reconcile hook replays fills missed while disconnected.
+            max_attempts: None,
             ping_interval_secs: self.config.ping_interval_secs,
             enable_position_fill_detection: true,
         };

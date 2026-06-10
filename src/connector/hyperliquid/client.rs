@@ -124,29 +124,45 @@ impl OrderbookClient {
         let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
         ping_interval.tick().await; // Skip first tick
 
+        // Staleness watchdog (mirrors the Pacifica clients): a half-open socket
+        // can stop delivering frames while pings still write successfully for
+        // minutes (TCP send buffer). Without this, the quote goes stale, the
+        // QuoteStale gate blocks quoting, and nothing triggers a reconnect
+        // until the OS finally fails a write.
+        let stale_after =
+            Duration::from_secs((self.config.ping_interval_secs.max(1)).saturating_mul(3));
+        let mut stale_check = interval(Duration::from_secs(self.config.ping_interval_secs.max(1)));
+        stale_check.tick().await;
+        let mut last_inbound = tokio::time::Instant::now();
+
         loop {
             tokio::select! {
                 // Handle incoming messages
-                Some(msg) = read.next() => {
+                msg = read.next() => {
+                    last_inbound = tokio::time::Instant::now();
                     match msg {
-                        Ok(Message::Text(text)) => {
+                        Some(Ok(Message::Text(text))) => {
                             // Errors are already handled gracefully in handle_message
                             self.handle_message(&text, callback).await.ok();
                         }
-                        Ok(Message::Ping(data)) => {
+                        Some(Ok(Message::Ping(data))) => {
                             debug!("[HYPERLIQUID] Received ping, sending pong");
                             write.send(Message::Pong(data)).await?;
                         }
-                        Ok(Message::Pong(_)) => {
+                        Some(Ok(Message::Pong(_))) => {
                             debug!("[HYPERLIQUID] Received pong");
                         }
-                        Ok(Message::Close(_)) => {
+                        Some(Ok(Message::Close(_))) => {
                             info!("[HYPERLIQUID] Received close message");
                             break;
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             error!("[HYPERLIQUID] WebSocket error: {}", e);
                             return Err(e.into());
+                        }
+                        None => {
+                            warn!("[HYPERLIQUID] WebSocket stream ended");
+                            break;
                         }
                         _ => {}
                     }
@@ -155,8 +171,19 @@ impl OrderbookClient {
                 // Send ping periodically
                 _ = ping_interval.tick() => {
                     debug!("[HYPERLIQUID] Sending ping");
-                    debug!("[HYPERLIQUID] Sending ping");
                     write.send(Message::Ping(vec![])).await?;
+                }
+
+                // Staleness watchdog. Return Err (not break) so `start` treats it
+                // as a connection failure and reconnects + resubscribes, rather
+                // than exiting as a graceful close.
+                _ = stale_check.tick() => {
+                    if last_inbound.elapsed() > stale_after {
+                        return Err(anyhow::anyhow!(
+                            "[HYPERLIQUID] No inbound frame for {:?}; socket stale",
+                            last_inbound.elapsed()
+                        ));
+                    }
                 }
             }
         }

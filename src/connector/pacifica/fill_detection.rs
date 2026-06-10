@@ -19,13 +19,21 @@ use super::types::{
 pub struct FillDetectionConfig {
     /// Account address to monitor
     pub account: String,
-    /// Maximum number of reconnection attempts
-    pub reconnect_attempts: u32,
+    /// Maximum number of CONSECUTIVE failed reconnection attempts before
+    /// giving up; a connection that stays up for `HEALTHY_CONNECTION_UPTIME`
+    /// resets the budget. `None` = retry forever (the production setting: the
+    /// fill stream is fail-closed and supervised, so exhausting reconnects
+    /// would permanently halt quoting until a manual restart).
+    pub max_attempts: Option<u32>,
     /// Ping interval in seconds
     pub ping_interval_secs: u64,
     /// Enable position-based fill detection (redundancy layer)
     pub enable_position_fill_detection: bool,
 }
+
+/// A connection that survives this long is "healthy": it resets the reconnect
+/// budget so only consecutive rapid failures count toward `max_attempts`.
+const HEALTHY_CONNECTION_UPTIME: Duration = Duration::from_secs(10);
 
 /// Handle for updating position baselines from external fill sources
 ///
@@ -263,47 +271,61 @@ impl FillDetectionClient {
 
     /// Start the fill detection client with a callback for fill events
     ///
+    /// There is no legitimate "graceful permanent close" for an account-stream
+    /// subscriber: a server-initiated close or stream end is treated as a
+    /// reconnect trigger, exactly like an error. A connection that lives at
+    /// least `HEALTHY_CONNECTION_UPTIME` resets the attempt budget so only
+    /// consecutive rapid failures can exhaust `max_attempts`.
+    ///
     /// # Arguments
     /// * `callback` - Function called for each fill event (partial fill, full fill, cancellation)
     pub async fn start<F>(&mut self, mut callback: F) -> Result<()>
     where
         F: FnMut(FillEvent) + Send + 'static,
     {
-        let mut attempt = 0;
+        let mut attempt: u32 = 0;
 
         loop {
-            attempt += 1;
-            info!(
-                "Fill detection attempt {}/{}",
-                attempt, self.config.reconnect_attempts
-            );
+            attempt = attempt.saturating_add(1);
+            match self.config.max_attempts {
+                Some(max) => info!("Fill detection attempt {}/{}", attempt, max),
+                None => info!("Fill detection attempt {} (unbounded)", attempt),
+            }
 
+            let connected_at = Instant::now();
             match self.connect_and_run(&mut callback).await {
                 Ok(_) => {
-                    info!("Fill detection client disconnected normally");
-                    break;
+                    warn!("Fill detection connection closed by server; reconnecting");
                 }
                 Err(e) => {
                     error!("Fill detection error: {}", e);
-
-                    if attempt >= self.config.reconnect_attempts {
-                        error!("Max reconnection attempts reached");
-                        return Err(e);
-                    }
-
-                    // Fast first reconnect (1s), then exponential backoff, capped at 30s
-                    let backoff = if attempt == 1 {
-                        1
-                    } else {
-                        std::cmp::min(2u64.pow(attempt - 1), 30)
-                    };
-                    warn!("Reconnecting in {} seconds...", backoff);
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
             }
-        }
+            self.ready.store(false, Ordering::Release);
 
-        Ok(())
+            if connected_at.elapsed() >= HEALTHY_CONNECTION_UPTIME {
+                attempt = 0;
+            }
+
+            if let Some(max) = self.config.max_attempts {
+                if attempt >= max {
+                    error!("Max consecutive fill-detection reconnection attempts reached");
+                    anyhow::bail!(
+                        "fill detection exhausted {} consecutive reconnect attempts",
+                        max
+                    );
+                }
+            }
+
+            // Fast first reconnect (1s), then exponential backoff, capped at 30s
+            let backoff = if attempt <= 1 {
+                1
+            } else {
+                std::cmp::min(2u64.saturating_pow(attempt - 1), 30)
+            };
+            warn!("Reconnecting in {} seconds...", backoff);
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+        }
     }
 
     /// Connect to WebSocket and run the monitoring loop
