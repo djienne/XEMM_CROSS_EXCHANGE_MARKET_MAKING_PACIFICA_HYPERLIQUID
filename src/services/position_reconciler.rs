@@ -10,9 +10,9 @@ use tracing::{debug, info, warn};
 use crate::bot::{BotState, RunState};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
 use crate::market_rules::{fallback_rules, is_dust_or_below_min};
 use crate::services::fill_aggregator::FillAggregator;
+use crate::services::maker::MakerExchange;
 use crate::services::{
     enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
 };
@@ -23,7 +23,7 @@ use crate::util::price::SharedQuote;
 pub struct PositionReconcilerService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker: Arc<dyn MakerExchange>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     /// Shared HL top-of-book cache: the USD-exposure estimate reads this
     /// (lock-free) instead of issuing a REST l2 snapshot every tick.
@@ -113,7 +113,7 @@ impl PositionReconcilerService {
                         )
                 };
                 if can_complete {
-                    match self.pacifica_trading.get_open_orders().await {
+                    match self.maker.open_orders().await {
                         Ok(orders)
                             if !orders
                                 .iter()
@@ -348,16 +348,11 @@ impl PositionReconcilerService {
     }
 
     async fn pacifica_position(&self) -> anyhow::Result<f64> {
-        let positions = self.pacifica_trading.get_positions().await?;
-        let Some(pos) = positions.iter().find(|p| p.symbol == self.config.symbol) else {
-            return Ok(0.0);
-        };
-        let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
-        Ok(match pos.side.as_str() {
-            "bid" => amount,
-            "ask" => -amount,
-            _ => 0.0,
-        })
+        Ok(self
+            .maker
+            .position(&self.config.symbol)
+            .await?
+            .signed_base)
     }
 
     async fn hyperliquid_position(&self) -> anyhow::Result<f64> {

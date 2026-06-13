@@ -775,7 +775,7 @@ impl XemmBot {
         {
             let bot_state = self.bot_state.clone();
             let hedge_tx = self.hedge_tx.clone();
-            let pacifica_trading = self.pacifica_trading.clone();
+            let maker = self.maker.clone();
             let hyperliquid_trading = self.hyperliquid_trading.clone();
             let hyperliquid_prices = self.hyperliquid_prices.clone();
             let fill_aggregator = self.fill_aggregator.clone();
@@ -788,7 +788,7 @@ impl XemmBot {
                     let service = PositionReconcilerService {
                         bot_state: bot_state.clone(),
                         hedge_tx: hedge_tx.clone(),
-                        pacifica_trading: pacifica_trading.clone(),
+                        maker: maker.clone(),
                         hyperliquid_trading: hyperliquid_trading.clone(),
                         hyperliquid_prices: hyperliquid_prices.clone(),
                         fill_aggregator: fill_aggregator.clone(),
