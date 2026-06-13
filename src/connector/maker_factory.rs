@@ -79,6 +79,12 @@ pub fn build_maker(
 }
 
 fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<MakerStack> {
+    // The maker venue's own wire symbol for this asset. `config.symbol` is the
+    // canonical identifier (also the Hyperliquid taker symbol); the adapter maps
+    // canonical <-> wire internally, and the maker price feeds below subscribe to
+    // the wire symbol. Defaults to identity when `maker_symbol` is unset.
+    let wire_symbol = config.maker_symbol.as_deref().unwrap_or(&config.symbol);
+
     // Control plane: one shared REST client + one WS client, wrapped by the
     // `MakerExchange` adapter. Mirrors the construction previously inlined in
     // `XemmBot::new` (single shared instances across all services - the previous
@@ -94,6 +100,8 @@ fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<
     let maker: Arc<dyn MakerExchange> = Arc::new(PacificaMaker::new(
         pacifica_trading.clone(),
         pacifica_ws_trading.clone(),
+        config.symbol.clone(),
+        wire_symbol.to_string(),
     ));
 
     // Fail-closed fill stream (built once; the client is non-Clone and not
@@ -118,7 +126,7 @@ fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<
     // the factory then rebuilds the (non-Clone) client from this Clone config on
     // every restart.
     let ob_cfg = PacOrderbookConfig {
-        symbol: config.symbol.clone(),
+        symbol: wire_symbol.to_string(),
         agg_level: config.agg_level,
         reconnect_attempts: config.reconnect_attempts,
         ping_interval_secs: config.ping_interval_secs,
@@ -136,7 +144,7 @@ fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<
     // Data plane: REST poll (restartable, price redundancy).
     let price_poll_factory: PricePollFactory = {
         let trading = pacifica_trading.clone();
-        let symbol = config.symbol.clone();
+        let symbol = wire_symbol.to_string();
         let agg_level = config.agg_level;
         Arc::new(move || {
             Box::new(PacificaPoller {

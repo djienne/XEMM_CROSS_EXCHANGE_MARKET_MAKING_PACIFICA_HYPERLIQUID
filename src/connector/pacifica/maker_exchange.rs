@@ -114,6 +114,11 @@ fn trade_from(t: &TradeHistoryItem) -> MakerTrade {
 /// Convert a connector `FillEvent` into the normalized event. `None` (skipped)
 /// on an unrecognized side string, preserving the current "unknown side -> do
 /// not hedge" behaviour of `FillEventProcessor`.
+///
+/// The `symbol` field is carried through as the venue's wire string. Downstream
+/// it is used only for logging - every venue operation triggered by a fill uses
+/// the service's canonical symbol - so it is intentionally not mapped back to
+/// canonical here (a differently-tickered venue simply logs its own ticker).
 fn maker_fill_event_from(fe: FillEvent) -> Option<MakerFillEvent> {
     Some(match fe {
         FillEvent::PartialFill {
@@ -196,6 +201,54 @@ fn maker_fill_event_from(fe: FillEvent) -> Option<MakerFillEvent> {
 }
 
 // ---------------------------------------------------------------------------
+// Symbol mapping
+// ---------------------------------------------------------------------------
+
+/// Maps between the **canonical** symbol the services (and the Hyperliquid taker
+/// leg) use and the **maker venue's own wire symbol**. When the maker venue
+/// names the asset the same way - the default, `wire == canonical` - every
+/// method here is a no-op, so behaviour is byte-identical. A maker venue that
+/// uses a different ticker (e.g. `"SOL-PERP"` vs `"SOL"`) is then a pure config
+/// change (`maker_symbol`): the adapter translates on the way in and out, so no
+/// service ever sees the wire string.
+#[derive(Clone, Debug)]
+struct SymbolMap {
+    canonical: String,
+    wire: String,
+}
+
+impl SymbolMap {
+    fn new(canonical: impl Into<String>, wire: impl Into<String>) -> Self {
+        Self {
+            canonical: canonical.into(),
+            wire: wire.into(),
+        }
+    }
+
+    /// Canonical (what services pass in) -> maker wire (what the venue expects).
+    /// Anything that is not the canonical symbol passes through unchanged.
+    #[inline]
+    fn to_wire<'a>(&'a self, canonical: &'a str) -> &'a str {
+        if canonical == self.canonical {
+            &self.wire
+        } else {
+            canonical
+        }
+    }
+
+    /// Maker wire (what the venue returns) -> canonical (what services compare
+    /// against). Orders for other symbols pass through unchanged.
+    #[inline]
+    fn to_canonical(&self, wire: &str) -> String {
+        if wire == self.wire {
+            self.canonical.clone()
+        } else {
+            wire.to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MakerExchange
 // ---------------------------------------------------------------------------
 
@@ -203,11 +256,23 @@ fn maker_fill_event_from(fe: FillEvent) -> Option<MakerFillEvent> {
 pub struct PacificaMaker {
     pub rest: Arc<PacificaTrading>,
     pub ws: Arc<PacificaWsTrading>,
+    /// Canonical <-> Pacifica wire symbol translation (identity unless
+    /// `maker_symbol` is configured).
+    symbols: SymbolMap,
 }
 
 impl PacificaMaker {
-    pub fn new(rest: Arc<PacificaTrading>, ws: Arc<PacificaWsTrading>) -> Self {
-        Self { rest, ws }
+    pub fn new(
+        rest: Arc<PacificaTrading>,
+        ws: Arc<PacificaWsTrading>,
+        canonical_symbol: impl Into<String>,
+        wire_symbol: impl Into<String>,
+    ) -> Self {
+        Self {
+            rest,
+            ws,
+            symbols: SymbolMap::new(canonical_symbol, wire_symbol),
+        }
     }
 }
 
@@ -218,10 +283,11 @@ impl MakerExchange for PacificaMaker {
     }
 
     async fn symbol_rules(&self, symbol: &str) -> Result<MakerSymbolRules> {
+        let wire = self.symbols.to_wire(symbol);
         let info = self.rest.get_market_info().await?;
         let m = info
-            .get(symbol)
-            .with_context(|| format!("Market info not found for {}", symbol))?;
+            .get(wire)
+            .with_context(|| format!("Market info not found for {}", wire))?;
         Ok(MakerSymbolRules {
             tick_size: m.tick_size.clone(),
             lot_size: m.lot_size.clone(),
@@ -241,12 +307,13 @@ impl MakerExchange for PacificaMaker {
         current_ask: f64,
     ) -> Result<MakerOrderAck> {
         let ps = pac_side(side);
+        let wire = self.symbols.to_wire(symbol);
         // WS-preferred with REST fallback — identical to the previous inline
         // hot-path branch (app.rs). The impl owns this choice now.
         let order_data = if self.ws.is_connected() {
             self.ws
                 .place_limit_order_ws(
-                    symbol,
+                    wire,
                     ps,
                     size,
                     price,
@@ -258,7 +325,7 @@ impl MakerExchange for PacificaMaker {
         } else {
             self.rest
                 .place_limit_order_with_client_order_id(
-                    symbol,
+                    wire,
                     ps,
                     size,
                     Some(price),
@@ -273,12 +340,21 @@ impl MakerExchange for PacificaMaker {
     }
 
     async fn cancel_all(&self, symbol: &str) -> Result<(u32, u32)> {
-        dual_cancel(&self.rest, &self.ws, symbol).await
+        dual_cancel(&self.rest, &self.ws, self.symbols.to_wire(symbol)).await
     }
 
     async fn open_orders(&self) -> Result<Vec<MakerOpenOrder>> {
         let orders = self.rest.get_open_orders().await?;
-        Ok(orders.into_iter().filter_map(open_order_from).collect())
+        // Map each order's wire symbol back to the canonical one so the services
+        // (which compare against the canonical `config.symbol`) still match.
+        Ok(orders
+            .into_iter()
+            .filter_map(open_order_from)
+            .map(|mut o| {
+                o.symbol = self.symbols.to_canonical(&o.symbol);
+                o
+            })
+            .collect())
     }
 
     async fn position(&self, symbol: &str) -> Result<MakerPosition> {
@@ -286,10 +362,11 @@ impl MakerExchange for PacificaMaker {
     }
 
     async fn position_opt(&self, symbol: &str) -> Result<Option<MakerPosition>> {
+        let wire = self.symbols.to_wire(symbol);
         let positions = self.rest.get_positions().await?;
         Ok(positions
             .iter()
-            .find(|p: &&PositionItem| p.symbol == symbol)
+            .find(|p: &&PositionItem| p.symbol == wire)
             .map(|p| MakerPosition {
                 signed_base: signed_base(&p.side, parse_f64(&p.amount)),
                 entry_price: parse_f64(&p.entry_price),
@@ -299,7 +376,7 @@ impl MakerExchange for PacificaMaker {
     async fn recent_trades(&self, symbol: &str, limit: u32) -> Result<Vec<MakerTrade>> {
         let trades = self
             .rest
-            .get_trade_history(Some(symbol), Some(limit), None, None)
+            .get_trade_history(Some(self.symbols.to_wire(symbol)), Some(limit), None, None)
             .await?;
         Ok(trades.iter().map(trade_from).collect())
     }
@@ -312,7 +389,7 @@ impl MakerExchange for PacificaMaker {
     ) -> MakerFillSummary {
         let r = crate::trade_fetcher::fetch_pacifica_trade(
             self.rest.clone(),
-            symbol,
+            self.symbols.to_wire(symbol),
             client_order_id,
             max_attempts,
             |_| {},
@@ -462,6 +539,32 @@ mod tests {
         assert_eq!(signed_base("bid", 3.0), 3.0);
         assert_eq!(signed_base("ask", 3.0), -3.0);
         assert_eq!(signed_base("???", 3.0), 0.0);
+    }
+
+    #[test]
+    fn symbol_map_identity_is_passthrough() {
+        // The default (wire == canonical): every translation is a no-op.
+        let m = SymbolMap::new("SOL", "SOL");
+        assert_eq!(m.to_wire("SOL"), "SOL");
+        assert_eq!(m.to_canonical("SOL"), "SOL");
+        // Other symbols pass through untouched in both directions.
+        assert_eq!(m.to_wire("BTC"), "BTC");
+        assert_eq!(m.to_canonical("BTC"), "BTC");
+    }
+
+    #[test]
+    fn symbol_map_translates_distinct_wire_symbol() {
+        // A maker venue that names the asset "SOL-PERP" while services use "SOL".
+        let m = SymbolMap::new("SOL", "SOL-PERP");
+        // Outbound: services pass canonical, venue receives wire.
+        assert_eq!(m.to_wire("SOL"), "SOL-PERP");
+        // Inbound: venue returns wire, services compare against canonical.
+        assert_eq!(m.to_canonical("SOL-PERP"), "SOL");
+        // Round-trips.
+        assert_eq!(m.to_canonical(m.to_wire("SOL")), "SOL");
+        // An unrelated symbol (e.g. a stray account order) is never rewritten.
+        assert_eq!(m.to_wire("BTC"), "BTC");
+        assert_eq!(m.to_canonical("BTC"), "BTC");
     }
 
     #[test]

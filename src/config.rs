@@ -15,6 +15,15 @@ pub struct Config {
     #[serde(default = "default_maker_venue")]
     pub maker_venue: String,
 
+    /// The maker venue's own wire symbol for this asset, when it differs from
+    /// `symbol`. `symbol` is the canonical identifier the services and the
+    /// Hyperliquid (taker) leg use; the maker connector maps `symbol` <-> this
+    /// wire string internally, so a maker venue that names the asset differently
+    /// (e.g. "SOL-PERP" vs "SOL") needs no service changes. `None` = identity
+    /// (the maker venue uses the same string as `symbol`).
+    #[serde(default)]
+    pub maker_symbol: Option<String>,
+
     /// Orderbook aggregation level (1, 2, 5, 10, 100, 1000)
     #[serde(default = "default_agg_level")]
     pub agg_level: u32,
@@ -339,6 +348,7 @@ impl Default for Config {
         Self {
             symbol: "SOL".to_string(),
             maker_venue: default_maker_venue(),
+            maker_symbol: None,
             agg_level: default_agg_level(),
             reconnect_attempts: default_reconnect_attempts(),
             ping_interval_secs: default_ping_interval(),
