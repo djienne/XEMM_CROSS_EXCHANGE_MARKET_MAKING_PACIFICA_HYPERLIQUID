@@ -19,8 +19,8 @@ use crate::connector::hyperliquid::{
 };
 use crate::connector::pacifica::trading::PacificaPoller;
 use crate::connector::pacifica::{
-    FillDetectionClient, FillDetectionConfig, OrderSide as PacificaOrderSide, PacificaCredentials,
-    PacificaFillStream, PacificaMaker, PacificaTrading, PacificaWsTrading,
+    FillDetectionClient, FillDetectionConfig, PacificaCredentials, PacificaFillStream,
+    PacificaMaker, PacificaTrading, PacificaWsTrading,
 };
 use crate::connector::pacifica::{
     OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
@@ -33,7 +33,7 @@ use crate::services::{
     fill_detection::FillDetectionService,
     hedge::HedgeService,
     hedge_store,
-    maker::{MakerExchange, MakerFillStream},
+    maker::{MakerExchange, MakerFillStream, MakerSymbolRules},
     metrics,
     order_monitor::{
         spawn_monitor_tasks, update_order_snapshot, OrderMonitorService, SharedOrderSnapshot,
@@ -48,7 +48,7 @@ use crate::services::{
     trade_gate::{GateReason, TradeGate},
     HedgeEnqueueResult, HedgeIntent,
 };
-use crate::strategy::{OpportunityEvaluator, OrderSide};
+use crate::strategy::OpportunityEvaluator;
 use crate::util::cancel::dual_cancel;
 use crate::util::log::{tag, tag_static, Color};
 use crate::util::price::{QuoteSource, SharedQuote};
@@ -178,8 +178,9 @@ pub struct XemmBot {
     pub atomic_status: Arc<AtomicU8>,
     pub order_snapshot: Arc<SharedOrderSnapshot>,
     pub trade_gate: Arc<TradeGate>,
-    pub pacifica_tick_size: String,
-    pub pacifica_lot_size: String,
+    /// Tick/lot rules for the maker symbol, pre-fetched once at startup and used
+    /// by the hot-path placement and dust-floor checks.
+    pub maker_rules: MakerSymbolRules,
 
     // Channels
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
@@ -391,17 +392,12 @@ impl XemmBot {
         }
 
         // Get market info to determine tick size
-        let (pacifica_tick_size, pacifica_lot_size): (String, String) = {
-            let market_info = pacifica_trading
-                .get_market_info()
-                .await
-                .context("Failed to fetch Pacifica market info")?;
-            let symbol_info = market_info
-                .get(&config.symbol)
-                .with_context(|| format!("Symbol {} not found in market info", config.symbol))?;
-            (symbol_info.tick_size.clone(), symbol_info.lot_size.clone())
-        };
-        let pacifica_tick_size_f64: f64 = pacifica_tick_size
+        let maker_rules = maker
+            .symbol_rules(&config.symbol)
+            .await
+            .context("Failed to fetch maker symbol rules")?;
+        let pacifica_tick_size_f64: f64 = maker_rules
+            .tick_size
             .parse()
             .context("Failed to parse tick size")?;
 
@@ -409,7 +405,7 @@ impl XemmBot {
             "{} Pacifica tick size for {}: {}",
             tag_static("INIT", Color::Cyan),
             config.symbol.bright_white(),
-            pacifica_tick_size.as_str().bright_white()
+            maker_rules.tick_size.as_str().bright_white()
         );
 
         // Create opportunity evaluator
@@ -488,8 +484,7 @@ impl XemmBot {
             atomic_status,
             order_snapshot,
             trade_gate,
-            pacifica_tick_size,
-            pacifica_lot_size,
+            maker_rules,
             hedge_tx,
             hedge_rx: Some(hedge_rx),
             shutdown_tx,
@@ -1089,7 +1084,7 @@ impl XemmBot {
                         // only by the reconciler.)
                         let floored = crate::market_rules::pacifica_size_floor(
                             opp.size,
-                            &self.pacifica_lot_size,
+                            &self.maker_rules.lot_size,
                         )
                         .unwrap_or(0.0);
                         if crate::market_rules::is_dust_or_below_min(
@@ -1149,44 +1144,30 @@ impl XemmBot {
                             "placing Pacifica maker order"
                         );
 
-                        let pacifica_side = match opp.direction {
-                            OrderSide::Buy => PacificaOrderSide::Buy,
-                            OrderSide::Sell => PacificaOrderSide::Sell,
-                        };
-
-                        let placement_result = if self.pacifica_ws_trading.is_connected() {
-                            self.pacifica_ws_trading
-                                .place_limit_order_ws(
-                                    &self.config.symbol,
-                                    pacifica_side,
-                                    opp.size,
-                                    opp.pacifica_price,
-                                    &self.pacifica_tick_size,
-                                    &self.pacifica_lot_size,
-                                    client_order_id.clone(),
-                                )
-                                .await
-                        } else {
-                            self.pacifica_trading
-                                .place_limit_order_with_client_order_id(
-                                    &self.config.symbol,
-                                    pacifica_side,
-                                    opp.size,
-                                    Some(opp.pacifica_price),
-                                    0.0,
-                                    Some(pac_bid),
-                                    Some(pac_ask),
-                                    Some(client_order_id.clone()),
-                                )
-                                .await
-                        };
+                        // Placement goes through the maker trait; the impl owns the
+                        // WS-preferred/REST-fallback choice and the side encoding.
+                        // This is the only maker call on the hot path — a single
+                        // network round-trip, so the dyn dispatch is immeasurable.
+                        let placement_result = self
+                            .maker
+                            .place_limit_order(
+                                &self.config.symbol,
+                                opp.direction,
+                                opp.size,
+                                opp.pacifica_price,
+                                &self.maker_rules,
+                                client_order_id.clone(),
+                                pac_bid,
+                                pac_ask,
+                            )
+                            .await;
 
                         match placement_result {
                             Ok(order_data) => {
                                 rate_limits.record_success(EndpointGroup::PacificaPlace);
 
                                 if let Some(returned_cloid) = order_data.client_order_id {
-                                    let order_id_opt = order_data.order_id.or(order_data.i);
+                                    let order_id_opt = order_data.order_id;
                                     let order_id_display = order_id_opt.unwrap_or(0);
                                     let submitted_price = order_data.submitted_price.unwrap_or(opp.pacifica_price);
                                     let submitted_size = order_data.submitted_size.unwrap_or(opp.size);
