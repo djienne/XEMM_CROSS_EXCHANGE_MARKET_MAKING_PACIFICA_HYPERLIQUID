@@ -49,7 +49,6 @@ use crate::services::{
     HedgeEnqueueResult, HedgeIntent,
 };
 use crate::strategy::OpportunityEvaluator;
-use crate::util::cancel::dual_cancel;
 use crate::util::log::{tag, tag_static, Color};
 use crate::util::price::{QuoteSource, SharedQuote};
 use crate::util::rate_limit::{
@@ -354,15 +353,13 @@ impl XemmBot {
             "{} Cancelling any existing orders on Pacifica...",
             tag_static("INIT", Color::Cyan)
         );
-        match pacifica_trading
-            .cancel_all_orders(false, Some(&config.symbol), false)
-            .await
-        {
-            Ok(count) => info!(
-                "{} {} Cancelled {} existing order(s)",
+        match maker.cancel_all(&config.symbol).await {
+            Ok((rest_count, ws_count)) => info!(
+                "{} {} Cancelled existing order(s) (REST: {}, WS: {})",
                 tag_static("INIT", Color::Cyan),
                 "OK".green().bold(),
-                count
+                rest_count,
+                ws_count
             ),
             Err(e) => info!(
                 "{} {} Failed to cancel existing orders: {}",
@@ -373,7 +370,7 @@ impl XemmBot {
         }
 
         if !config.allow_startup_with_cancel_failure {
-            match pacifica_trading.get_open_orders().await {
+            match maker.open_orders().await {
                 Ok(orders) => {
                     let stale_for_symbol = orders.iter().any(|o| o.symbol == config.symbol);
                     anyhow::ensure!(
@@ -1377,13 +1374,7 @@ impl XemmBot {
             tag(&self.config.symbol, "SHUTDOWN", Color::Yellow)
         );
 
-        match dual_cancel(
-            &self.pacifica_trading,
-            &self.pacifica_ws_trading,
-            &self.config.symbol,
-        )
-        .await
-        {
+        match self.maker.cancel_all(&self.config.symbol).await {
             Ok((rest_count, ws_count)) => info!(
                 "{} {} Cancelled remaining orders (REST: {}, WS: {})",
                 tag(&self.config.symbol, "SHUTDOWN", Color::Yellow),
