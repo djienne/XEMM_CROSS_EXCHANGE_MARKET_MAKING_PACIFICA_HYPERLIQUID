@@ -20,7 +20,7 @@ use crate::connector::hyperliquid::{
 use crate::connector::pacifica::trading::PacificaPoller;
 use crate::connector::pacifica::{
     FillDetectionClient, FillDetectionConfig, OrderSide as PacificaOrderSide, PacificaCredentials,
-    PacificaTrading, PacificaWsTrading,
+    PacificaMaker, PacificaTrading, PacificaWsTrading,
 };
 use crate::connector::pacifica::{
     OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
@@ -32,7 +32,9 @@ use crate::services::{
     fill_dedup::FillDedup,
     fill_detection::FillDetectionService,
     hedge::HedgeService,
-    hedge_store, metrics,
+    hedge_store,
+    maker::MakerExchange,
+    metrics,
     order_monitor::{
         spawn_monitor_tasks, update_order_snapshot, OrderMonitorService, SharedOrderSnapshot,
     },
@@ -153,6 +155,10 @@ pub struct XemmBot {
     // connection pool and cache with no concurrency benefit.
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
+    /// Maker-venue control plane. One shared handle (today wrapping the Pacifica
+    /// REST + WS clients) cloned into every service; the single swap point for a
+    /// future maker venue.
+    pub maker: Arc<dyn MakerExchange>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
 
     // Shared state (prices)
@@ -306,6 +312,14 @@ impl XemmBot {
                     config.pacifica_ws_request_timeout_ms,
                 )),
         );
+
+        // Maker-venue handle: one shared `Arc<dyn MakerExchange>` cloned into every
+        // service. Today this wraps Pacifica's REST + WS clients; a future venue
+        // swaps only this construction (later moved behind `build_maker`).
+        let maker: Arc<dyn MakerExchange> = Arc::new(PacificaMaker::new(
+            pacifica_trading.clone(),
+            pacifica_ws_trading.clone(),
+        ));
 
         let hyperliquid_trading = Arc::new(
             HyperliquidTrading::new(hyperliquid_credentials, false)
@@ -463,6 +477,7 @@ impl XemmBot {
             bot_state,
             pacifica_trading,
             pacifica_ws_trading,
+            maker,
             hyperliquid_trading,
             pacifica_prices,
             hyperliquid_prices,
@@ -690,7 +705,7 @@ impl XemmBot {
             let hedge_tx = self.hedge_tx.clone();
             let cancel_tx = cancel_tx.clone();
             let cancel_demand = cancel_demand.clone();
-            let pacifica_trading = self.pacifica_trading.clone();
+            let maker = self.maker.clone();
             let symbol = self.config.symbol.clone();
             let processed_fills = self.processed_fills.clone();
             let fill_aggregator = self.fill_aggregator.clone();
@@ -707,7 +722,7 @@ impl XemmBot {
                         hedge_tx: hedge_tx.clone(),
                         cancel_tx: cancel_tx.clone(),
                         cancel_demand: cancel_demand.clone(),
-                        pacifica_trading: pacifica_trading.clone(),
+                        maker: maker.clone(),
                         symbol: symbol.clone(),
                         processed_fills: processed_fills.clone(),
                         fill_aggregator: fill_aggregator.clone(),

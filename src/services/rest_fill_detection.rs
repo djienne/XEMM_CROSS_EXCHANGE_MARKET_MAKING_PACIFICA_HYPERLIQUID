@@ -3,16 +3,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
-use fast_float::parse;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::bot::{BotState, BotStatus};
-use crate::connector::pacifica::{OpenOrderItem, PacificaTrading};
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::{FillAggregator, HedgeReservation};
 use crate::services::fill_dedup::{FillDedup, FillKey};
+use crate::services::maker::{MakerExchange, MakerOpenOrder};
 use crate::services::metrics;
 use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use crate::strategy::OrderSide;
@@ -34,7 +33,7 @@ pub struct RestFillDetectionService {
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
     pub cancel_tx: mpsc::Sender<CancelIntent>,
     pub cancel_demand: Arc<CancelDemand>,
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker: Arc<dyn MakerExchange>,
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
     pub fill_aggregator: Arc<FillAggregator>,
@@ -77,7 +76,7 @@ impl RestFillDetectionService {
                 continue;
             };
 
-            match self.pacifica_trading.get_open_orders().await {
+            match self.maker.open_orders().await {
                 Ok(orders) => {
                     consecutive_errors = 0;
                     if let Some(order) = orders
@@ -156,15 +155,15 @@ impl RestFillDetectionService {
 
     async fn process_open_order(
         &self,
-        order: &OpenOrderItem,
+        order: &MakerOpenOrder,
         per_order: &mut HashMap<String, RestFillState>,
     ) {
-        let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
-        let initial_amount: f64 = parse(&order.initial_amount).unwrap_or(0.0);
-        let price: f64 = parse(&order.price).unwrap_or(0.0);
-        let Some(order_side) = order_side_from_str(&order.side) else {
-            return;
-        };
+        // MakerOpenOrder is pre-typed by the adapter (f64 amounts/price, OrderSide
+        // side); an unrecognized venue side was already dropped at the boundary.
+        let filled_amount = order.filled_amount;
+        let initial_amount = order.initial_amount;
+        let price = order.price;
+        let order_side = order.side;
 
         let state = per_order
             .entry(order.client_order_id.clone())
@@ -208,10 +207,7 @@ impl RestFillDetectionService {
         order_size: f64,
         per_order: &mut HashMap<String, RestFillState>,
     ) -> anyhow::Result<bool> {
-        let trades = self
-            .pacifica_trading
-            .get_trade_history(Some(&self.symbol), Some(100), None, None)
-            .await?;
+        let trades = self.maker.recent_trades(&self.symbol, 100).await?;
 
         let mut cumulative = 0.0;
         let mut notional = 0.0;
@@ -220,8 +216,8 @@ impl RestFillDetectionService {
             .iter()
             .filter(|trade| trade.client_order_id.as_deref() == Some(client_order_id))
         {
-            let qty: f64 = parse(&trade.amount).unwrap_or(0.0);
-            let price: f64 = parse(&trade.entry_price).unwrap_or(0.0);
+            let qty = trade.amount;
+            let price = trade.entry_price;
             if qty <= 0.0 {
                 continue;
             }
@@ -377,14 +373,6 @@ impl RestFillDetectionService {
                 "FAIL".red().bold()
             );
         }
-    }
-}
-
-fn order_side_from_str(side: &str) -> Option<OrderSide> {
-    match side {
-        "bid" | "buy" => Some(OrderSide::Buy),
-        "ask" | "sell" => Some(OrderSide::Sell),
-        _ => None,
     }
 }
 
