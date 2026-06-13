@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fast_float::parse;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -10,9 +9,9 @@ use tracing::{debug, info, warn};
 use crate::bot::{BotState, BotStatus, RunState};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
 use crate::market_rules::fallback_rules;
 use crate::services::fill_aggregator::FillAggregator;
+use crate::services::maker::MakerExchange;
 use crate::services::order_monitor::{update_order_snapshot, SharedOrderSnapshot};
 use crate::services::trade_gate::{GateReason, TradeGate};
 use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
@@ -23,7 +22,7 @@ pub struct SafetyMonitorService {
     pub atomic_status: Arc<AtomicU8>,
     pub order_snapshot: Arc<SharedOrderSnapshot>,
     pub trade_gate: Arc<TradeGate>,
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker: Arc<dyn MakerExchange>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub pacifica_prices: Arc<SharedQuote>,
     pub hyperliquid_prices: Arc<SharedQuote>,
@@ -61,7 +60,7 @@ impl SafetyMonitorService {
     }
 
     async fn update_open_orders(&self) {
-        match self.pacifica_trading.get_open_orders().await {
+        match self.maker.open_orders().await {
             Ok(orders) => {
                 self.trade_gate.allow(GateReason::OpenOrderUnknown);
                 let has_symbol_order = orders
@@ -140,7 +139,7 @@ impl SafetyMonitorService {
             }
         };
 
-        match self.pacifica_trading.get_open_orders().await {
+        match self.maker.open_orders().await {
             Ok(orders) => {
                 if let Some(order) = orders
                     .iter()
@@ -150,19 +149,29 @@ impl SafetyMonitorService {
                         "[SAFETY] Recovered unknown placement as open order (cloid={})",
                         active.client_order_id
                     );
+                    let recovered_price = if order.price > 0.0 {
+                        order.price
+                    } else {
+                        active.price
+                    };
+                    let recovered_size = if order.initial_amount > 0.0 {
+                        order.initial_amount
+                    } else {
+                        active.size
+                    };
                     let mut state = self.bot_state.write();
                     if let Some(active_order) = state.active_order.as_mut() {
                         active_order.order_id = Some(order.order_id);
-                        active_order.price = parse(&order.price).unwrap_or(active.price);
-                        active_order.size = parse(&order.initial_amount).unwrap_or(active.size);
+                        active_order.price = recovered_price;
+                        active_order.size = recovered_size;
                     }
                     state.status = BotStatus::OrderPlaced;
                     state.store_status();
                     update_order_snapshot(
                         &self.order_snapshot,
                         active.side,
-                        parse(&order.price).unwrap_or(active.price),
-                        parse(&order.initial_amount).unwrap_or(active.size),
+                        recovered_price,
+                        recovered_size,
                         active.initial_profit_bps,
                     );
                     self.trade_gate.allow(GateReason::PlacementUnknown);
@@ -184,8 +193,8 @@ impl SafetyMonitorService {
         }
 
         match self
-            .pacifica_trading
-            .get_trade_history(Some(&self.config.symbol), Some(50), None, None)
+            .maker
+            .recent_trades(&self.config.symbol, 50)
             .await
         {
             Ok(trades) => {
@@ -193,8 +202,12 @@ impl SafetyMonitorService {
                     .iter()
                     .find(|trade| trade.client_order_id.as_deref() == Some(&active.client_order_id))
                 {
-                    let filled = parse(&fill.amount).unwrap_or(0.0);
-                    let price = parse(&fill.entry_price).unwrap_or(active.price);
+                    let filled = fill.amount;
+                    let price = if fill.entry_price > 0.0 {
+                        fill.entry_price
+                    } else {
+                        active.price
+                    };
                     if self.fill_aggregator.observe_fill(
                         fill.order_id,
                         active.side,
@@ -255,7 +268,7 @@ impl SafetyMonitorService {
 
     async fn signed_positions(&self) -> anyhow::Result<(f64, f64)> {
         crate::services::signed_positions(
-            &self.pacifica_trading,
+            self.maker.as_ref(),
             &self.hyperliquid_trading,
             &self.config.symbol,
         )

@@ -820,7 +820,7 @@ impl XemmBot {
             let atomic_status = self.atomic_status.clone();
             let order_snapshot = self.order_snapshot.clone();
             let gate = self.trade_gate.clone();
-            let pacifica_trading = self.pacifica_trading.clone();
+            let maker = self.maker.clone();
             let hyperliquid_trading = self.hyperliquid_trading.clone();
             let pacifica_prices = self.pacifica_prices.clone();
             let hyperliquid_prices = self.hyperliquid_prices.clone();
@@ -838,7 +838,7 @@ impl XemmBot {
                         atomic_status: atomic_status.clone(),
                         order_snapshot: order_snapshot.clone(),
                         trade_gate: gate.clone(),
-                        pacifica_trading: pacifica_trading.clone(),
+                        maker: maker.clone(),
                         hyperliquid_trading: hyperliquid_trading.clone(),
                         pacifica_prices: pacifica_prices.clone(),
                         hyperliquid_prices: hyperliquid_prices.clone(),
@@ -927,7 +927,7 @@ impl XemmBot {
             hyperliquid_prices: self.hyperliquid_prices.clone(),
             config: self.config.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
-            pacifica_trading: self.pacifica_trading.clone(),
+            maker: self.maker.clone(),
             fill_aggregator: self.fill_aggregator.clone(),
             audit_tx,
             cancel_tx: cancel_tx.clone(),
@@ -1607,7 +1607,7 @@ impl XemmBot {
 
     async fn signed_positions(&self) -> Result<(f64, f64)> {
         crate::services::signed_positions(
-            &self.pacifica_trading,
+            self.maker.as_ref(),
             &self.hyperliquid_trading,
             &self.config.symbol,
         )

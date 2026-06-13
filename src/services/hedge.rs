@@ -19,8 +19,8 @@ use crate::connector::hyperliquid::types::{
     WsPostRequestInner, WsPostResponse,
 };
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
 use crate::market_rules::fallback_rules;
+use crate::services::maker::MakerExchange;
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::{FillAggregator, HedgeSettlement};
 use crate::services::hedge_store::{self, HedgeIntentStatus, HedgeLifecycleUpdate};
@@ -47,7 +47,7 @@ pub struct HedgeService {
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     /// Used only to revalidate Reconciler-sourced intents against fresh venue
     /// positions before execution; maker-fill intents never touch it.
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker: Arc<dyn MakerExchange>,
     pub fill_aggregator: Arc<FillAggregator>,
     pub audit_tx: mpsc::Sender<PostTradeAuditEvent>,
     pub cancel_tx: mpsc::Sender<CancelIntent>,
@@ -1220,7 +1220,7 @@ impl HedgeService {
         }
 
         let (pacifica, hyperliquid) = match crate::services::signed_positions(
-            &self.pacifica_trading,
+            self.maker.as_ref(),
             &self.hyperliquid_trading,
             &self.config.symbol,
         )

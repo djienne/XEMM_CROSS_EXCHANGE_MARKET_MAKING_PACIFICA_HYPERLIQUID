@@ -25,33 +25,23 @@ use tokio::sync::mpsc;
 
 use crate::bot::BotState;
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
+use crate::services::maker::MakerExchange;
 use crate::strategy::OrderSide;
 
-/// Signed per-venue positions for `symbol`: `(pacifica, hyperliquid)`.
+/// Signed per-venue positions for `symbol`: `(maker, hyperliquid)`.
 ///
-/// Pacifica reports unsigned amounts with a side ("bid" = long, "ask" = short);
-/// Hyperliquid's `szi` is already signed. Shared by the reconciler, safety
-/// monitor, hedge executor, and shutdown path so every exposure decision uses
-/// the same sign convention.
+/// The maker leg comes from `MakerExchange::position` (already signed: +long /
+/// -short); Hyperliquid's `szi` is already signed. Shared by the reconciler,
+/// safety monitor, hedge executor, and shutdown path so every exposure decision
+/// uses the same sign convention. The maker and taker may use different symbol
+/// tickers; pass the maker symbol here (taker symbol handled by the caller until
+/// the symbol split lands).
 pub async fn signed_positions(
-    pacifica: &PacificaTrading,
+    maker: &dyn MakerExchange,
     hyperliquid: &HyperliquidTrading,
     symbol: &str,
 ) -> anyhow::Result<(f64, f64)> {
-    let pacifica_positions = pacifica.get_positions().await?;
-    let pacifica_position = pacifica_positions
-        .iter()
-        .find(|position| position.symbol == symbol)
-        .map(|position| {
-            let amount: f64 = fast_float::parse(&position.amount).unwrap_or(0.0);
-            match position.side.as_str() {
-                "bid" => amount,
-                "ask" => -amount,
-                _ => 0.0,
-            }
-        })
-        .unwrap_or(0.0);
+    let pacifica_position = maker.position(symbol).await?.signed_base;
 
     let user_state = hyperliquid
         .get_user_state(&hyperliquid.account_address())
