@@ -1,22 +1,20 @@
 use colored::Colorize;
-use fast_float::parse;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bot::{BotState, BotStatus};
-use crate::connector::pacifica::{
-    FillDetectionClient, FillEvent, PacificaTrading, PositionBaselineUpdater,
-};
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::{FillAggregator, HedgeReservation};
 use crate::services::fill_dedup::{FillDedup, FillKey};
+use crate::services::maker::{
+    MakerBaselineUpdater, MakerExchange, MakerFillEvent, MakerFillStream, MakerReconcileHook,
+};
 use crate::services::metrics;
 use crate::services::supervisor::spawn_supervised_fail_closed;
 use crate::services::trade_gate::TradeGate;
 use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
-use crate::strategy::OrderSide;
 use crate::util::log::{tag_static, Color};
 
 /// WebSocket-based fill detection service (primary fill detection method).
@@ -25,12 +23,13 @@ pub struct FillDetectionService {
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
     pub cancel_tx: mpsc::Sender<CancelIntent>,
     pub cancel_demand: Arc<CancelDemand>,
-    pub pacifica_trading: Arc<PacificaTrading>,
-    pub fill_client: FillDetectionClient,
+    /// Maker handle used by the reconnect reconcile hook (REST open-order scan).
+    pub maker: Arc<dyn MakerExchange>,
+    pub fill_stream: Box<dyn MakerFillStream>,
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
     pub fill_aggregator: Arc<FillAggregator>,
-    pub baseline_updater: PositionBaselineUpdater,
+    pub baseline_updater: Arc<dyn MakerBaselineUpdater>,
     pub atomic_status: Arc<std::sync::atomic::AtomicU8>,
     pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
     pub trade_gate: Arc<TradeGate>,
@@ -55,7 +54,7 @@ struct FillEventProcessor {
     symbol: String,
     processed_fills: Arc<FillDedup>,
     fill_aggregator: Arc<FillAggregator>,
-    baseline_updater: PositionBaselineUpdater,
+    baseline_updater: Arc<dyn MakerBaselineUpdater>,
     atomic_status: Arc<std::sync::atomic::AtomicU8>,
     order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
     low_latency_mode: bool,
@@ -76,13 +75,13 @@ impl FillEventProcessor {
             .unwrap_or(false)
     }
 
-    async fn process(&self, fill_event: FillEvent) {
+    async fn process(&self, fill_event: MakerFillEvent) {
         match fill_event {
-            FillEvent::FullFill {
+            MakerFillEvent::Full {
                 order_id,
                 symbol: fill_symbol,
                 side,
-                filled_amount,
+                filled,
                 avg_price,
                 client_order_id,
                 ..
@@ -93,10 +92,10 @@ impl FillEventProcessor {
                         "{} {} FULL FILL: {} {} {} @ {} (cloid: {})",
                         tag_static("FILL_DETECTION", Color::Magenta),
                         "OK".green().bold(),
-                        side.bright_yellow(),
-                        filled_amount.bright_white(),
+                        side.as_str().bright_yellow(),
+                        filled.to_string().bright_white(),
                         fill_symbol.bright_white().bold(),
-                        avg_price.cyan(),
+                        avg_price.to_string().cyan(),
                         client_order_id.as_deref().unwrap_or("None")
                     );
                 }
@@ -105,17 +104,9 @@ impl FillEventProcessor {
                     return;
                 }
 
-                let Some(order_side) = order_side_from_str(&side) else {
-                    error!(
-                        "{} {} Unknown side: {}",
-                        tag_static("FILL_DETECTION", Color::Magenta),
-                        "FAIL".red().bold(),
-                        side
-                    );
-                    return;
-                };
-                let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
-                let avg_px: f64 = parse(&avg_price).unwrap_or(0.0);
+                let order_side = side;
+                let filled_size = filled;
+                let avg_px = avg_price;
 
                 if !self
                     .fill_aggregator
@@ -162,7 +153,7 @@ impl FillEventProcessor {
                     CancelReason::PartialFill,
                 );
                 self.baseline_updater
-                    .update_baseline(&self.symbol, &side, filled_size, avg_px);
+                    .update_baseline(&self.symbol, order_side, filled_size, avg_px);
 
                 if !self.low_latency_mode {
                     info!(
@@ -182,30 +173,30 @@ impl FillEventProcessor {
                 )
                 .await;
             }
-            FillEvent::PartialFill {
+            MakerFillEvent::Partial {
                 order_id,
                 symbol: fill_symbol,
                 side,
-                filled_amount,
-                original_amount,
+                filled,
+                original,
                 avg_price,
                 client_order_id,
                 ..
             } => {
-                let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
-                let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
+                let filled_size = filled;
+                let fill_price = avg_price;
                 let notional_value = filled_size * fill_price;
                 if !self.low_latency_mode {
                     info!(
                         "{} {} PARTIAL FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {}",
                         tag_static("FILL_DETECTION", Color::Magenta),
                         "FAST".yellow().bold(),
-                        side.bright_yellow(),
-                        filled_amount.bright_white(),
+                        side.as_str().bright_yellow(),
+                        filled.to_string().bright_white(),
                         fill_symbol.bright_white().bold(),
-                        avg_price.cyan(),
-                        filled_amount.bright_white(),
-                        original_amount,
+                        avg_price.to_string().cyan(),
+                        filled.to_string().bright_white(),
+                        original,
                         format!("${:.2}", notional_value).cyan().bold()
                     );
                 }
@@ -214,16 +205,8 @@ impl FillEventProcessor {
                     return;
                 }
 
-                let Some(order_side) = order_side_from_str(&side) else {
-                    error!(
-                        "{} {} Unknown side: {}",
-                        tag_static("FILL_DETECTION", Color::Magenta),
-                        "FAIL".red().bold(),
-                        side
-                    );
-                    return;
-                };
-                let target_size: f64 = parse(&original_amount).unwrap_or(0.0);
+                let order_side = side;
+                let target_size = original;
                 if !self.fill_aggregator.observe_fill_with_target(
                     order_id,
                     order_side,
@@ -278,7 +261,7 @@ impl FillEventProcessor {
                 );
                 self.baseline_updater.update_baseline(
                     &self.symbol,
-                    &side,
+                    order_side,
                     reservation.size,
                     reservation.avg_price,
                 );
@@ -292,11 +275,11 @@ impl FillEventProcessor {
                 )
                 .await;
             }
-            FillEvent::Cancelled {
+            MakerFillEvent::Cancelled {
                 order_id,
                 client_order_id,
                 side,
-                filled_amount,
+                filled,
                 reason,
                 ..
             } => {
@@ -304,46 +287,41 @@ impl FillEventProcessor {
                     "[FILL_DETECTION] Order cancelled: {} (reason: {}, filled_amount: {})",
                     client_order_id.as_deref().unwrap_or("None"),
                     reason,
-                    filled_amount
+                    filled
                 );
 
                 // Residual-fill check FIRST, state cleanup second: the cleanup
                 // clears `active_order`, which would make the residual path's
                 // is_our_order test fail if it ran first (the old per-event
                 // spawns raced exactly that way).
-                let filled_so_far: f64 = parse(&filled_amount).unwrap_or(0.0);
+                let filled_so_far = filled;
                 if filled_so_far > 0.0 && self.is_our_order(&client_order_id) {
-                    if let Some(order_side) = order_side_from_str(&side) {
-                        if self.fill_aggregator.observe_fill(
-                            order_id,
-                            order_side,
-                            filled_so_far,
-                            0.0,
-                            true,
-                        ) {
-                            let dedup_key = client_order_id
-                                .clone()
-                                .map(|cloid| FillKey::from_cloid_cumulative(cloid, filled_so_far))
-                                .unwrap_or_else(|| {
-                                    FillKey::from_order_cumulative(order_id, filled_so_far)
-                                });
-                            if self.processed_fills.insert_if_new(dedup_key) {
-                                if let Some(reservation) =
-                                    self.fill_aggregator.try_reserve_hedge(order_id)
-                                {
-                                    warn!(
-                                        "[FILL_DETECTION] Cancellation left {} filled on order_id={}, emitting hedge",
-                                        reservation.size, order_id
-                                    );
-                                    enqueue_reserved_hedge(
-                                        &self.fill_aggregator,
-                                        &self.hedge_tx,
-                                        &self.bot_state,
-                                        reservation,
-                                        "cancel residual",
-                                    )
-                                    .await;
-                                }
+                    if self
+                        .fill_aggregator
+                        .observe_fill(order_id, side, filled_so_far, 0.0, true)
+                    {
+                        let dedup_key = client_order_id
+                            .clone()
+                            .map(|cloid| FillKey::from_cloid_cumulative(cloid, filled_so_far))
+                            .unwrap_or_else(|| {
+                                FillKey::from_order_cumulative(order_id, filled_so_far)
+                            });
+                        if self.processed_fills.insert_if_new(dedup_key) {
+                            if let Some(reservation) =
+                                self.fill_aggregator.try_reserve_hedge(order_id)
+                            {
+                                warn!(
+                                    "[FILL_DETECTION] Cancellation left {} filled on order_id={}, emitting hedge",
+                                    reservation.size, order_id
+                                );
+                                enqueue_reserved_hedge(
+                                    &self.fill_aggregator,
+                                    &self.hedge_tx,
+                                    &self.bot_state,
+                                    reservation,
+                                    "cancel residual",
+                                )
+                                .await;
                             }
                         }
                     }
@@ -398,7 +376,7 @@ impl FillEventProcessor {
                     }
                 }
             }
-            FillEvent::PositionFill { .. } => {
+            MakerFillEvent::Position { .. } => {
                 debug!("[FILL_DETECTION] Position fill event handled by position monitor");
             }
         }
@@ -412,18 +390,18 @@ impl FillDetectionService {
             tag_static("FILL_DETECTION", Color::Magenta)
         );
 
-        let fill_client = &mut self.fill_client;
+        let fill_stream = &mut self.fill_stream;
 
         {
-            let pac_for_hook = self.pacifica_trading.clone();
+            let maker_for_hook = self.maker.clone();
             let symbol_for_hook = self.symbol.clone();
             let aggregator_for_hook = self.fill_aggregator.clone();
             let processed_for_hook = self.processed_fills.clone();
             let hedge_tx_for_hook = self.hedge_tx.clone();
             let bot_state_for_hook = self.bot_state.clone();
 
-            let hook: crate::connector::pacifica::ReconcileHook = Arc::new(move || {
-                let pac = pac_for_hook.clone();
+            let hook: MakerReconcileHook = Arc::new(move || {
+                let maker = maker_for_hook.clone();
                 let symbol = symbol_for_hook.clone();
                 let aggregator = aggregator_for_hook.clone();
                 let processed = processed_for_hook.clone();
@@ -435,7 +413,7 @@ impl FillDetectionService {
                         .active_order
                         .as_ref()
                         .map(|order| order.client_order_id.clone());
-                    match pac.get_open_orders().await {
+                    match maker.open_orders().await {
                         Ok(orders) => {
                             for order in orders.into_iter().filter(|o| o.symbol == symbol) {
                                 if active_cloid
@@ -446,16 +424,14 @@ impl FillDetectionService {
                                     continue;
                                 }
 
-                                let filled: f64 = parse(&order.filled_amount).unwrap_or(0.0);
+                                let filled = order.filled_amount;
                                 if filled <= 0.0 {
                                     continue;
                                 }
-                                let initial: f64 = parse(&order.initial_amount).unwrap_or(0.0);
-                                let price: f64 = parse(&order.price).unwrap_or(0.0);
+                                let initial = order.initial_amount;
+                                let price = order.price;
                                 let is_terminal = (filled - initial).abs() < 1e-9;
-                                let Some(side) = order_side_from_str(&order.side) else {
-                                    continue;
-                                };
+                                let side = order.side;
 
                                 if !aggregator.observe_fill_with_target(
                                     order.order_id,
@@ -498,13 +474,13 @@ impl FillDetectionService {
                     }
                 })
             });
-            fill_client.set_reconcile_hook(hook);
+            fill_stream.set_reconcile_hook(hook);
         }
 
         // Single ordered consumer (see FillEventProcessor docs). Unbounded
         // channel: a dropped fill event risks a missed hedge, and real order
         // flow bounds the rate.
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<FillEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MakerFillEvent>();
         let processor = FillEventProcessor {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
@@ -532,20 +508,12 @@ impl FillDetectionService {
 
         // The WS read callback does nothing but forward: no locks, no parsing,
         // no spawned task per event.
-        fill_client
-            .start(move |fill_event| {
+        fill_stream
+            .run_with(Box::new(move |fill_event| {
                 let _ = event_tx.send(fill_event);
-            })
+            }))
             .await
             .ok();
-    }
-}
-
-fn order_side_from_str(side: &str) -> Option<OrderSide> {
-    match side {
-        "buy" | "bid" => Some(OrderSide::Buy),
-        "sell" | "ask" => Some(OrderSide::Sell),
-        _ => None,
     }
 }
 

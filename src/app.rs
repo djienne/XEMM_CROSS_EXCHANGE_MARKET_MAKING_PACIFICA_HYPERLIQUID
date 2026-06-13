@@ -20,7 +20,7 @@ use crate::connector::hyperliquid::{
 use crate::connector::pacifica::trading::PacificaPoller;
 use crate::connector::pacifica::{
     FillDetectionClient, FillDetectionConfig, OrderSide as PacificaOrderSide, PacificaCredentials,
-    PacificaMaker, PacificaTrading, PacificaWsTrading,
+    PacificaFillStream, PacificaMaker, PacificaTrading, PacificaWsTrading,
 };
 use crate::connector::pacifica::{
     OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
@@ -33,7 +33,7 @@ use crate::services::{
     fill_detection::FillDetectionService,
     hedge::HedgeService,
     hedge_store,
-    maker::MakerExchange,
+    maker::{MakerExchange, MakerFillStream},
     metrics,
     order_monitor::{
         spawn_monitor_tasks, update_order_snapshot, OrderMonitorService, SharedOrderSnapshot,
@@ -581,8 +581,9 @@ impl XemmBot {
         };
         let fill_client = FillDetectionClient::new(fill_config.clone(), false)
             .context("Failed to create fill detection client")?;
-        let fill_ws_ready = fill_client.ready_flag();
-        let baseline_updater = fill_client.get_baseline_updater();
+        let fill_stream: Box<dyn MakerFillStream> = Box::new(PacificaFillStream::new(fill_client));
+        let fill_ws_ready = fill_stream.ready_flag();
+        let baseline_updater = fill_stream.baseline_updater();
 
         let cancel_demand = CancelDemand::new();
         let (cancel_tx, cancel_rx) = CancelManagerService::channel();
@@ -612,8 +613,8 @@ impl XemmBot {
             hedge_tx: self.hedge_tx.clone(),
             cancel_tx: cancel_tx.clone(),
             cancel_demand: cancel_demand.clone(),
-            pacifica_trading: self.pacifica_trading.clone(),
-            fill_client,
+            maker: self.maker.clone(),
+            fill_stream,
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             fill_aggregator: self.fill_aggregator.clone(),

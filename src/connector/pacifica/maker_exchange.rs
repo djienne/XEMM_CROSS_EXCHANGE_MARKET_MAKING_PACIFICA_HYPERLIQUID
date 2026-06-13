@@ -337,9 +337,12 @@ struct PacificaBaselineUpdater(PositionBaselineUpdater);
 
 impl MakerBaselineUpdater for PacificaBaselineUpdater {
     fn update_baseline(&self, symbol: &str, side: OrderSide, filled: f64, avg_price: f64) {
+        // Pass Pacifica's native side string ("bid"/"ask") — the exact value the
+        // legacy order-fill path fed to `PositionBaselineUpdater`, so the
+        // downstream snapshot math is byte-for-byte unchanged.
         let s = match side {
-            OrderSide::Buy => "buy",
-            OrderSide::Sell => "sell",
+            OrderSide::Buy => "bid",
+            OrderSide::Sell => "ask",
         };
         self.0.update_baseline(symbol, s, filled, avg_price);
     }
