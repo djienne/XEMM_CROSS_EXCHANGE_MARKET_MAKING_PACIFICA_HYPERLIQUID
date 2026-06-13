@@ -6,18 +6,15 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use fast_float::parse;
-
 use crate::bot::{BotState, BotStatus, RunState};
 use crate::config::Config;
-use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::services::fill_aggregator::{FillAggregator, HedgeReservation};
 use crate::services::fill_dedup::{FillDedup, FillKey};
+use crate::services::maker::MakerExchange;
 use crate::services::metrics;
 use crate::services::order_monitor::SharedOrderSnapshot;
 use crate::services::trade_gate::{GateReason, TradeGate};
 use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
-use crate::util::cancel::dual_cancel;
 use crate::util::rate_limit::is_rate_limit_error;
 
 #[derive(Debug, Clone)]
@@ -120,8 +117,7 @@ pub struct CancelManagerService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub atomic_status: Arc<AtomicU8>,
     pub order_snapshot: Arc<SharedOrderSnapshot>,
-    pub rest: Arc<PacificaTrading>,
-    pub ws: Arc<PacificaWsTrading>,
+    pub maker: Arc<dyn MakerExchange>,
     pub trade_gate: Arc<TradeGate>,
     pub cancel_demand: Arc<CancelDemand>,
     pub config: Config,
@@ -200,7 +196,7 @@ impl CancelManagerService {
         let mut attempts = 0u32;
         loop {
             attempts += 1;
-            match dual_cancel(&self.rest, &self.ws, &intent.symbol).await {
+            match self.maker.cancel_all(&intent.symbol).await {
                 Ok((rest_count, ws_count)) => {
                     debug!(
                         "[CANCEL] Dual cancel submitted (REST: {}, WS: {}, attempt {})",
@@ -265,7 +261,7 @@ impl CancelManagerService {
     }
 
     async fn verify_no_open_orders(&self, symbol: &str) -> anyhow::Result<bool> {
-        let orders = self.rest.get_open_orders().await?;
+        let orders = self.maker.open_orders().await?;
         Ok(!orders.iter().any(|order| order.symbol == symbol))
     }
 
@@ -288,11 +284,7 @@ impl CancelManagerService {
             return false;
         };
 
-        let trades = match self
-            .rest
-            .get_trade_history(Some(symbol), Some(100), None, None)
-            .await
-        {
+        let trades = match self.maker.recent_trades(symbol, 100).await {
             Ok(t) => t,
             Err(e) => {
                 // Could not confirm; treat as not-routed so the slow REST fill
@@ -315,8 +307,8 @@ impl CancelManagerService {
             .iter()
             .filter(|t| t.client_order_id.as_deref() == Some(cloid.as_str()))
         {
-            let qty: f64 = parse(&trade.amount).unwrap_or(0.0);
-            let px: f64 = parse(&trade.entry_price).unwrap_or(0.0);
+            let qty = trade.amount;
+            let px = trade.entry_price;
             if qty <= 0.0 {
                 continue;
             }
