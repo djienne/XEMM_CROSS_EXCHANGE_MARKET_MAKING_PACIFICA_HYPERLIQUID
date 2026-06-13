@@ -11,10 +11,9 @@ use tracing::{info, warn};
 use crate::bot::BotState;
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::csv_logger;
+use crate::services::maker::MakerExchange;
 use crate::strategy::OrderSide;
-use crate::util::cancel::dual_cancel;
 use crate::trade_fetcher;
 use crate::util::log::{tag, Color};
 
@@ -37,8 +36,7 @@ pub struct PostTradeAuditorService {
     pub audit_rx: mpsc::Receiver<PostTradeAuditEvent>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
-    pub pacifica_trading: Arc<PacificaTrading>,
-    pub pacifica_ws_trading: Arc<PacificaWsTrading>,
+    pub maker: Arc<dyn MakerExchange>,
     pub shutdown_tx: mpsc::Sender<()>,
 }
 
@@ -120,20 +118,16 @@ impl PostTradeAuditorService {
         event: &PostTradeAuditEvent,
     ) -> trade_fetcher::TradeFetchResult {
         if let Some(cloid) = &event.client_order_id {
-            trade_fetcher::fetch_pacifica_trade(
-                self.pacifica_trading.clone(),
-                &self.config.symbol,
-                cloid,
-                3,
-                |msg| {
-                    info!(
-                        "{} {}",
-                        tag(&self.config.symbol, "PROFIT", Color::Blue),
-                        msg
-                    )
-                },
-            )
-            .await
+            let s = self
+                .maker
+                .maker_fill_summary(&self.config.symbol, cloid, 3)
+                .await;
+            trade_fetcher::TradeFetchResult {
+                fill_price: s.fill_price,
+                actual_fee: s.actual_fee,
+                total_size: s.total_size,
+                total_notional: s.total_notional,
+            }
         } else {
             trade_fetcher::TradeFetchResult {
                 fill_price: None,
@@ -368,13 +362,7 @@ impl PostTradeAuditorService {
         );
         // Use the same redundant REST+WS cancel as the rest of the codebase, so a
         // single failing transport does not leave a resting order after a hedge.
-        match dual_cancel(
-            &self.pacifica_trading,
-            &self.pacifica_ws_trading,
-            &self.config.symbol,
-        )
-        .await
-        {
+        match self.maker.cancel_all(&self.config.symbol).await {
             Ok((rest_count, ws_count)) => info!(
                 "{} {} Final cancel submitted (REST: {}, WS: {})",
                 tag(&self.config.symbol, "AUDIT", Color::Blue),
@@ -411,7 +399,7 @@ impl PostTradeAuditorService {
                 hl_pos
             );
             if net_position.abs() <= self.config.neutral_dust_base {
-                match self.pacifica_trading.get_open_orders().await {
+                match self.maker.open_orders().await {
                     Ok(orders)
                         if orders
                             .iter()
@@ -461,20 +449,15 @@ impl PostTradeAuditorService {
     }
 
     async fn fetch_pacifica_position(&self) -> Option<f64> {
-        match self.pacifica_trading.get_positions().await {
-            Ok(positions) => {
-                if let Some(pos) = positions.iter().find(|p| p.symbol == self.config.symbol) {
-                    let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
-                    let signed = if pos.side == "bid" { amount } else { -amount };
-                    info!(
-                        "{} Pacifica signed position: {:.4}",
-                        tag(&self.config.symbol, "VERIFY", Color::Cyan),
-                        signed
-                    );
-                    Some(signed)
-                } else {
-                    Some(0.0)
-                }
+        match self.maker.position(&self.config.symbol).await {
+            Ok(pos) => {
+                let signed = pos.signed_base;
+                info!(
+                    "{} Pacifica signed position: {:.4}",
+                    tag(&self.config.symbol, "VERIFY", Color::Cyan),
+                    signed
+                );
+                Some(signed)
             }
             Err(e) => {
                 warn!(

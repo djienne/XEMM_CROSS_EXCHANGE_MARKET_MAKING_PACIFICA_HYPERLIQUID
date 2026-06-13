@@ -911,8 +911,7 @@ impl XemmBot {
             audit_rx,
             config: self.config.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
-            pacifica_trading: self.pacifica_trading.clone(),
-            pacifica_ws_trading: self.pacifica_ws_trading.clone(),
+            maker: self.maker.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
         };
         // Fail-closed: owns the audit-event Receiver, which cannot be reconstructed.
