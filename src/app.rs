@@ -741,7 +741,7 @@ impl XemmBot {
             let hedge_tx = self.hedge_tx.clone();
             let cancel_tx = cancel_tx.clone();
             let cancel_demand = cancel_demand.clone();
-            let pacifica_trading = self.pacifica_trading.clone();
+            let maker = self.maker.clone();
             let symbol = self.config.symbol.clone();
             let processed_fills = self.processed_fills.clone();
             let fill_aggregator = self.fill_aggregator.clone();
@@ -757,7 +757,7 @@ impl XemmBot {
                         hedge_tx: hedge_tx.clone(),
                         cancel_tx: cancel_tx.clone(),
                         cancel_demand: cancel_demand.clone(),
-                        pacifica_trading: pacifica_trading.clone(),
+                        maker: maker.clone(),
                         symbol: symbol.clone(),
                         processed_fills: processed_fills.clone(),
                         fill_aggregator: fill_aggregator.clone(),

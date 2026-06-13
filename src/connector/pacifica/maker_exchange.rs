@@ -282,6 +282,10 @@ impl MakerExchange for PacificaMaker {
     }
 
     async fn position(&self, symbol: &str) -> Result<MakerPosition> {
+        Ok(self.position_opt(symbol).await?.unwrap_or_default())
+    }
+
+    async fn position_opt(&self, symbol: &str) -> Result<Option<MakerPosition>> {
         let positions = self.rest.get_positions().await?;
         Ok(positions
             .iter()
@@ -289,8 +293,7 @@ impl MakerExchange for PacificaMaker {
             .map(|p| MakerPosition {
                 signed_base: signed_base(&p.side, parse_f64(&p.amount)),
                 entry_price: parse_f64(&p.entry_price),
-            })
-            .unwrap_or_default())
+            }))
     }
 
     async fn recent_trades(&self, symbol: &str, limit: u32) -> Result<Vec<MakerTrade>> {

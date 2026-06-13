@@ -1,5 +1,4 @@
 use colored::Colorize;
-use fast_float::parse;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::collections::hash_map::DefaultHasher;
@@ -12,10 +11,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
-use crate::connector::pacifica::PacificaTrading;
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::fill_dedup::{FillDedup, FillKey};
+use crate::services::maker::MakerExchange;
 use crate::services::{enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent};
 use crate::strategy::OrderSide;
 use crate::util::log::{tag_static, Color};
@@ -30,7 +29,7 @@ pub struct PositionMonitorService {
     pub hedge_tx: mpsc::Sender<HedgeIntent>,
     pub cancel_tx: mpsc::Sender<CancelIntent>,
     pub cancel_demand: Arc<CancelDemand>,
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker: Arc<dyn MakerExchange>,
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
     pub fill_aggregator: Arc<FillAggregator>,
@@ -69,22 +68,21 @@ impl PositionMonitorService {
 
             if active_order_info.is_none() {
                 // No active order - update snapshot for next order
-                match self.pacifica_trading.get_positions().await {
-                    Ok(positions) => {
-                        let position = positions.iter().find(|p| p.symbol == self.symbol);
+                match self.maker.position_opt(&self.symbol).await {
+                    Ok(position) => {
                         let mut snapshot = self.last_position_snapshot.lock();
 
                         if let Some(pos) = position {
-                            let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
-                            *snapshot = Some(PositionSnapshot {
-                                amount,
-                                side: pos.side.clone(),
-                                last_check: std::time::Instant::now(),
-                            });
+                            let (amount, side) = signed_to_amount_side(pos.signed_base);
                             debug!(
                                 "[POSITION_MONITOR] Updated baseline: {} {} {}",
-                                self.symbol, pos.side, amount
+                                self.symbol, side, amount
                             );
+                            *snapshot = Some(PositionSnapshot {
+                                amount,
+                                side,
+                                last_check: std::time::Instant::now(),
+                            });
                         } else {
                             *snapshot = None;
                             debug!("[POSITION_MONITOR] No position for {}", self.symbol);
@@ -119,18 +117,17 @@ impl PositionMonitorService {
             };
 
             // Fetch current positions
-            let positions_result = self.pacifica_trading.get_positions().await;
+            let position_result = self.maker.position_opt(&self.symbol).await;
 
-            match positions_result {
-                Ok(positions) => {
-                    let current_position = positions.iter().find(|p| p.symbol == self.symbol);
-
+            match position_result {
+                Ok(current_position) => {
                     if baseline_stale {
                         // Re-anchor to the authoritative current position and skip
                         // delta detection on this tick. Subsequent ticks detect
                         // genuine fills against this fresh baseline.
                         let (amount, side) = current_position
-                            .map(|p| (parse(&p.amount).unwrap_or(0.0), p.side.clone()))
+                            .as_ref()
+                            .map(|p| signed_to_amount_side(p.signed_base))
                             .unwrap_or((0.0, "none".to_string()));
                         *self.last_position_snapshot.lock() = Some(PositionSnapshot {
                             amount,
@@ -152,8 +149,8 @@ impl PositionMonitorService {
                         (0.0, "none".to_string())
                     };
 
-                    let (current_amount, current_side) = if let Some(pos) = current_position {
-                        (pos.amount.parse::<f64>().unwrap_or(0.0), pos.side.clone())
+                    let (current_amount, current_side) = if let Some(pos) = &current_position {
+                        signed_to_amount_side(pos.signed_base)
                     } else {
                         (0.0, "none".to_string())
                     };
@@ -252,7 +249,8 @@ impl PositionMonitorService {
                         }
 
                         let estimated_price = current_position
-                            .and_then(|p| p.entry_price.parse::<f64>().ok())
+                            .as_ref()
+                            .map(|p| p.entry_price)
                             .unwrap_or(0.0);
 
                         let dedup_key =
@@ -396,6 +394,18 @@ impl PositionMonitorService {
                 }
             }
         }
+    }
+}
+
+/// Reconstruct the (unsigned amount, side-string) pair the snapshot stores from
+/// a signed position. Round-trips identically with the venue's bid/ask.
+fn signed_to_amount_side(signed: f64) -> (f64, String) {
+    if signed > 0.0 {
+        (signed, "bid".to_string())
+    } else if signed < 0.0 {
+        (-signed, "ask".to_string())
+    } else {
+        (0.0, "none".to_string())
     }
 }
 

@@ -83,6 +83,11 @@ pub trait MakerExchange: Send + Sync + 'static {
     /// Signed position for `symbol` (+long / -short); zeroed when flat.
     async fn position(&self, symbol: &str) -> Result<MakerPosition>;
 
+    /// Like [`MakerExchange::position`] but distinguishes "no position row"
+    /// (`None`) from a flat/zero position. The position monitor needs that to
+    /// keep a `None` baseline distinct from a real zero.
+    async fn position_opt(&self, symbol: &str) -> Result<Option<MakerPosition>>;
+
     /// Up to `limit` recent trade-history rows for `symbol`.
     async fn recent_trades(&self, symbol: &str, limit: u32) -> Result<Vec<MakerTrade>>;
 
