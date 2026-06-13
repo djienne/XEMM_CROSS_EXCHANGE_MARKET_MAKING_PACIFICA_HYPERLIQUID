@@ -264,6 +264,8 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `symbol` | "SOL" | Trading symbol (must exist on both exchanges) |
+| `maker_venue` | "pacifica" | Maker exchange. Currently only `pacifica`; the maker side is abstracted behind the `build_maker` factory so a new venue is one added arm (Hyperliquid stays the permanent taker). |
+| `maker_symbol` | (unset) | Optional maker-venue wire symbol when it differs from `symbol`. Defaults to `symbol`; the connector maps canonical `symbol` <-> wire internally. |
 | `reconnect_attempts` | 5 | Number of WebSocket reconnection attempts with exponential backoff |
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `ping_interval_secs` | 15 | WebSocket ping interval in seconds (max 30s) |
@@ -564,6 +566,78 @@ RUST_LOG=debug cargo run  # With debug logging
 # Run tests
 cargo test
 cargo test --lib  # Library tests only
+```
+
+## Validating a Run (`verify_run.py`)
+
+`verify_run.py` (repo root, Python 3 stdlib only) is a **post-run validator**: after the bot completes a cycle it reads the captured stdout log plus the structured journals and asserts the cycle behaved correctly, exiting non-zero if anything is off. Use it as a routine post-cycle sanity check — and especially to **sign off a maker-venue migration before trading at normal size**.
+
+> **Why this matters for the maker abstraction.** The maker side (Pacifica) is built behind a swap point — the `MakerExchange` / `MakerFillStream` traits and the `build_maker` factory in `src/connector/maker_factory.rs` — so a new maker venue is one added arm with no service or hot-path changes; Hyperliquid stays the permanent taker. Such a change is behavior-preserving and unit-tested, but only a real cycle exercises the live WS/REST flows. There is **no testnet**: validate with **one mainnet cycle at minimum size**, bounded by the venue minimum notional and the bot's own auto-hedge/exit safety.
+
+### What it checks
+
+| Check | Source | Asserts |
+|-------|--------|---------|
+| `cycle_sequence` | stdout log | `place -> fill -> hedge received -> hedge executed`, in order |
+| `clean_exit` | stdout log | a clean shutdown was logged, not "terminated with error" |
+| `no_anomalies` | stdout log | no `panicked` / `Placement remains unknown` / `cannot auto-hedge` / unresolved-exposure lines. Recoverable signals (e.g. a retried `Hedge order FAILED`) are reported as `WARN`, not failures |
+| `hedge_lifecycle` | `data/hedge_lifecycle.jsonl` | every hedge intent reached a terminal **success**; maker/hedge sides opposite; `filled_qty ≈ size` |
+| `trade_accounting` | `<symbol>_trades.csv` | the audit row is self-consistent: opposite sides, matching sizes, fees present, `gross_pnl` recomputes from the notionals |
+| `net_neutral` | `data/unresolved_exposure.jsonl` | no unresolved-exposure record or log line |
+
+The journals are append-only and accumulate across runs, so journal checks are scoped to the most recent cycle (last ~15 min). Pass `--since-ms <epoch_ms>` to pin an exact window, or `--window-min N` to widen it.
+
+### Procedure
+
+1. **Pre-flight** — `cargo build --release` and `cargo test --lib` (expect all lib tests passing); `.env` holds credentials for **both** venues; fund both with a small buffer over the order notional.
+2. **Configure minimum size** — in `config.json`, set `order_notional_usd` to the symbol's minimum notional (startup rejects anything below it via `Config::validate`). **Keep `low_latency_mode: false`** — low-latency mode suppresses the human-readable event lines the `cycle_sequence` check reads. Optionally lower `profit_rate_bps` so a maker quote fills sooner during the test (quotes nearer break-even, a few cents of real cost — revert it afterwards).
+3. **Run one cycle and capture stdout** — the bot is single-cycle (place -> fill -> hedge -> ~20s audit -> exit):
+
+   ```bash
+   cargo run --release 2>&1 | tee output.log                  # bash / Linux
+   ```
+   ```powershell
+   cargo run --release 2>&1 | Tee-Object -FilePath output.log  # PowerShell
+   ```
+
+   If no fill happens within a few minutes (the market never crossed your quote), stop it and re-run — without a fill there is no cycle to validate.
+4. **Validate**:
+
+   ```bash
+   python verify_run.py --log output.log    # --symbol is auto-detected from config.json
+   ```
+   ```
+   [PASS] cycle_sequence     placed=1 fill=1 hedge_received=1 hedge_ok=1
+   [PASS] clean_exit         clean shutdown logged
+   [PASS] no_anomalies       none
+   [PASS] hedge_lifecycle    1 intent(s): 1 complete, 0 skipped
+   [PASS] trade_accounting   1 row(s) self-consistent
+   [PASS] net_neutral        no unresolved exposure
+   VERDICT: PASS
+   ```
+
+   Exit code is `0` on PASS, `1` on FAIL. **On FAIL, do not trade at larger size** — read the failing check's detail and inspect `output.log` and `data/hedge_lifecycle.jsonl`.
+
+### Optional: old-build vs new-build equivalence
+
+To answer "did the refactor change behavior?", run one cycle on each build and compare the `--json` summaries — the **event sequence + invariants**, not raw market values (which differ every run):
+
+```bash
+git checkout 31318d3 && cargo run --release 2>&1 | tee pre.log    # last pre-refactor commit
+python verify_run.py --log pre.log --json > pre.json
+git checkout master  && cargo run --release 2>&1 | tee post.log
+python verify_run.py --log post.log --json > post.json
+```
+
+Both should report `"verdict": "PASS"` with the same checks passing and comparable accounting. `verify_run.py` is committed, so it survives the checkout. Run the harness right after each cycle (or pass `--since-ms`) so the most-recent-cycle window keeps the two runs separate.
+
+### Safety / recovery
+
+The bot's existing protections cover a stuck cycle: the position reconciler retries corrective hedges, `data/unresolved_exposure.jsonl` is written on a non-neutral shutdown, and fail-closed supervisors halt quoting on a crashed critical service. If `verify_run.py` reports `net_neutral FAIL` or you see unresolved exposure, flatten before retrying:
+
+```bash
+cargo run --release --bin check_balance   # inspect positions on both venues
+cargo run --release --bin rebalance       # flatten residual exposure
 ```
 
 ## Terminal Output
