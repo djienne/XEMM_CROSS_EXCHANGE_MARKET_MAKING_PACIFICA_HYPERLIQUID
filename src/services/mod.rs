@@ -5,6 +5,7 @@ pub mod fill_dedup;
 pub mod fill_detection;
 pub mod hedge;
 pub mod hedge_store;
+pub mod maker;
 pub mod metrics;
 pub mod order_monitor;
 pub mod position_monitor;
