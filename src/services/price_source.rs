@@ -38,6 +38,30 @@ pub trait PricePoll: Send + Sync + 'static {
     async fn fetch(&self) -> Result<Option<(f64, f64)>>;
 }
 
+/// Object-erased forwarding impls so the maker factory can hand back
+/// `Box<dyn PriceStream>` / `Box<dyn PricePoll>` and still drive the generic
+/// services below. Boxing happens once per connection (stream) / per restart
+/// (poll) - never per book frame - so the hot path is untouched.
+#[async_trait]
+impl PriceStream for Box<dyn PriceStream> {
+    fn label(&self) -> &'static str {
+        (**self).label()
+    }
+    async fn run_with(&mut self, cb: BookCallback) -> Result<()> {
+        (**self).run_with(cb).await
+    }
+}
+
+#[async_trait]
+impl PricePoll for Box<dyn PricePoll> {
+    fn label(&self) -> &'static str {
+        (**self).label()
+    }
+    async fn fetch(&self) -> Result<Option<(f64, f64)>> {
+        (**self).fetch().await
+    }
+}
+
 /// Generic stream service: owns a `PriceStream`, pushes every update into a
 /// shared `SharedQuote`. Spawn one `tokio::spawn(service.run())`.
 pub struct PriceStreamService<C: PriceStream> {

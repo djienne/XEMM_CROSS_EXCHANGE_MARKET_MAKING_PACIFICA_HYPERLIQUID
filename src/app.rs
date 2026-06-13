@@ -17,14 +17,10 @@ use crate::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
 use crate::connector::hyperliquid::{
     OrderbookClient as HlOrderbookClient, OrderbookConfig as HlOrderbookConfig,
 };
-use crate::connector::pacifica::trading::PacificaPoller;
-use crate::connector::pacifica::{
-    FillDetectionClient, FillDetectionConfig, PacificaCredentials, PacificaFillStream,
-    PacificaMaker, PacificaTrading, PacificaWsTrading,
+use crate::connector::maker_factory::{
+    build_maker, MakerStack, MakerVenue, PricePollFactory, PriceStreamFactory,
 };
-use crate::connector::pacifica::{
-    OrderbookClient as PacOrderbookClient, OrderbookConfig as PacOrderbookConfig,
-};
+use crate::connector::pacifica::PacificaCredentials;
 use crate::services::{
     cancel_manager::{CancelDemand, CancelManagerService},
     enqueue_hedge_intent,
@@ -148,16 +144,17 @@ pub struct XemmBot {
     pub config: Config,
     pub bot_state: Arc<RwLock<BotState>>,
 
-    // Trading clients. `PacificaTrading` wraps a cloneable, thread-safe
-    // `reqwest::Client` and an `Arc<Mutex<_>>` metadata cache, so all services
-    // share a single instance - the previous 6 instances each kept their own
-    // connection pool and cache with no concurrency benefit.
-    pub pacifica_trading: Arc<PacificaTrading>,
-    pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     /// Maker-venue control plane. One shared handle (today wrapping the Pacifica
     /// REST + WS clients) cloned into every service; the single swap point for a
-    /// future maker venue.
+    /// future maker venue. Built by `build_maker`.
     pub maker: Arc<dyn MakerExchange>,
+    /// Fail-closed maker fill-event stream, built once by `build_maker` and
+    /// consumed (`take`n) when the fill-detection service is spawned.
+    pub fill_stream: Option<Box<dyn MakerFillStream>>,
+    /// Restartable maker data-plane builders (orderbook stream + REST poll), each
+    /// rebuilt by its supervised task on every reconnect/restart.
+    pub price_stream_factory: PriceStreamFactory,
+    pub price_poll_factory: PricePollFactory,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
 
     // Shared state (prices)
@@ -190,9 +187,6 @@ pub struct XemmBot {
     // Hedge-service drain signal. Fired on SIGINT/SIGTERM so any queued hedge
     // event completes before the process exits.
     pub hedge_shutdown_signal: Arc<tokio::sync::Notify>,
-
-    // Credentials (needed for spawning services)
-    pub pacifica_credentials: PacificaCredentials,
 }
 
 impl XemmBot {
@@ -299,27 +293,19 @@ impl XemmBot {
             "Credentials loaded successfully".green()
         );
 
-        // Initialize trading client (single shared instance across all services)
-        let pacifica_trading = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create Pacifica trading client")?,
-        );
-
-        // Initialize WebSocket trading client for ultra-fast cancellations
-        let pacifica_ws_trading = Arc::new(
-            PacificaWsTrading::new(pacifica_credentials.clone(), false) // false = mainnet
-                .with_request_timeout(Duration::from_millis(
-                    config.pacifica_ws_request_timeout_ms,
-                )),
-        );
-
-        // Maker-venue handle: one shared `Arc<dyn MakerExchange>` cloned into every
-        // service. Today this wraps Pacifica's REST + WS clients; a future venue
-        // swaps only this construction (later moved behind `build_maker`).
-        let maker: Arc<dyn MakerExchange> = Arc::new(PacificaMaker::new(
-            pacifica_trading.clone(),
-            pacifica_ws_trading.clone(),
-        ));
+        // Build the (swappable) maker venue: control-plane handle, the
+        // fail-closed fill stream, and the restartable data-plane builders. This
+        // is the single swap point - a future maker venue is one new arm in
+        // `build_maker`. Hyperliquid (the permanent taker) is built separately
+        // below and never routed through the factory.
+        let venue = MakerVenue::from_config(&config)?;
+        let MakerStack {
+            maker,
+            fill_stream,
+            price_stream_factory,
+            price_poll_factory,
+        } = build_maker(venue, &config, &pacifica_credentials)
+            .context("Failed to build maker venue")?;
 
         let hyperliquid_trading = Arc::new(
             HyperliquidTrading::new(hyperliquid_credentials, false)
@@ -468,9 +454,10 @@ impl XemmBot {
         Ok(XemmBot {
             config,
             bot_state,
-            pacifica_trading,
-            pacifica_ws_trading,
             maker,
+            fill_stream: Some(fill_stream),
+            price_stream_factory,
+            price_poll_factory,
             hyperliquid_trading,
             pacifica_prices,
             hyperliquid_prices,
@@ -487,7 +474,6 @@ impl XemmBot {
             shutdown_tx,
             shutdown_rx: Some(shutdown_rx),
             hedge_shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            pacifica_credentials,
         })
     }
 
@@ -501,27 +487,21 @@ impl XemmBot {
         // ===================================================
 
         // Service 1: Pacifica Orderbook (WebSocket, restartable via factory).
+        // The maker factory owns client construction (and the fail-fast config
+        // validation done at startup); here we just rebuild a fresh boxed stream
+        // on each restart. Boxing is per-connection, never per book frame.
         {
-            let ob_cfg = PacOrderbookConfig {
-                symbol: self.config.symbol.clone(),
-                agg_level: self.config.agg_level,
-                reconnect_attempts: self.config.reconnect_attempts,
-                ping_interval_secs: self.config.ping_interval_secs,
-            };
-            // Fail fast on an invalid config at startup; the factory rebuilds the
-            // (non-Clone) client from this Clone config on every restart.
-            PacOrderbookClient::new(ob_cfg.clone())
-                .context("Failed to create Pacifica orderbook client")?;
             let prices = self.pacifica_prices.clone();
+            let build_stream = self.price_stream_factory.clone();
             spawn_supervised_with_factory(
                 "pacifica_price_stream",
                 self.trade_gate.clone(),
                 RestartPolicy::default(),
                 move || {
                     let prices = prices.clone();
-                    let ob_cfg = ob_cfg.clone();
+                    let build_stream = build_stream.clone();
                     async move {
-                        match PacOrderbookClient::new(ob_cfg) {
+                        match build_stream() {
                             Ok(client) => PriceStreamService { client, prices }.run().await,
                             Err(e) => {
                                 tracing::error!("[pacifica_price_stream] client build failed: {}", e)
@@ -561,19 +541,14 @@ impl XemmBot {
                 },
             );
         }
-        let fill_config = FillDetectionConfig {
-            account: self.pacifica_credentials.account.clone(),
-            // Unbounded: the fill stream is fail-closed (a permanent exit
-            // latches ServiceDown and halts quoting until manual restart), so
-            // it must keep reconnecting; FillWsDown gates quoting during gaps
-            // and the reconcile hook replays fills missed while disconnected.
-            max_attempts: None,
-            ping_interval_secs: self.config.ping_interval_secs,
-            enable_position_fill_detection: true,
-        };
-        let fill_client = FillDetectionClient::new(fill_config.clone(), false)
-            .context("Failed to create fill detection client")?;
-        let fill_stream: Box<dyn MakerFillStream> = Box::new(PacificaFillStream::new(fill_client));
+        // Fail-closed maker fill stream, built once by `build_maker`. Take it
+        // here (it is consumed by the fill-detection service); the ready-flag and
+        // baseline-updater handles are cloned out for the readiness gate and the
+        // safety monitor before the stream is moved.
+        let fill_stream = self
+            .fill_stream
+            .take()
+            .expect("fill stream already taken (run called twice?)");
         let fill_ws_ready = fill_stream.ready_flag();
         let baseline_updater = fill_stream.baseline_updater();
 
@@ -616,21 +591,22 @@ impl XemmBot {
             trade_gate: self.trade_gate.clone(),
             low_latency_mode: self.config.low_latency_mode,
         };
-        // Fail-closed for now: the FillDetectionClient is non-Clone and its
-        // ready_flag/baseline_updater are captured by wait_for_startup_readiness
-        // and safety_monitor before spawn, so a naive restart would publish
-        // readiness to a flag those consumers don't observe. Making it restartable
-        // requires injecting long-lived Arc flags into FillDetectionClient::new
-        // (tracked as a follow-up in MEGA_FIX_PLAN_5).
+        // Fail-closed for now: the maker fill stream is non-Clone (built once by
+        // the factory and taken above) and its ready_flag/baseline_updater are
+        // captured by wait_for_startup_readiness and safety_monitor before spawn,
+        // so a naive restart would publish readiness to a flag those consumers
+        // don't observe. Making it restartable requires injecting long-lived Arc
+        // flags into the stream constructor (tracked as a follow-up in
+        // MEGA_FIX_PLAN_5).
         spawn_supervised_fail_closed("fill_detection", self.trade_gate.clone(), async move {
             fill_service.run().await;
         });
 
         // Service 4: Pacifica REST Poll (price redundancy, restartable via factory).
+        // The maker factory owns poller construction; here we rebuild a fresh
+        // boxed poller on each restart.
         {
-            let trading = self.pacifica_trading.clone();
-            let symbol = self.config.symbol.clone();
-            let agg_level = self.config.agg_level;
+            let build_poll = self.price_poll_factory.clone();
             let prices = self.pacifica_prices.clone();
             let interval_secs = self.config.pacifica_rest_poll_interval_secs;
             spawn_supervised_with_factory(
@@ -638,15 +614,11 @@ impl XemmBot {
                 self.trade_gate.clone(),
                 RestartPolicy::default(),
                 move || {
-                    let (trading, symbol, prices) =
-                        (trading.clone(), symbol.clone(), prices.clone());
+                    let build_poll = build_poll.clone();
+                    let prices = prices.clone();
                     async move {
                         PricePollService {
-                            source: Arc::new(PacificaPoller {
-                                trading,
-                                symbol,
-                                agg_level,
-                            }),
+                            source: Arc::new(build_poll()),
                             prices,
                             interval_secs,
                         }
