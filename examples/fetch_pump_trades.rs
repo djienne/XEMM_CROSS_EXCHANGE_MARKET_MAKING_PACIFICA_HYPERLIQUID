@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     println!();
 
     // Initialize trading clients
-    let pacifica_trading = PacificaTrading::new(pacifica_creds.clone());
+    let pacifica_trading = PacificaTrading::new(pacifica_creds.clone()).unwrap();
     let hyperliquid_trading = HyperliquidTrading::new(hyperliquid_creds.clone(), false)?;
 
     // ═══════════════════════════════════════════════════
@@ -63,10 +63,7 @@ async fn main() -> Result<()> {
                     println!("    Price:            {}", format!("${}", trade.entry_price).cyan());
                     println!("    Amount:           {}", trade.amount.bright_white());
                     println!("    Fee:              {}", format!("${}", trade.fee).yellow());
-                    println!("    Client Order ID:  {}...{}",
-                        &trade.client_order_id[..8],
-                        &trade.client_order_id[trade.client_order_id.len()-4..]
-                    );
+                    println!("    Client Order ID:  {}", trade.client_order_id.as_deref().unwrap_or("None"));
 
                     // Convert timestamp to readable format
                     let dt = chrono::DateTime::from_timestamp_millis(trade.created_at as i64);

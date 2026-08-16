@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     info!("[PACIFICA] Market: Bid=${:.2} Ask=${:.2} Mid=${:.2}\n", bid, ask, mid);
 
     // Create trading client (mainnet)
-    let mut trading_client = PacificaTrading::new(credentials);
+    let mut trading_client = PacificaTrading::new(credentials).unwrap();
 
     // Place a buy order 1% below mid
     let symbol = "SOL";

@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     println!();
 
     // Create trading client
-    let trading = PacificaTrading::new(credentials);
+    let trading = PacificaTrading::new(credentials).unwrap();
 
     // Get recent trade history for ENA
     println!("Fetching recent ENA trade history...");

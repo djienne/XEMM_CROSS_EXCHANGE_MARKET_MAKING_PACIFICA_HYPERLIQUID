@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -10,6 +9,7 @@ use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
+use crate::util::bounded_set::BoundedSet;
 use crate::util::cancel::dual_cancel;
 use crate::util::rate_limit::is_rate_limit_error;
 
@@ -19,11 +19,11 @@ use crate::util::rate_limit::is_rate_limit_error;
 /// missed by WebSocket. This provides redundancy and recovery capabilities.
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<BoundedSet>>,
     pub min_hedge_notional: f64,
     pub poll_interval_ms: u64,
 }
@@ -101,6 +101,17 @@ impl RestFillDetectionService {
                         let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
                         let initial_amount: f64 = parse(&order.initial_amount).unwrap_or(0.0);
                         let price: f64 = parse(&order.price).unwrap_or(0.0);
+
+                        // Validate parsed values - malformed API data could cause silent fill misses
+                        if (filled_amount > 0.0 || initial_amount > 0.0) && price <= 0.0 {
+                            warn!(
+                                "{} {} Malformed order data: filled={}, initial={}, price={} (raw: '{}') - skipping",
+                                "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                "⚠".yellow().bold(),
+                                filled_amount, initial_amount, price, order.price
+                            );
+                            continue;
+                        }
 
                         // Check if there's a NEW fill (filled_amount increased since last check)
                         if filled_amount > last_known_filled_amount && filled_amount > 0.0 {
@@ -223,7 +234,7 @@ impl RestFillDetectionService {
                                     );
 
                                     // Trigger hedge (with current timestamp since REST detection detects fills retroactively)
-                                    let _ = hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now()));
+                                    let _ = hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now())).await;
                                 });
                             } else {
                                 debug!(

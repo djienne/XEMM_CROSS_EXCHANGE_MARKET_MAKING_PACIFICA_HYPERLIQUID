@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start fill detection client in background
     let fill_detection_config = FillDetectionConfig {
+        enable_position_fill_detection: true,
         account: credentials.account.clone(),
         reconnect_attempts: 5,
         ping_interval_secs: 30,
@@ -182,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
                     info!("");
                     *fill_received_clone.lock().unwrap() = true;
                 }
+                xemm_rust::connector::pacifica::FillEvent::PositionFill { .. } => {}
             }
         }).await.ok();
     });
@@ -190,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     sleep(Duration::from_secs(2)).await;
 
     // Place the order
-    let mut trading_client = PacificaTrading::new(credentials);
+    let mut trading_client = PacificaTrading::new(credentials).unwrap();
 
     info!("Placing order...");
     let order = trading_client.place_limit_order(

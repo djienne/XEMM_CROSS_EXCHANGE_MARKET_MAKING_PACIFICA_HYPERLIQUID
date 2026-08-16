@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     info!("[PACIFICA] Loaded credentials for account: {}", credentials.account);
 
     // Create trading client (mainnet)
-    let mut trading_client = PacificaTrading::new(credentials);
+    let mut trading_client = PacificaTrading::new(credentials).unwrap();
 
     // Create orderbook client to get current prices
     let orderbook_config = OrderbookConfig {

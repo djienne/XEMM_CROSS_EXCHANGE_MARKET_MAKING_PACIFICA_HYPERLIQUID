@@ -125,7 +125,6 @@ pub fn log_trade(file_path: &str, record: &TradeRecord) -> Result<()> {
 
     // Open file in append mode (create if doesn't exist)
     let file = OpenOptions::new()
-        .write(true)
         .create(true)
         .append(true)
         .open(path)

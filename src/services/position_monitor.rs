@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -12,6 +11,7 @@ use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
+use crate::util::bounded_set::BoundedSet;
 
 /// Position-based fill detection service (4th layer - ground truth)
 ///
@@ -20,11 +20,11 @@ use crate::strategy::OrderSide;
 /// a fill definitely occurred regardless of WebSocket/REST/order status detection.
 pub struct PositionMonitorService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<Mutex<BoundedSet>>,
     pub last_position_snapshot: Arc<Mutex<Option<PositionSnapshot>>>,
 }
 
@@ -275,7 +275,7 @@ impl PositionMonitorService {
                             );
 
                             // Trigger hedge (with current timestamp since position monitor detects fills retroactively)
-                            let _ = self.hedge_tx.send((order_side, fill_size, estimated_price, std::time::Instant::now()));
+                            let _ = self.hedge_tx.send((order_side, fill_size, estimated_price, std::time::Instant::now())).await;
                         } else {
                             debug!("[POSITION_MONITOR] Fill already processed by another detection method");
                         }

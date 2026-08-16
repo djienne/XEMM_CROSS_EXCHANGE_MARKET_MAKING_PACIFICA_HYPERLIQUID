@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
+
+use crate::util::atomic_price::{AtomicPricePair, AtomicInstant};
+use crate::util::bounded_set::BoundedSet;
 
 use crate::bot::{ActiveOrder, BotState, BotStatus};
 use crate::config::Config;
@@ -52,24 +53,27 @@ pub struct XemmBot {
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
 
-    // Shared state (prices)
-    pub pacifica_prices: Arc<Mutex<(f64, f64)>>, // (bid, ask)
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>, // (bid, ask)
+    // Shared state (lock-free prices)
+    pub pacifica_prices: Arc<AtomicPricePair>,
+    pub hyperliquid_prices: Arc<AtomicPricePair>,
 
     // Opportunity evaluator
     pub evaluator: OpportunityEvaluator,
 
-    // Fill tracking state
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    // Fill tracking state (bounded to prevent unbounded memory growth)
+    pub processed_fills: Arc<parking_lot::Mutex<BoundedSet>>,
     pub last_position_snapshot: Arc<parking_lot::Mutex<Option<PositionSnapshot>>>,
 
     // Order monitor state (lock-free)
     pub atomic_status: Arc<AtomicU8>,
     pub order_snapshot: Arc<SharedOrderSnapshot>,
 
-    // Channels
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
-    pub hedge_rx: Option<mpsc::UnboundedReceiver<HedgeEvent>>,
+    // Lock-free grace period timestamp
+    pub last_cancellation_time: Arc<AtomicInstant>,
+
+    // Channels (bounded to apply backpressure if hedge executor stalls)
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
+    pub hedge_rx: Option<mpsc::Receiver<HedgeEvent>>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub shutdown_rx: Option<mpsc::Receiver<()>>,
 
@@ -268,21 +272,21 @@ impl XemmBot {
             "Opportunity evaluator created".green()
         );
 
-        // Shared state for orderbook prices
-        let pacifica_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
-        let hyperliquid_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
+        // Shared state for orderbook prices (lock-free)
+        let pacifica_prices = Arc::new(AtomicPricePair::new());
+        let hyperliquid_prices = Arc::new(AtomicPricePair::new());
 
         // Shared bot state
         let bot_state = Arc::new(RwLock::new(BotState::new()));
 
         // Channels for communication
-        // Unbounded hedge event queue: producers never block when enqueueing,
-        // hedge executor processes events sequentially.
-        let (hedge_tx, hedge_rx) = mpsc::unbounded_channel::<HedgeEvent>(); // (side, size, avg_price, fill_timestamp)
+        // Bounded hedge event queue: applies backpressure if hedge executor stalls,
+        // preventing unbounded memory growth during API timeouts.
+        let (hedge_tx, hedge_rx) = mpsc::channel::<HedgeEvent>(32);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
-        // Fill tracking state
-        let processed_fills = Arc::new(parking_lot::Mutex::new(HashSet::<String>::new()));
+        // Fill tracking state (bounded to 500 entries to prevent memory leak over long runs)
+        let processed_fills = Arc::new(parking_lot::Mutex::new(BoundedSet::new(500)));
         let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
 
         info!("{} {}",
@@ -294,6 +298,7 @@ impl XemmBot {
         // Initialize order monitor state
         let atomic_status = Arc::new(AtomicU8::new(AtomicBotStatus::Idle as u8));
         let order_snapshot = Arc::new(SharedOrderSnapshot::new());
+        let last_cancellation_time = Arc::new(AtomicInstant::new());
 
         Ok(XemmBot {
             config,
@@ -313,6 +318,7 @@ impl XemmBot {
             last_position_snapshot,
             atomic_status,
             order_snapshot,
+            last_cancellation_time,
             hedge_tx,
             hedge_rx: Some(hedge_rx),
             shutdown_tx,
@@ -368,8 +374,10 @@ impl XemmBot {
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             baseline_updater,
+            min_hedge_notional: self.config.min_hedge_notional_usd,
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
+            last_cancellation_time: self.last_cancellation_time.clone(),
         };
         tokio::spawn(async move {
             fill_service.run().await;
@@ -410,7 +418,7 @@ impl XemmBot {
             pacifica_ws_trading: self.pacifica_ws_trading.clone(),
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
-            min_hedge_notional: 10.0,
+            min_hedge_notional: self.config.min_hedge_notional_usd,
             poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
         };
         tokio::spawn(async move {
@@ -448,6 +456,7 @@ impl XemmBot {
             self.evaluator.clone(),
             self.pacifica_trading_monitor.clone(),
             self.hyperliquid_trading.clone(),
+            self.last_cancellation_time.clone(),
         );
         let order_monitor_service = Arc::new(order_monitor_service);
         spawn_monitor_tasks(order_monitor_service, cancel_rx);
@@ -475,12 +484,12 @@ impl XemmBot {
         );
         info!("");
 
-        let mut eval_interval = interval(Duration::from_millis(1));
+        let mut eval_interval = interval(Duration::from_millis(50));
         let mut order_placement_rate_limit = RateLimitTracker::new();
 
         let sigint = signal::ctrl_c();
         tokio::pin!(sigint);
-        
+
         #[cfg(unix)]
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("Failed to setup SIGTERM handler");
@@ -515,22 +524,25 @@ impl XemmBot {
                 }
 
                 _ = eval_interval.tick() => {
-                    // Check if we should exit
-                    let state = self.bot_state.read().await;
-                    if state.is_terminal() {
+                    // ── Lock-free status checks (no RwLock) ──
+                    let status = self.atomic_status.load(Ordering::Acquire);
+
+                    // Check if we should exit (terminal states)
+                    if status == AtomicBotStatus::Complete as u8
+                        || status == AtomicBotStatus::Error as u8
+                    {
                         break;
                     }
 
                     // Only evaluate if idle
-                    if !state.is_idle() {
+                    if status != AtomicBotStatus::Idle as u8 {
                         continue;
                     }
 
-                    // Check grace period
-                    if !state.grace_period_elapsed(3) {
+                    // Check grace period (lock-free)
+                    if !self.last_cancellation_time.has_elapsed(self.config.grace_period_secs) {
                         continue;
                     }
-                    drop(state);
 
                     // Check rate limit backoff
                     if order_placement_rate_limit.should_skip() {
@@ -541,12 +553,15 @@ impl XemmBot {
                         continue;
                     }
 
-                    // Get current prices
-                    let (pac_bid, pac_ask) = *self.pacifica_prices.lock();
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+                    // Get current prices (lock-free SeqLock reads)
+                    let (pac_bid, pac_ask) = self.pacifica_prices.load();
+                    let (hl_bid, hl_ask) = self.hyperliquid_prices.load();
 
-                    // Validate prices
+                    // Validate prices (zero or inverted spreads indicate stale/corrupt data)
                     if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {
+                        continue;
+                    }
+                    if pac_bid > pac_ask || hl_bid > hl_ask {
                         continue;
                     }
 
@@ -564,9 +579,15 @@ impl XemmBot {
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
 
                     if let Some(opp) = best_opp {
-                        // Double-check bot is still idle
-                        let mut state = self.bot_state.write().await;
-                        if !state.is_idle() {
+                        // ── CAS guard: atomically claim Idle -> OrderPlaced ──
+                        // If another task changed the status during our evaluation,
+                        // the CAS fails and we skip this opportunity safely.
+                        if self.atomic_status.compare_exchange(
+                            AtomicBotStatus::Idle as u8,
+                            AtomicBotStatus::OrderPlaced as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ).is_err() {
                             continue;
                         }
 
@@ -595,6 +616,9 @@ impl XemmBot {
                             OrderSide::Sell => PacificaOrderSide::Sell,
                         };
 
+                        // ── REST call with NO lock held ──
+                        // The CAS above set atomic_status to OrderPlaced, preventing
+                        // any other task from placing orders. No RwLock needed.
                         match self.pacifica_trading_main
                             .place_limit_order(
                                 &self.config.symbol,
@@ -633,10 +657,14 @@ impl XemmBot {
                                         placed_at: Instant::now(),
                                     };
 
-                                    state.set_active_order(active_order);
+                                    // Brief write lock ONLY to update BotState after successful REST call
+                                    {
+                                        let mut state = self.bot_state.write().await;
+                                        state.set_active_order(active_order);
+                                        // atomic_status is already OrderPlaced from CAS above
+                                        sync_atomic_status(&self.atomic_status, &state.status);
+                                    }
 
-                                    // Sync atomic status and order snapshot for order monitor
-                                    sync_atomic_status(&self.atomic_status, &state.status);
                                     update_order_snapshot(
                                         &self.order_snapshot,
                                         opp.direction,
@@ -649,9 +677,14 @@ impl XemmBot {
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
                                         "✗".red().bold()
                                     );
+                                    // Revert atomic status back to Idle since we can't track this order
+                                    self.atomic_status.store(AtomicBotStatus::Idle as u8, Ordering::Release);
                                 }
                             }
                             Err(e) => {
+                                // REST call failed - revert atomic status back to Idle
+                                self.atomic_status.store(AtomicBotStatus::Idle as u8, Ordering::Release);
+
                                 if is_rate_limit_error(&e) {
                                     order_placement_rate_limit.record_error();
                                     let backoff_secs = order_placement_rate_limit.get_backoff_secs();

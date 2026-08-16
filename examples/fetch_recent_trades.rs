@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     println!();
 
     // Initialize trading clients
-    let pacifica_trading = Arc::new(Mutex::new(PacificaTrading::new(pacifica_creds.clone())));
+    let pacifica_trading = Arc::new(PacificaTrading::new(pacifica_creds.clone()).unwrap());
     let hyperliquid_trading = HyperliquidTrading::new(hyperliquid_creds.clone(), false)?;
 
     // ═══════════════════════════════════════════════════
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     println!("{} {}", "[PACIFICA]".magenta().bold(), "Finding most recent trade...");
     println!();
 
-    let (client_order_id, pacifica_timestamp) = match pacifica_trading.lock().await.get_trade_history(Some(symbol), Some(5), None, None).await {
+    let (client_order_id, pacifica_timestamp) = match pacifica_trading.get_trade_history(Some(symbol), Some(5), None, None).await {
         Ok(trades) => {
             if trades.is_empty() {
                 println!("{} No Pacifica trades found for {}", "⚠".yellow().bold(), symbol.bright_white().bold());
@@ -68,10 +68,7 @@ async fn main() -> Result<()> {
 
             let most_recent = &trades[0];
             println!("{} Found most recent trade:", "✓".green().bold());
-            println!("  Client Order ID: {}...{}",
-                &most_recent.client_order_id[..8],
-                &most_recent.client_order_id[most_recent.client_order_id.len()-4..]
-            );
+            println!("  Client Order ID: {}", most_recent.client_order_id.as_deref().unwrap_or("None"));
             println!("  Price:           {}", format!("${}", most_recent.entry_price).cyan());
             println!("  Amount:          {} {}", most_recent.amount.bright_white(), symbol);
             println!("  Fee:             {}", format!("${}", most_recent.fee).yellow());
@@ -82,7 +79,7 @@ async fn main() -> Result<()> {
             println!("  Time:            {}", time_str);
             println!();
 
-            (most_recent.client_order_id.clone(), most_recent.created_at)
+            (most_recent.client_order_id.clone().unwrap_or_default(), most_recent.created_at)
         }
         Err(e) => {
             println!("{} Failed to fetch Pacifica trades: {}", "✗".red().bold(), e);
@@ -107,10 +104,10 @@ async fn main() -> Result<()> {
     ).await;
 
     // Show details of matched Pacifica fills (MAKER ONLY)
-    if let Ok(trades) = pacifica_trading.lock().await.get_trade_history(Some(symbol), Some(20), None, None).await {
+    if let Ok(trades) = pacifica_trading.get_trade_history(Some(symbol), Some(20), None, None).await {
         // First, show ALL fills with this client_order_id for debugging
         let all_matching: Vec<_> = trades.iter()
-            .filter(|t| &t.client_order_id == &client_order_id)
+            .filter(|t| t.client_order_id.as_ref() == Some(&client_order_id))
             .collect();
 
         if !all_matching.is_empty() {
@@ -132,7 +129,7 @@ async fn main() -> Result<()> {
         // Now filter to only MAKER fills
         let matching_trades: Vec<_> = trades.iter()
             .filter(|t| {
-                &t.client_order_id == &client_order_id &&
+                t.client_order_id.as_ref() == Some(&client_order_id) &&
                 t.event_type == "fulfill_maker"
             })
             .collect();
@@ -372,7 +369,7 @@ async fn main() -> Result<()> {
         println!();
 
         // Get the side from most recent Pacifica trade to determine direction
-        let pac_side = pacifica_trading.lock().await
+        let pac_side = pacifica_trading
             .get_trade_history(Some(symbol), Some(1), None, None).await
             .ok()
             .and_then(|trades| trades.first().map(|t| t.side.clone()));

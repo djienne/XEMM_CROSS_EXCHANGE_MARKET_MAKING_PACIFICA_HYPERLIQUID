@@ -436,7 +436,7 @@ impl HyperliquidTrading {
             action,
             nonce,
             signature,
-            vaultAddress: None,
+            vault_address: None,
         })
     }
 

@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         .context("Failed to load Pacifica credentials from environment")?;
 
     // Create trading client
-    let mut trading = PacificaTrading::new(credentials.clone());
+    let mut trading = PacificaTrading::new(credentials.clone()).unwrap();
     info!("[TEST] Trading client initialized");
 
     // Get market info

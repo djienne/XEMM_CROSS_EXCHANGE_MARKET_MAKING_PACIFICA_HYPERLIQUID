@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     println!("{} Hyperliquid wallet: {}", "[INIT]".cyan().bold(), hl_wallet.bright_white());
 
     // Initialize trading clients
-    let pac_trading = PacificaTrading::new(pac_credentials);
+    let pac_trading = PacificaTrading::new(pac_credentials).unwrap();
     let hl_trading = HyperliquidTrading::new(hl_credentials, false)
         .context("Failed to create Hyperliquid trading client")?;
 
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
 
     // Fetch positions from both exchanges
     println!("{} Fetching positions from Pacifica...", "[CHECK]".magenta().bold());
-    let pac_positions = pac_trading.get_positions(target_symbol.as_deref()).await
+    let pac_positions = pac_trading.get_positions().await
         .context("Failed to fetch Pacifica positions")?;
     println!("{} {} Found {} Pacifica position(s)",
         "[CHECK]".magenta().bold(),
@@ -285,25 +285,27 @@ async fn main() -> Result<()> {
                 );
 
                 // Extract fill price from response
-                if let Some(status) = response.response.data.statuses.first() {
-                    match status {
-                        xemm_rust::connector::hyperliquid::OrderStatus::Filled { filled } => {
-                            let avg_px: f64 = filled.avgPx.parse().unwrap_or(0.0);
-                            let total_sz: f64 = filled.totalSz.parse().unwrap_or(0.0);
-                            println!("  Fill: {} {} @ ${:.4}",
-                                if is_buy { "BOUGHT".green() } else { "SOLD".red() },
-                                format!("{:.4}", total_sz).bright_white(),
-                                avg_px
-                            );
+                if let xemm_rust::connector::hyperliquid::OrderResponseContent::Success(success_data) = &response.response {
+                    if let Some(status) = success_data.data.statuses.first() {
+                        match status {
+                            xemm_rust::connector::hyperliquid::OrderStatus::Filled { filled } => {
+                                let avg_px: f64 = filled.avg_px.parse().unwrap_or(0.0);
+                                let total_sz: f64 = filled.total_sz.parse().unwrap_or(0.0);
+                                println!("  Fill: {} {} @ ${:.4}",
+                                    if is_buy { "BOUGHT".green() } else { "SOLD".red() },
+                                    format!("{:.4}", total_sz).bright_white(),
+                                    avg_px
+                                );
+                            }
+                            xemm_rust::connector::hyperliquid::OrderStatus::Error { error } => {
+                                println!("{} {} Order failed: {}",
+                                    "[REBALANCE]".bright_yellow().bold(),
+                                    "✗".red().bold(),
+                                    error.red()
+                                );
+                            }
+                            _ => {}
                         }
-                        xemm_rust::connector::hyperliquid::OrderStatus::Error { error } => {
-                            println!("{} {} Order failed: {}",
-                                "[REBALANCE]".bright_yellow().bold(),
-                                "✗".red().bold(),
-                                error.red()
-                            );
-                        }
-                        _ => {}
                     }
                 }
 

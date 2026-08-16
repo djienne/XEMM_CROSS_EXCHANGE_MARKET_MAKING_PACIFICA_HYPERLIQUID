@@ -67,8 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let hyperliquid_config = HyperliquidConfig {
         coin: config.symbol.clone(),
         reconnect_attempts: config.reconnect_attempts,
-        ping_interval_secs: config.ping_interval_secs,
-        request_interval_ms: 50,  // Request every 50ms (20 Hz)
+        ping_interval_secs: config.ping_interval_secs,  // Request every 50ms (20 Hz)
     };
 
     let mut hyperliquid_client = HyperliquidClient::new(hyperliquid_config)?;

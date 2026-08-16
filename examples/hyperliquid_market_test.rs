@@ -52,7 +52,6 @@ async fn main() -> anyhow::Result<()> {
         coin: "ENA".to_string(),
         reconnect_attempts: 5,
         ping_interval_secs: 30,
-        request_interval_ms: 100,
     };
 
     let mut orderbook_client = OrderbookClient::new(orderbook_config)?;

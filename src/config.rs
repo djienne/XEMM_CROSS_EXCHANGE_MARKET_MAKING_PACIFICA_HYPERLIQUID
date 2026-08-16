@@ -66,6 +66,14 @@ pub struct Config {
     /// Used by REST fill detection to poll more frequently when an order is active.
     #[serde(default = "default_pacifica_active_order_rest_poll_interval")]
     pub pacifica_active_order_rest_poll_interval_ms: u64,
+
+    /// Grace period in seconds after order completion before evaluating new opportunities.
+    #[serde(default = "default_grace_period_secs")]
+    pub grace_period_secs: u64,
+
+    /// Minimum hedge notional in USD. Partial fills below this threshold are skipped.
+    #[serde(default = "default_min_hedge_notional_usd")]
+    pub min_hedge_notional_usd: f64,
 }
 
 // Default values
@@ -125,6 +133,14 @@ fn default_pacifica_active_order_rest_poll_interval() -> u64 {
     500 // 500 ms (safer than 100ms to avoid rate limits)
 }
 
+fn default_grace_period_secs() -> u64 {
+    3
+}
+
+fn default_min_hedge_notional_usd() -> f64 {
+    10.0
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -143,6 +159,8 @@ impl Default for Config {
             hyperliquid_use_ws_for_hedge: default_hyperliquid_use_ws_for_hedge(),
             pacifica_rest_poll_interval_secs: default_pacifica_rest_poll_interval(),
             pacifica_active_order_rest_poll_interval_ms: default_pacifica_active_order_rest_poll_interval(),
+            grace_period_secs: default_grace_period_secs(),
+            min_hedge_notional_usd: default_min_hedge_notional_usd(),
         }
     }
 }

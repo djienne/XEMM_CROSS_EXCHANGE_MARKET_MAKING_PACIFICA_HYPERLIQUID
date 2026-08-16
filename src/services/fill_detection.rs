@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn, error};
@@ -12,20 +11,23 @@ use crate::connector::pacifica::{
 };
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
+use crate::util::bounded_set::BoundedSet;
 use crate::util::cancel::dual_cancel;
 
 /// WebSocket-based fill detection service (primary fill detection method)
 pub struct FillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
+    pub hedge_tx: mpsc::Sender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub fill_config: FillDetectionConfig,
     pub symbol: String,
-    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<BoundedSet>>,
     pub baseline_updater: PositionBaselineUpdater,
+    pub min_hedge_notional: f64,
     pub atomic_status: Arc<std::sync::atomic::AtomicU8>,
     pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
+    pub last_cancellation_time: Arc<crate::util::atomic_price::AtomicInstant>,
 }
 
 impl FillDetectionService {
@@ -52,8 +54,10 @@ impl FillDetectionService {
         let symbol = self.symbol.clone();
         let processed_fills = self.processed_fills.clone();
         let baseline_updater = self.baseline_updater.clone();
+        let min_hedge_notional = self.min_hedge_notional;
         let atomic_status = self.atomic_status.clone();
         let order_snapshot = self.order_snapshot.clone();
+        let last_cancellation_time = self.last_cancellation_time.clone();
 
         fill_client
             .start(move |fill_event| {
@@ -196,7 +200,7 @@ impl FillDetectionService {
                                 );
 
                                 // Trigger hedge immediately (runs in parallel with background cancellation)
-                                let _ = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start));
+                                let _ = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start)).await;
                             }
                         });
                     }
@@ -213,6 +217,7 @@ impl FillDetectionService {
                         let cloid = client_order_id.clone();
                         let atomic_status_clone = atomic_status.clone();
                         let order_snapshot_clone = order_snapshot.clone();
+                        let last_cancel_clone = last_cancellation_time.clone();
 
                         tokio::spawn(async move {
                             let mut state = bot_state_clone.write().await;
@@ -233,6 +238,8 @@ impl FillDetectionService {
                                         // Sync atomic status and clear order snapshot
                                         crate::services::order_monitor::sync_atomic_status(&atomic_status_clone, &state.status);
                                         order_snapshot_clone.set(None);
+                                        // Update lock-free grace period timestamp
+                                        last_cancel_clone.set_now();
                                         debug!("[BOT] Active order cancelled, returning to Idle");
                                     }
                                     BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
@@ -282,13 +289,14 @@ impl FillDetectionService {
                             format!("${:.2}", notional_value).cyan().bold()
                         );
 
-                        // Only hedge if notional value > $10
-                        if notional_value > 10.0 {
+                        // Only hedge if notional value exceeds threshold
+                        if notional_value > min_hedge_notional {
                             info!(
-                                "{} {} Partial fill notional ${:.2} > $10.00 threshold, initiating hedge",
+                                "{} {} Partial fill notional ${:.2} > ${:.2} threshold, initiating hedge",
                                 "[FILL_DETECTION]".magenta().bold(),
                                 "✓".green().bold(),
-                                notional_value
+                                notional_value,
+                                min_hedge_notional
                             );
 
                             // Spawn async task to handle the partial fill (same as full fill)
@@ -408,15 +416,16 @@ impl FillDetectionService {
                                     );
 
                                     // Trigger hedge immediately (runs in parallel with background cancellation)
-                                    let _ = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start));
+                                    let _ = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start)).await;
                                 }
                             });
                         } else {
                             info!(
-                                "{} {} Partial fill notional ${:.2} < $10.00 threshold, skipping hedge",
+                                "{} {} Partial fill notional ${:.2} < ${:.2} threshold, skipping hedge",
                                 "[FILL_DETECTION]".magenta().bold(),
                                 "→".bright_black(),
-                                notional_value
+                                notional_value,
+                                min_hedge_notional
                             );
                         }
                     }

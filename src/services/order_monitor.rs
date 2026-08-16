@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
 use crate::strategy::{OpportunityEvaluator, OrderSide};
+use crate::util::atomic_price::{AtomicInstant, AtomicPricePair};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 // ============================================================================
@@ -26,6 +27,7 @@ pub enum AtomicBotStatus {
     Filled = 2,
     Hedging = 3,
     Complete = 4,
+    Error = 5,
 }
 
 impl From<&BotStatus> for AtomicBotStatus {
@@ -36,7 +38,7 @@ impl From<&BotStatus> for AtomicBotStatus {
             BotStatus::Filled => AtomicBotStatus::Filled,
             BotStatus::Hedging => AtomicBotStatus::Hedging,
             BotStatus::Complete => AtomicBotStatus::Complete,
-            BotStatus::Error(_) => AtomicBotStatus::Idle, // Treat errors as idle for monitoring purposes
+            BotStatus::Error(_) => AtomicBotStatus::Error,
         }
     }
 }
@@ -118,9 +120,9 @@ pub struct OrderMonitorService {
     // Lightweight order snapshot (updated when order placed)
     pub order_snapshot: Arc<SharedOrderSnapshot>,
     
-    // Price feeds (lock-free reads via parking_lot)
-    pub pacifica_prices: Arc<Mutex<(f64, f64)>>,
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+    // Price feeds (lock-free reads via SeqLock atomics)
+    pub pacifica_prices: Arc<AtomicPricePair>,
+    pub hyperliquid_prices: Arc<AtomicPricePair>,
     
     // Configuration
     pub config: Config,
@@ -129,7 +131,10 @@ pub struct OrderMonitorService {
     // Trading connectors (only used by cancellation task)
     pub pacifica_trading: Arc<PacificaTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
-    
+
+    // Lock-free grace period timestamp (shared with main loop)
+    pub last_cancellation_time: Arc<AtomicInstant>,
+
     // Channel for cancel requests (decouples hot path from I/O)
     pub cancel_tx: mpsc::Sender<CancelRequest>,
 }
@@ -140,16 +145,17 @@ impl OrderMonitorService {
         bot_state: Arc<RwLock<BotState>>,
         atomic_status: Arc<AtomicU8>,
         order_snapshot: Arc<SharedOrderSnapshot>,
-        pacifica_prices: Arc<Mutex<(f64, f64)>>,
-        hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+        pacifica_prices: Arc<AtomicPricePair>,
+        hyperliquid_prices: Arc<AtomicPricePair>,
         config: Config,
         evaluator: OpportunityEvaluator,
         pacifica_trading: Arc<PacificaTrading>,
         hyperliquid_trading: Arc<HyperliquidTrading>,
+        last_cancellation_time: Arc<AtomicInstant>,
     ) -> (Self, mpsc::Receiver<CancelRequest>) {
         // Bounded channel to prevent unbounded growth, but large enough to not block
         let (cancel_tx, cancel_rx) = mpsc::channel(64);
-        
+
         let service = Self {
             bot_state,
             atomic_status,
@@ -160,6 +166,7 @@ impl OrderMonitorService {
             evaluator,
             pacifica_trading,
             hyperliquid_trading,
+            last_cancellation_time,
             cancel_tx,
         };
         
@@ -192,8 +199,8 @@ impl OrderMonitorService {
                 None => continue,
             };
 
-            // Get prices (parking_lot mutex is very fast for uncontended case)
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+            // Get prices (lock-free SeqLock read)
+            let (hl_bid, hl_ask) = self.hyperliquid_prices.load();
             if hl_bid == 0.0 || hl_ask == 0.0 {
                 continue;
             }
@@ -306,13 +313,15 @@ impl OrderMonitorService {
             match self.pacifica_trading.cancel_all_orders(false, Some(symbol), false).await {
                 Ok(_) => {
                     rate_limit.record_success();
-                    
+
                     // Clear state only if still in OrderPlaced
                     let mut state = self.bot_state.write().await;
                     if matches!(state.status, BotStatus::OrderPlaced) {
                         state.clear_active_order();
                         self.atomic_status.store(AtomicBotStatus::Idle as u8, Ordering::Release);
                         self.order_snapshot.set(None);
+                        // Update lock-free grace period timestamp
+                        self.last_cancellation_time.set_now();
                     }
                     drop(state);
 
@@ -353,7 +362,7 @@ impl OrderMonitorService {
                 None => continue,
             };
 
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+            let (hl_bid, hl_ask) = self.hyperliquid_prices.load();
             if hl_bid == 0.0 || hl_ask == 0.0 {
                 continue;
             }
@@ -422,12 +431,12 @@ impl OrderMonitorService {
         let (pac_result, hl_result) = tokio::join!(pac_future, hl_future);
 
         if let Ok(Some((bid, ask))) = pac_result {
-            *self.pacifica_prices.lock() = (bid, ask);
+            self.pacifica_prices.store(bid, ask);
             debug!("[REFRESH] Pacifica: bid=${:.6}, ask=${:.6}", bid, ask);
         }
 
         if let Ok(Some((bid, ask))) = hl_result {
-            *self.hyperliquid_prices.lock() = (bid, ask);
+            self.hyperliquid_prices.store(bid, ask);
             debug!("[REFRESH] Hyperliquid: bid=${:.6}, ask=${:.6}", bid, ask);
         }
     }
@@ -468,6 +477,92 @@ pub fn update_order_snapshot(
         initial_profit_bps,
         placed_at: Instant::now(),
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_atomic_bot_status_from_all_variants() {
+        assert_eq!(AtomicBotStatus::from(&BotStatus::Idle) as u8, 0);
+        assert_eq!(AtomicBotStatus::from(&BotStatus::OrderPlaced) as u8, 1);
+        assert_eq!(AtomicBotStatus::from(&BotStatus::Filled) as u8, 2);
+        assert_eq!(AtomicBotStatus::from(&BotStatus::Hedging) as u8, 3);
+        assert_eq!(AtomicBotStatus::from(&BotStatus::Complete) as u8, 4);
+        assert_eq!(
+            AtomicBotStatus::from(&BotStatus::Error("anything".to_string())) as u8,
+            5
+        );
+    }
+
+    #[test]
+    fn test_sync_atomic_status() {
+        let atomic = AtomicU8::new(0);
+
+        let cases: Vec<(BotStatus, u8)> = vec![
+            (BotStatus::Idle, 0),
+            (BotStatus::OrderPlaced, 1),
+            (BotStatus::Filled, 2),
+            (BotStatus::Hedging, 3),
+            (BotStatus::Complete, 4),
+            (BotStatus::Error("err".to_string()), 5),
+        ];
+
+        for (status, expected) in cases {
+            sync_atomic_status(&atomic, &status);
+            assert_eq!(
+                atomic.load(Ordering::Acquire),
+                expected,
+                "Failed for {:?}",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_order_snapshot_none_on_new() {
+        let snapshot = SharedOrderSnapshot::new();
+        assert!(snapshot.get().is_none());
+    }
+
+    #[test]
+    fn test_shared_order_snapshot_set_and_get() {
+        let shared = SharedOrderSnapshot::new();
+
+        // Set a snapshot
+        let snap = OrderSnapshot {
+            side: OrderSide::Buy,
+            price: 100.5,
+            size: 2.0,
+            initial_profit_bps: 5.5,
+            placed_at: Instant::now(),
+        };
+        shared.set(Some(snap));
+
+        let got = shared.get().expect("should be Some");
+        assert_eq!(got.side, OrderSide::Buy);
+        assert_eq!(got.price, 100.5);
+        assert_eq!(got.size, 2.0);
+        assert_eq!(got.initial_profit_bps, 5.5);
+
+        // Clear it
+        shared.set(None);
+        assert!(shared.get().is_none());
+    }
+
+    #[test]
+    fn test_update_order_snapshot_helper() {
+        let shared = SharedOrderSnapshot::new();
+
+        update_order_snapshot(&shared, OrderSide::Sell, 200.0, 3.0, 7.5);
+
+        let got = shared.get().expect("should be Some after update");
+        assert_eq!(got.side, OrderSide::Sell);
+        assert_eq!(got.price, 200.0);
+        assert_eq!(got.size, 3.0);
+        assert_eq!(got.initial_profit_bps, 7.5);
+    }
 }
 
 // ============================================================================

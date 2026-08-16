@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let trading = PacificaTrading::new(credentials);
+    let trading = PacificaTrading::new(credentials).unwrap();
 
     // Test symbols to fetch
     let test_symbols = vec!["SOL", "BTC", "ETH"];

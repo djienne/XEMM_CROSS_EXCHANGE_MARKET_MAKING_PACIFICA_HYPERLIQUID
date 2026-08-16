@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use colored::Colorize;
@@ -19,6 +18,7 @@ use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::trade_fetcher;
 use crate::csv_logger;
+use crate::util::atomic_price::AtomicPricePair;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
@@ -40,8 +40,8 @@ type WsRead = futures_util::stream::SplitStream<WsStream>;
 /// 9. Mark cycle complete and signal shutdown
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_rx: mpsc::UnboundedReceiver<HedgeEvent>,
-    pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+    pub hedge_rx: mpsc::Receiver<HedgeEvent>,
+    pub hyperliquid_prices: Arc<AtomicPricePair>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub pacifica_trading: Arc<PacificaTrading>,
@@ -152,7 +152,7 @@ impl HedgeService {
                 OrderSide::Sell => true, // Filled sell on Pacifica → buy on Hyperliquid
             };
 
-            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock();
+            let (mut hl_bid, mut hl_ask) = self.hyperliquid_prices.load();
 
             if hl_bid <= 0.0 || hl_ask <= 0.0 {
                 warn!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
@@ -166,8 +166,7 @@ impl HedgeService {
                         Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
                             hl_bid = bid;
                             hl_ask = ask;
-                            let mut cache = self.hyperliquid_prices.lock();
-                            *cache = (bid, ask);
+                            self.hyperliquid_prices.store(bid, ask);
                             info!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✓".green().bold(),
@@ -197,10 +196,10 @@ impl HedgeService {
 
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        let cached = *self.hyperliquid_prices.lock();
+                        let cached = self.hyperliquid_prices.load();
                         hl_bid = cached.0;
                         hl_ask = cached.1;
-                        if hl_bid > 0.0 && hl_ask > 0.0 {
+                        if hl_bid > 0.0 && hl_ask > 0.0 && hl_bid <= hl_ask {
                             info!("{} {} Hyperliquid prices populated by feed during wait",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                 "✓".green().bold()
@@ -222,6 +221,22 @@ impl HedgeService {
                     self.shutdown_tx.send(()).await.ok();
                     return;
                 }
+            }
+
+            // Validate spread is not inverted (bid must be <= ask)
+            if hl_bid > hl_ask {
+                error!("{} {} Hyperliquid spread inverted (bid {} > ask {}) - aborting hedge for safety",
+                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                    "✗".red().bold(),
+                    hl_bid,
+                    hl_ask
+                );
+
+                let mut state = self.bot_state.write().await;
+                state.set_error(format!("Hyperliquid spread inverted: bid {} > ask {}", hl_bid, hl_ask));
+
+                self.shutdown_tx.send(()).await.ok();
+                return;
             }
 
             info!(
@@ -347,11 +362,11 @@ impl HedgeService {
                                 info!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✓".green().bold(),
-                                    filled.totalSz,
-                                    filled.avgPx,
+                                    filled.total_sz,
+                                    filled.avg_px,
                                     end_to_end_latency.as_secs_f64() * 1000.0
                                 );
-                                filled.avgPx.parse::<f64>().ok()
+                                filled.avg_px.parse::<f64>().ok()
                             }
                             crate::connector::hyperliquid::OrderStatus::Error { error } => {
                                 error!("{} {} Hedge order FAILED: {}",
@@ -539,19 +554,19 @@ impl HedgeService {
                         };
 
                     // Log trade to CSV file
-                    if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
+                    if let (Some(pac_price), Some(hl_price)) = (pacifica_actual_price, hl_actual_price) {
                         let trade_record = csv_logger::TradeRecord::new(
                             Utc::now(),
                             end_to_end_latency.as_secs_f64() * 1000.0,  // Convert to milliseconds
                             self.config.symbol.clone(),
                             side,
-                            pacifica_actual_price.unwrap(),
+                            pac_price,
                             size,
-                            pacifica_notional.unwrap_or(pacifica_actual_price.unwrap() * size),
+                            pacifica_notional.unwrap_or(pac_price * size),
                             pac_fee_usd,
-                            hl_actual_price.unwrap(),
+                            hl_price,
                             size,
-                            hl_notional.unwrap_or(hl_actual_price.unwrap() * size),
+                            hl_notional.unwrap_or(hl_price * size),
                             hl_fee_usd,
                             expected_profit_bps.unwrap_or(0.0),
                             actual_profit_bps,

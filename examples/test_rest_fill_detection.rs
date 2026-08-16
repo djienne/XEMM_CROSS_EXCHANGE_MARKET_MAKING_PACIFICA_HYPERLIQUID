@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     println!();
 
     // Load configuration
-    let config = Config::load().context("Failed to load configuration")?;
+    let config = Config::load_default().unwrap();
     println!("{} Configuration loaded: symbol={}, notional=${}",
         "[TEST]".bright_yellow().bold(),
         config.symbol.bright_white().bold(),
@@ -61,10 +61,10 @@ async fn main() -> Result<()> {
 
     // Initialize trading clients
     let pacifica_trading = Arc::new(tokio::sync::Mutex::new(
-        PacificaTrading::new(pacifica_credentials.clone())
+        PacificaTrading::new(pacifica_credentials.clone()).unwrap()
     ));
     let pacifica_ws_trading = Arc::new(
-        PacificaWsTrading::new(pacifica_credentials.clone())
+        PacificaWsTrading::new(pacifica_credentials.clone(), false)
     );
     let hyperliquid_trading = Arc::new(
         HyperliquidTrading::new(hyperliquid_credentials, false)?

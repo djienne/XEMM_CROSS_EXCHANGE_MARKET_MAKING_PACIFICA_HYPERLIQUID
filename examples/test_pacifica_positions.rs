@@ -43,8 +43,7 @@ async fn main() -> Result<()> {
     println!();
 
     // Create trading client
-    let trading_client = PacificaTrading::new(credentials)
-        .context("Failed to create Pacifica trading client")?;
+    let trading_client = PacificaTrading::new(credentials).unwrap();
 
     // Fetch current positions
     println!("{} Fetching positions...", "→".cyan().bold());

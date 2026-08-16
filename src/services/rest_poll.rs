@@ -1,11 +1,11 @@
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::debug;
 
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
+use crate::util::atomic_price::AtomicPricePair;
 
 /// Pacifica REST API polling service
 ///
@@ -13,7 +13,7 @@ use crate::connector::pacifica::PacificaTrading;
 /// Provides redundancy if WebSocket connection is lost or delayed.
 /// Updates shared price state at configured interval.
 pub struct PacificaRestPollService {
-    pub prices: Arc<Mutex<(f64, f64)>>,
+    pub prices: Arc<AtomicPricePair>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub symbol: String,
     pub agg_level: u32,
@@ -30,8 +30,7 @@ impl PacificaRestPollService {
 
             match self.pacifica_trading.get_best_bid_ask_rest(&self.symbol, self.agg_level).await {
                 Ok(Some((bid, ask))) => {
-                    // Update shared orderbook prices
-                    *self.prices.lock() = (bid, ask);
+                    self.prices.store(bid, ask);
                     debug!(
                         "[PACIFICA_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
                         bid, ask
@@ -54,7 +53,7 @@ impl PacificaRestPollService {
 /// Provides redundancy if WebSocket connection is lost or delayed.
 /// Updates shared price state at configured interval (typically 2s).
 pub struct HyperliquidRestPollService {
-    pub prices: Arc<Mutex<(f64, f64)>>,
+    pub prices: Arc<AtomicPricePair>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub symbol: String,
     pub poll_interval_secs: u64,
@@ -70,8 +69,7 @@ impl HyperliquidRestPollService {
 
             match self.hyperliquid_trading.get_l2_snapshot(&self.symbol).await {
                 Ok(Some((bid, ask))) => {
-                    // Update shared orderbook prices
-                    *self.prices.lock() = (bid, ask);
+                    self.prices.store(bid, ask);
                     debug!(
                         "[HYPERLIQUID_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
                         bid, ask

@@ -1,5 +1,5 @@
-mod connector;
-mod config;
+use xemm_rust::connector;
+use xemm_rust::config;
 
 use config::Config;
 use connector::pacifica::{OrderbookClient, OrderbookConfig};
