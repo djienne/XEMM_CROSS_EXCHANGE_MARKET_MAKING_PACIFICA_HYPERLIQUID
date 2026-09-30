@@ -239,7 +239,6 @@ impl PacificaTrading {
             .timeout(std::time::Duration::from_secs(10)) // Max 10s per request
             .connect_timeout(std::time::Duration::from_secs(5)) // Max 5s to connect
             .tcp_nodelay(true)
-            .pool_idle_timeout(None) // keep warm connections alive between calls
             .build()
             .context("Failed to build HTTP client")?;
 

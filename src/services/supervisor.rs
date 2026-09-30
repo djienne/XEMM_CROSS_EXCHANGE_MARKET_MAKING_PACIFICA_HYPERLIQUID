@@ -199,12 +199,12 @@ mod tests {
             );
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            runs.load(Ordering::Acquire) >= 2,
-            "task should have restarted after panic"
-        );
-        // The restarted (healthy) task is up, so ServiceDown is cleared.
-        assert!(!gate.is_blocked(GateReason::ServiceDown));
+        // Poll, not a fixed sleep: panic reporting (e.g. RUST_BACKTRACE=1) can
+        // take longer than the restart delay. Restarted and healthy => ServiceDown cleared.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runs.load(Ordering::Acquire) < 2 || gate.is_blocked(GateReason::ServiceDown) {
+            assert!(Instant::now() < deadline, "task should have restarted after panic");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

@@ -251,6 +251,7 @@ impl OrderbookClient {
             "subscriptionResponse" => {
                 debug!("[HYPERLIQUID] Subscription confirmed");
             }
+            "l2Book" => warn!("[HYPERLIQUID] Skipping l2Book frame that failed top-of-book parse"),
             _ => {
                 debug!("[HYPERLIQUID] Unknown channel: {}", response.channel);
             }

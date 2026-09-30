@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::types::*;
 use crate::market_rules::hyperliquid_size_floor;
@@ -105,13 +105,10 @@ impl HyperliquidTrading {
         // in seconds, not stall the serial hedge executor for the OS TCP
         // timeout (minutes). The error path treats a timeout as an uncertain
         // submit and retries with the SAME cloid, so this is idempotency-safe.
-        // pool_idle_timeout(None) keeps the warm TLS connection alive between
-        // calls (the reconciler polls every 1s, so it never actually idles).
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .connect_timeout(std::time::Duration::from_secs(2))
             .tcp_nodelay(true)
-            .pool_idle_timeout(None)
             .build()
             .context("Failed to build Hyperliquid HTTP client")?;
 
@@ -268,28 +265,24 @@ impl HyperliquidTrading {
         Ok((asset_index as u32, asset))
     }
 
-    /// Get asset ID from coin name (per-symbol cached; no universe clone).
-    pub async fn get_asset_id(&self, coin: &str) -> Result<u32> {
-        if !self.meta_stale() {
-            if let Some((cached_coin, asset_id, _)) = self.asset_cache.read().as_ref() {
-                if cached_coin == coin {
-                    return Ok(*asset_id);
+    /// `(asset_id, meta)` for `coin`, per-symbol cached. When a stale-cache
+    /// refresh fails the cached entry is reused (HL's asset list is append-only),
+    /// so a flaky `/info` call cannot fail a hedge.
+    pub async fn asset(&self, coin: &str) -> Result<(u32, AssetMeta)> {
+        let cached = match self.asset_cache.read().as_ref() {
+            Some((c, id, a)) if c == coin => Some((*id, a.clone())),
+            _ => None,
+        };
+        match (cached, self.meta_stale()) {
+            (Some(hit), false) => Ok(hit),
+            (cached, _) => match (self.refresh_asset_cache(coin).await, cached) {
+                (Err(e), Some(hit)) => {
+                    warn!("[HYPERLIQUID] Meta refresh failed; using cached {} asset: {}", coin, e);
+                    Ok(hit)
                 }
-            }
+                (r, _) => r,
+            },
         }
-        self.refresh_asset_cache(coin).await.map(|(id, _)| id)
-    }
-
-    /// Get asset metadata (szDecimals, etc.) (per-symbol cached).
-    pub async fn get_asset_info(&self, coin: &str) -> Result<AssetMeta> {
-        if !self.meta_stale() {
-            if let Some((cached_coin, _, asset)) = self.asset_cache.read().as_ref() {
-                if cached_coin == coin {
-                    return Ok(asset.clone());
-                }
-            }
-        }
-        self.refresh_asset_cache(coin).await.map(|(_, asset)| asset)
     }
 
     /// Get L2 orderbook snapshot via info endpoint
@@ -524,8 +517,7 @@ impl HyperliquidTrading {
         cloid: Option<String>,
     ) -> Result<OrderRequest> {
         // Get asset ID and metadata
-        let asset_id = self.get_asset_id(coin).await?;
-        let asset_info = self.get_asset_info(coin).await?;
+        let (asset_id, asset_info) = self.asset(coin).await?;
 
         // Check if we have bid/ask prices
         if bid.is_none() || ask.is_none() {

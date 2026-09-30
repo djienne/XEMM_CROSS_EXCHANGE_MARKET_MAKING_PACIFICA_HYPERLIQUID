@@ -245,6 +245,7 @@ impl OrderbookClient {
             Some("pong") => {
                 debug!("[PACIFICA] Received pong response");
             }
+            Some("book") => anyhow::bail!("book frame failed top-of-book parse"),
             Some(other) => {
                 debug!("[PACIFICA] Received unknown channel: {}", other);
             }

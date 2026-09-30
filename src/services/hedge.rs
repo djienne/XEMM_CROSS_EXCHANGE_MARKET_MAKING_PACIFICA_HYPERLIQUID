@@ -769,12 +769,8 @@ impl HedgeService {
                     // hedged (it floors to 0), so treat it as un-hedgeable dust: do
                     // not retry it forever, and let the position reconciler net the
                     // bounded remainder instead of wedging in Reconciling.
-                    let hl_step = match self
-                        .hyperliquid_trading
-                        .get_asset_info(&self.config.symbol)
-                        .await
-                    {
-                        Ok(info) => 10_f64.powi(-info.sz_decimals.max(0)),
+                    let hl_step = match self.hyperliquid_trading.asset(&self.config.symbol).await {
+                        Ok((_, info)) => 10_f64.powi(-info.sz_decimals.max(0)),
                         Err(_) => 0.0,
                     };
                     let unhedgeable = hedge_dust.max(hl_step);

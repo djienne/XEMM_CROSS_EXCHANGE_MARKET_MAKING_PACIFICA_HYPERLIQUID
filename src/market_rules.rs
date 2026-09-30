@@ -85,12 +85,27 @@ pub fn round_to_decimals(value: f64, decimals: usize) -> f64 {
     (value * factor).round() / factor
 }
 
+/// `value / step` of an already on-step value can land a hair off an integer in
+/// f64 (0.29 / 0.01 = 28.999…), so floor/ceil would move it a whole step. Snap
+/// within 1e-9 steps; beyond ~1e7 steps f64 error exceeds that and this
+/// degrades to plain floor/ceil.
+#[inline]
+fn steps(value: f64, step: f64) -> f64 {
+    let q = value / step;
+    let r = q.round();
+    if (q - r).abs() < 1e-9 {
+        r
+    } else {
+        q
+    }
+}
+
 #[inline]
 pub fn floor_to_step(value: f64, step: f64, decimals: usize) -> f64 {
     if step <= 0.0 || !value.is_finite() {
         return 0.0;
     }
-    let snapped = (value / step).floor() * step;
+    let snapped = steps(value, step).floor() * step;
     let r = round_to_decimals(snapped, decimals);
     // Guard: the final decimal rounding must never move the price more than half a
     // tick away from the tick-aligned value (catches a mismatched `decimals`).
@@ -106,7 +121,7 @@ pub fn ceil_to_step(value: f64, step: f64, decimals: usize) -> f64 {
     if step <= 0.0 || !value.is_finite() {
         return 0.0;
     }
-    let snapped = (value / step).ceil() * step;
+    let snapped = steps(value, step).ceil() * step;
     let r = round_to_decimals(snapped, decimals);
     debug_assert!(
         (r - snapped).abs() <= step * 0.5 + f64::EPSILON,
@@ -165,6 +180,16 @@ mod tests {
             pacifica_maker_price(OrderSide::Sell, 100.011, "0.01").unwrap(),
             100.02
         );
+    }
+
+    #[test]
+    fn on_step_values_do_not_move_a_step() {
+        for k in 1..10_000 {
+            let v = k as f64 * 0.01;
+            let expect = round_to_decimals(v, 2);
+            assert_eq!(floor_to_step(v, 0.01, 2), expect, "floor k={k}");
+            assert_eq!(ceil_to_step(v, 0.01, 2), expect, "ceil k={k}");
+        }
     }
 
     #[test]

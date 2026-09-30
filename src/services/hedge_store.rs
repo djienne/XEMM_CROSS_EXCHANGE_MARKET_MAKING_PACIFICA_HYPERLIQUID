@@ -131,33 +131,33 @@ pub fn start_lifecycle_logger(capacity: usize) {
         };
 
         while let Some(record) = rx.recv().await {
-            let line = match serde_json::to_string(&record) {
+            let mut line = match serde_json::to_string(&record) {
                 Ok(line) => line,
                 Err(e) => {
                     tracing::warn!("failed to serialize hedge lifecycle record: {}", e);
                     continue;
                 }
             };
+            line.push('\n');
+            // One write per record (no torn lines), flushed so the last record
+            // reaches the OS before process exit.
             if let Err(e) = file.write_all(line.as_bytes()).await {
                 tracing::warn!("failed to write hedge lifecycle update: {}", e);
                 continue;
             }
-            if let Err(e) = file.write_all(b"\n").await {
-                tracing::warn!("failed to write hedge lifecycle newline: {}", e);
-            }
+            let _ = file.flush().await;
         }
-        let _ = file.flush().await;
     });
 }
 
+/// No-op until `start_lifecycle_logger` runs (first thing in `XemmBot::run`), so
+/// tests and tools never write the production journal.
 pub async fn append_lifecycle_update(update: HedgeLifecycleUpdate<'_>) -> Result<()> {
-    let record = lifecycle_record(update);
-    if let Some(tx) = LIFECYCLE_LOGGER.get() {
-        tx.try_send(record)?;
+    let Some(tx) = LIFECYCLE_LOGGER.get() else {
         return Ok(());
-    }
-    append_lifecycle_line_to_path(DEFAULT_HEDGE_LIFECYCLE_PATH, serde_json::to_string(&record)?)
-        .await
+    };
+    tx.try_send(lifecycle_record(update))?;
+    Ok(())
 }
 
 /// Best-effort lifecycle write that NEVER fails the caller. Journaling is a
@@ -178,6 +178,7 @@ async fn append_lifecycle_update_to_path(
     append_lifecycle_line_to_path(path, serde_json::to_string(&lifecycle_record(update))?).await
 }
 
+#[cfg(test)]
 async fn append_lifecycle_line_to_path(path: impl AsRef<Path>, line: String) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
@@ -190,8 +191,7 @@ async fn append_lifecycle_line_to_path(path: impl AsRef<Path>, line: String) -> 
         .open(path)
         .await?;
 
-    file.write_all(line.as_bytes()).await?;
-    file.write_all(b"\n").await?;
+    file.write_all(format!("{line}\n").as_bytes()).await?;
     Ok(())
 }
 
