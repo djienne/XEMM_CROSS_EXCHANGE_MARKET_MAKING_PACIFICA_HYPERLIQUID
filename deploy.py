@@ -102,6 +102,10 @@ EXCLUDE_PATTERNS = [
     'deploy.py',
     '**/*.pyc',  # Python bytecode
     '__pycache__/',  # Python cache
+    # Runtime state lives on the host: never overwrite (or rsync --delete) the
+    # remote hedge/exposure journals or trade CSVs with local copies.
+    'data/',
+    '*_trades.csv',
     # Defense-in-depth: never ship credential-handling dev utilities to the host.
     # (The prints themselves are already scrubbed; this keeps the files off the VPS.)
     '**/verify_wallet.rs',

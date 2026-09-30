@@ -424,7 +424,7 @@ pub fn should_cancel_for_profit_drop(
 /// blocks new placement, then restarts). The profit logger is logging-only and
 /// stays best-effort.
 pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>, trade_gate: Arc<TradeGate>) {
-    // Hot path monitor (1kHz) — supervised, restartable.
+    // Hot path monitor (event-driven) — supervised, restartable.
     spawn_supervised_with_factory(
         "order_monitor",
         trade_gate,

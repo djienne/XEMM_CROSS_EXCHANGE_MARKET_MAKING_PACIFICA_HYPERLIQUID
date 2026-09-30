@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # XEMM Bot Continuous Runner (using cargo run)
-# Runs the bot in a loop using cargo run, waiting 20 seconds between cycles
-# Each cycle completes one fill + hedge, then the bot restarts
+# Restarts the bot (cargo run) 20 seconds after it exits, e.g. after a fatal
+# error. The bot itself runs cycle after cycle until stopped.
 #
 # This version rebuilds on each run (slower but picks up code changes)
 

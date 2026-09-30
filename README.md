@@ -37,7 +37,7 @@ This bot is Inspired by Hummingbot's XEMM Strategy.
 - OK **Instant Hedging** - Executes market orders on Hyperliquid after fills
 - OK **Profit Monitoring** - Tracks and cancels orders if profit deviates
 - OK **Order Refresh** - Auto-cancels stale orders based on age
-- OK **Single-cycle Mode** - Exits after one successful arbitrage cycle
+- OK **Continuous** - Returns to idle after each audited cycle and keeps quoting until Ctrl+C / SIGTERM
 
 ### Fill Detection (4 Layers)
 
@@ -97,7 +97,7 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 - OK **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
 - OK **Auto-reconnect** - Exponential backoff on connection failures
 - OK **Concurrent Tasks** - 10 async tasks running in parallel
-- OK **High-frequency Monitoring** - ~1ms (1 kHz) profit checks and opportunity evaluation (gated by quote freshness, rate limits, and run state)
+- OK **Event-driven Monitoring** - Profit checks and opportunity evaluation on every book update (5-10ms fallback tick) (gated by quote freshness, rate limits, and run state)
 - OK **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
 - OK **Graceful Shutdown** - Cancels orders on Ctrl+C
 
@@ -148,7 +148,7 @@ Edit `config.json`:
 ### 3. Run the bot
 
 ```bash
-# Run the XEMM trading bot. Warning: This will perform only one cycle (one maker order filled on Pacifica and then hedged ASAP on Hyperliquid). Use `run_bot_loop_cargo.sh` to run cycles continuously.
+# Run the XEMM trading bot. It runs cycle after cycle until Ctrl+C / SIGTERM (graceful: cancels orders, drains hedges).
 cargo run
 
 # With debug logging
@@ -215,7 +215,7 @@ The bot uses a state machine to track lifecycle:
 - **OrderPlaced** - Order placed on Pacifica, monitoring for fill
 - **Filled** - Order filled, waiting for hedge execution
 - **Hedging** - Hedge being executed on Hyperliquid
-- **Complete** - Cycle complete, bot exits
+- **Idle** again after the post-trade audit (next cycle)
 - **Error** - Unrecoverable error occurred
 
 ### Concurrent Tasks
@@ -280,9 +280,9 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 
 1. **Startup**: Cancel all existing Pacifica orders
 2. **Wait**: Gather initial orderbook data (3s warmup)
-3. **Evaluate**: Check both BUY and SELL opportunities every ~1ms (1 kHz), gated by quote freshness/rate limits/run state
+3. **Evaluate**: Check both BUY and SELL opportunities on every book update (10ms fallback tick), gated by quote freshness/rate limits/run state
 4. **Calculate & Place**: Calculate Pacifica limit price from Hyperliquid hedge price with target profit margin (`profit_rate_bps`) embedded, place order if still profitable after rounding
-5. **Monitor**: Track profit every ~1ms (1 kHz), cancel if deviation >3 bps or age >60s
+5. **Monitor**: Track profit on every book update (5ms fallback tick), cancel if deviation >3 bps or age >60s
 6. **Fill Detection**: 4-layer system detects when order fills
    - WebSocket fill detection (primary, real-time via account_order_updates)
    - REST API order polling (backup, 500ms)
@@ -293,7 +293,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 8. **Wait**: 20-second delay for trades to propagate to exchange APIs
 9. **Fetch**: Retrieve actual fill data from both exchanges with retry logic
 10. **Calculate**: Compute actual profit using real fills and fees
-11. **Complete**: Display comprehensive profit summary and exit
+11. **Complete**: Display comprehensive profit summary and return to Idle for the next cycle
 
 ## Opportunity Calculation
 
@@ -499,19 +499,19 @@ See `dashboard_js/README.md` for detailed documentation, API endpoints, and trou
 
 The repository includes bash scripts for easy deployment on Linux systems (e.g., AWS VPS):
 
-### Single Cycle (Background)
+### Background
 
-Run one complete arbitrage cycle in the background with nohup:
+Run the bot in the background with nohup:
 
 ```bash
 bash run_nohup.sh
 ```
 
-This runs the bot in the background, logs output to `output.log`, and exits after one successful fill + hedge cycle.
+This runs the bot in the background and logs output to `output.log`; it keeps running until stopped.
 
-### Continuous Loop (Multiple Cycles)
+### Restart Loop
 
-Run the bot continuously, restarting automatically after each cycle:
+Run the bot under a restart loop (restarts it whenever it exits, e.g. after a fatal error):
 
 ```bash
 bash run_bot_loop_cargo.sh
@@ -519,8 +519,7 @@ bash run_bot_loop_cargo.sh
 
 This script:
 - Runs the bot in an infinite loop
-- Waits 20 seconds between cycles
-- Automatically restarts after each successful fill + hedge
+- Waits 20 seconds before each restart
 - Rebuilds on each run (picks up code changes)
 - Shows colorized output with cycle numbers and timestamps
 - Press `Ctrl+C` to stop
@@ -561,75 +560,18 @@ cargo test --lib  # Library tests only
 
 ## Validating a Run (`verify_run.py`)
 
-`verify_run.py` (repo root, Python 3 stdlib only) is a **post-run validator**: after the bot completes a cycle it reads the captured stdout log plus the structured journals and asserts the cycle behaved correctly, exiting non-zero if anything is off. Use it as a routine post-cycle sanity check — and especially to **sign off a maker-venue migration before trading at normal size**.
+`verify_run.py` (Python 3 stdlib) checks one bot cycle after the fact: `place -> fill -> hedge` in order, a clean exit, no hard anomaly lines (panics, stuck placement, skipped shutdown exposure check, trade-history fallback), every hedge intent of this run ending `complete`/`skipped` in `data/hedge_lifecycle.jsonl`, and no `data/unresolved_exposure.jsonl` record. Journal records are scoped to the run by the log's first timestamp; missing evidence is a FAIL. Exit code `0` = PASS/WARN, `1` = FAIL.
 
-> **Why this matters for the maker abstraction.** The maker side (Pacifica) is built behind a swap point — the `MakerExchange` / `MakerFillStream` traits and the `build_maker` factory in `src/connector/maker_factory.rs` — so a new maker venue is one added arm with no service or hot-path changes; Hyperliquid stays the permanent taker. Such a change is behavior-preserving and unit-tested, but only a real cycle exercises the live WS/REST flows. There is **no testnet**: validate with **one mainnet cycle at minimum size**, bounded by the venue minimum notional and the bot's own auto-hedge/exit safety.
+Use it after any code change, with one minimum-size mainnet cycle (there is no testnet):
 
-### What it checks
-
-| Check | Source | Asserts |
-|-------|--------|---------|
-| `cycle_sequence` | stdout log | `place -> fill -> hedge received -> hedge executed`, in order |
-| `clean_exit` | stdout log | a clean shutdown was logged, not "terminated with error" |
-| `no_anomalies` | stdout log | no `panicked` / `Placement remains unknown` / `cannot auto-hedge` / unresolved-exposure lines. Recoverable signals (e.g. a retried `Hedge order FAILED`) are reported as `WARN`, not failures |
-| `hedge_lifecycle` | `data/hedge_lifecycle.jsonl` | every hedge intent reached a terminal **success**; maker/hedge sides opposite; `filled_qty ≈ size` |
-| `trade_accounting` | `<symbol>_trades.csv` | the audit row is self-consistent: opposite sides, matching sizes, fees present, `gross_pnl` recomputes from the notionals |
-| `net_neutral` | `data/unresolved_exposure.jsonl` | no unresolved-exposure record or log line |
-
-The journals are append-only and accumulate across runs, so journal checks are scoped to the most recent cycle (last ~15 min). Pass `--since-ms <epoch_ms>` to pin an exact window, or `--window-min N` to widen it.
-
-### Procedure
-
-1. **Pre-flight** — `cargo build --release` and `cargo test --lib` (expect all lib tests passing); `.env` holds credentials for **both** venues; fund both with a small buffer over the order notional.
-2. **Configure minimum size** — in `config.json`, set `order_notional_usd` to the symbol's minimum notional (startup rejects anything below it via `Config::validate`). **Keep `low_latency_mode: false`** — low-latency mode suppresses the human-readable event lines the `cycle_sequence` check reads. Optionally lower `profit_rate_bps` so a maker quote fills sooner during the test (quotes nearer break-even, a few cents of real cost — revert it afterwards).
-3. **Run one cycle and capture stdout** — the bot is single-cycle (place -> fill -> hedge -> ~20s audit -> exit):
-
+1. `config.json`: `order_notional_usd` at the symbol minimum, `low_latency_mode: false` (it suppresses the event lines the check reads).
+2. Run and capture stdout+stderr. The bot keeps quoting after a cycle, so stop it with Ctrl+C once `BOT CYCLE AUDIT COMPLETE` appears (`tee -i` survives the Ctrl+C so the shutdown lines are kept):
    ```bash
-   cargo run --release 2>&1 | tee output.log                  # bash / Linux
+   cargo run --release 2>&1 | tee -i output.log
    ```
-   ```powershell
-   cargo run --release 2>&1 | Tee-Object -FilePath output.log  # PowerShell
-   ```
+3. `python verify_run.py --log output.log`
 
-   If no fill happens within a few minutes (the market never crossed your quote), stop it and re-run — without a fill there is no cycle to validate.
-4. **Validate**:
-
-   ```bash
-   python verify_run.py --log output.log    # --symbol is auto-detected from config.json
-   ```
-   ```
-   [PASS] cycle_sequence     placed=1 fill=1 hedge_received=1 hedge_ok=1
-   [PASS] clean_exit         clean shutdown logged
-   [PASS] no_anomalies       none
-   [PASS] hedge_lifecycle    1 intent(s): 1 complete, 0 skipped
-   [PASS] trade_accounting   1 row(s) self-consistent
-   [PASS] net_neutral        no unresolved exposure
-   VERDICT: PASS
-   ```
-
-   Exit code is `0` on PASS, `1` on FAIL. **On FAIL, do not trade at larger size** — read the failing check's detail and inspect `output.log` and `data/hedge_lifecycle.jsonl`.
-
-### Optional: old-build vs new-build equivalence
-
-To answer "did the refactor change behavior?", run one cycle on each build and compare the `--json` summaries — the **event sequence + invariants**, not raw market values (which differ every run):
-
-```bash
-git checkout 31318d3 && cargo run --release 2>&1 | tee pre.log    # last pre-refactor commit
-python verify_run.py --log pre.log --json > pre.json
-git checkout master  && cargo run --release 2>&1 | tee post.log
-python verify_run.py --log post.log --json > post.json
-```
-
-Both should report `"verdict": "PASS"` with the same checks passing and comparable accounting. `verify_run.py` is committed, so it survives the checkout. Run the harness right after each cycle (or pass `--since-ms`) so the most-recent-cycle window keeps the two runs separate.
-
-### Safety / recovery
-
-The bot's existing protections cover a stuck cycle: the position reconciler retries corrective hedges, `data/unresolved_exposure.jsonl` is written on a non-neutral shutdown, and fail-closed supervisors halt quoting on a crashed critical service. If `verify_run.py` reports `net_neutral FAIL` or you see unresolved exposure, flatten before retrying:
-
-```bash
-cargo run --release --bin check_balance   # inspect positions on both venues
-cargo run --release --bin rebalance       # flatten residual exposure
-```
+On FAIL, do not trade larger size: read the failing line, `output.log` and `data/hedge_lifecycle.jsonl`, and flatten residual exposure with `cargo run --release --bin check_balance` / `--bin rebalance`.
 
 ## Terminal Output
 
@@ -671,14 +613,14 @@ The bot features colorized terminal output for easy monitoring:
 [SOL HEDGE] Executing SELL 0.1281 on Hyperliquid
 [SOL HEDGE] OK Hedge executed successfully
 ═══════════════════════════════════════════════════
-  BOT CYCLE COMPLETE!
+  BOT CYCLE AUDIT COMPLETE
 ═══════════════════════════════════════════════════
 ```
 
 ## Important Notes
 
 - **Mainnet only**: Production system, uses real funds
-- **Single-cycle**: Bot exits after one successful hedge
+- **Continuous**: Runs cycle after cycle until stopped
 - **No position accumulation**: Always hedges immediately after fill
 - **Graceful shutdown**: Ctrl+C cancels remaining orders before exit
 - **Credentials**: Never commit `.env` file to version control

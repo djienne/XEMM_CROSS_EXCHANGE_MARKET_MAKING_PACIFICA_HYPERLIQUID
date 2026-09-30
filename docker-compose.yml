@@ -52,15 +52,15 @@ services:
     # Network mode (use host network or create custom network)
     # network_mode: "host"  # Uncomment if you need host network access
     
-    # Resource limits. 2 CPUs so the WS read loops, signing, and the hedge
-    # executor never queue behind each other on a single core (latency tail).
+    # Memory limits only: a CPU limit above the host's core count makes Docker
+    # refuse to create the container. Give the bot 2+ cores where available.
+    # Before the first `up`, create ./data owned by the container user:
+    #   mkdir -p data && chown 1000:1000 data
     deploy:
       resources:
         limits:
-          cpus: '2.0'
           memory: 512M
         reservations:
-          cpus: '1.0'
           memory: 256M
 
 # Optional: Create a custom network

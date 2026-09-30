@@ -105,8 +105,8 @@ impl SafetyMonitorService {
                     .max(fallback_rules(&self.config.symbol).min_size);
                 // Order matters: assert NetExposure BEFORE clearing
                 // PositionUnknown so there is no instant where both bits are
-                // clear while net exposure exists (the 1 kHz placement loop
-                // could interleave exactly there).
+                // clear while net exposure exists (the placement loop could
+                // interleave exactly there).
                 self.trade_gate
                     .set(GateReason::NetExposure, net.abs() > effective_dust);
                 self.trade_gate.allow(GateReason::PositionUnknown);
