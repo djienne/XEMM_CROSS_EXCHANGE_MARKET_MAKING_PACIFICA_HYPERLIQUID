@@ -32,6 +32,9 @@ rust_code_collection.txt
 # CSV files
 *.csv
 
+# Runtime journals (hedge lifecycle, unresolved exposure)
+data/
+
 # Environment and Secrets
 .env
 .env.*
