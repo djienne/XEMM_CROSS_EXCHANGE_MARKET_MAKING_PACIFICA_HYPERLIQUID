@@ -224,8 +224,13 @@ impl PositionReconcilerService {
             } else {
                 None
             };
-            let limit_breach =
-                self.exposure_limit_breach(effective_net, usd_exposure, hard_unhedged_for);
+            let limit_breach = Self::exposure_limit_breach(
+                &self.config,
+                effective_net,
+                self.fill_aggregator.unknown_qty_for_side(maker_side),
+                mid_price,
+                hard_unhedged_for,
+            );
             {
                 let mut state = self.bot_state.write();
                 if limit_breach {
@@ -296,19 +301,21 @@ impl PositionReconcilerService {
         }
     }
 
+    /// Size ceilings escalate immediately, except for quarantined (unknown-hedge)
+    /// qty, which this loop repairs; the hard age ceiling bounds everything.
     fn exposure_limit_breach(
-        &self,
-        abs_base: f64,
-        usd_exposure: Option<f64>,
+        config: &Config,
+        uncovered_base: f64,
+        quarantined_base: f64,
+        mid_price: f64,
         hard_unhedged_for: Duration,
     ) -> bool {
-        // base/USD ceilings escalate immediately; the time ceiling uses the
-        // non-resettable hard clock so a sawtooth exposure cannot starve it.
-        (self.config.max_unhedged_base > 0.0 && abs_base > self.config.max_unhedged_base)
-            || usd_exposure
-                .map(|usd| self.config.max_unhedged_usd > 0.0 && usd > self.config.max_unhedged_usd)
-                .unwrap_or(false)
-            || hard_unhedged_for >= Duration::from_millis(self.config.max_unhedged_hard_ms)
+        let capped = (uncovered_base - quarantined_base).max(0.0);
+        (config.max_unhedged_base > 0.0 && capped > config.max_unhedged_base)
+            || (config.max_unhedged_usd > 0.0
+                && mid_price > 0.0
+                && capped * mid_price > config.max_unhedged_usd)
+            || hard_unhedged_for >= Duration::from_millis(config.max_unhedged_hard_ms)
     }
 
     fn should_enqueue_residual(
@@ -399,6 +406,18 @@ mod tests {
             0.01,
             Duration::from_secs(5),
         ));
+    }
+
+    #[test]
+    fn quarantined_exposure_skips_size_caps_but_not_age_cap() {
+        let cfg = Config::default();
+        let (leg, mid) = (0.13, 150.0); // ~$20 leg vs $10 / 0.05 default caps
+        let young = Duration::from_secs(1);
+        let old = Duration::from_millis(cfg.max_unhedged_hard_ms + 1);
+        let breach = PositionReconcilerService::exposure_limit_breach;
+        assert!(!breach(&cfg, leg, leg, mid, young));
+        assert!(breach(&cfg, leg, 0.0, mid, young));
+        assert!(breach(&cfg, leg, leg, mid, old));
     }
 
     #[test]

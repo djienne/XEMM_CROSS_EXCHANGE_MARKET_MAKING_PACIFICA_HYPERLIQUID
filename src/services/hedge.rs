@@ -97,10 +97,20 @@ impl HedgeService {
         let mut draining = false;
 
         loop {
+            // Checked at the loop head so every hedge outcome (they all
+            // `continue`) reaches it; the current event always finishes first.
+            if draining && self.hedge_rx.is_empty() {
+                info!(
+                    "{} {} Drain complete, exiting hedge service",
+                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
+                    "OK".green().bold()
+                );
+                let _ = self.shutdown_tx.send(()).await;
+                return;
+            }
             tokio::select! {
                 // Shutdown requested by main loop - stop accepting new events and
-                // process whatever is already queued. One tick later we'll see
-                // hedge_rx return None / empty and exit.
+                // process whatever is already queued.
                 _ = shutdown_signal.notified(), if !draining => {
                     info!(
                         "{} {} Shutdown signal received, draining {} pending hedge event(s)",
@@ -109,16 +119,6 @@ impl HedgeService {
                         self.hedge_rx.len()
                     );
                     draining = true;
-                    // If queue is empty right now, we can exit immediately.
-                    if self.hedge_rx.is_empty() {
-                        info!(
-                            "{} {} Hedge queue already empty, exiting",
-                            tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                            "OK".green().bold()
-                        );
-                        let _ = self.shutdown_tx.send(()).await;
-                        return;
-                    }
                 }
 
                 // Send periodic pings to keep WebSocket connection warm
@@ -938,6 +938,11 @@ impl HedgeService {
                                     failed_update.reason = Some(e.to_string());
                                     let _ =
                                         hedge_store::append_lifecycle_update(failed_update).await;
+                                    // A fresh cloid while this one may still have filled
+                                    // could double-hedge: leave the rest to the reconciler.
+                                    if !self.cloid_definitively_unfilled(&cloid).await {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1100,19 +1105,6 @@ impl HedgeService {
                         "WARN".yellow().bold()
                     );
                 }
-            }
-
-            // If we were asked to shut down and the queue is now empty, exit so
-            // main can finish cleanup. We intentionally finish the current event
-            // first - dropping a hedge mid-flight is worse than taking ~1s longer.
-            if draining && self.hedge_rx.is_empty() {
-                info!(
-                    "{} {} Drain complete, exiting hedge service",
-                    tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
-                    "OK".green().bold()
-                );
-                let _ = self.shutdown_tx.send(()).await;
-                return;
             }
                 } // Close Some((side, size, avg_price, fill_timestamp)) arm
             } // Close tokio::select!

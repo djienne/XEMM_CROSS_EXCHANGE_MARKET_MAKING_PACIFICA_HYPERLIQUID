@@ -1300,7 +1300,7 @@ impl XemmBot {
         );
         self.hedge_shutdown_signal.notify_one();
 
-        // Wait up to 5 s for the hedge service to either signal `shutdown_tx`
+        // Wait up to `shutdown_drain_timeout_secs` for the hedge service to either signal `shutdown_tx`
         // (normal exit path) or timeout. We tolerate the timeout to avoid hanging
         // the process indefinitely if something is stuck on the Hyperliquid side.
         // Track whether the hedge service actually finished draining. If it only

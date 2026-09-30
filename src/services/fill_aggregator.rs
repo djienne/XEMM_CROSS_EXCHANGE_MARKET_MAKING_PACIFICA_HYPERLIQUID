@@ -477,6 +477,16 @@ impl FillAggregator {
             .sum()
     }
 
+    /// Unknown-settled (quarantined) hedge qty for maker fills of `maker_side`.
+    pub fn unknown_qty_for_side(&self, maker_side: OrderSide) -> f64 {
+        self.inner
+            .lock()
+            .values()
+            .filter(|state| state.side == maker_side)
+            .map(|state| state.unverified_unknown_qty)
+            .sum()
+    }
+
     /// Current accumulator count (diagnostic / test use).
     pub fn len(&self) -> usize {
         self.inner.lock().len()
@@ -680,6 +690,8 @@ mod tests {
         agg.settle_hedge(HedgeSettlement::unknown(1, d.size, 0.0));
         let state = agg.snapshot(1).unwrap();
         assert!((state.unverified_unknown_qty - 1.0).abs() < 1e-9);
+        assert!((agg.unknown_qty_for_side(OrderSide::Buy) - 1.0).abs() < 1e-9);
+        assert!(agg.unknown_qty_for_side(OrderSide::Sell).abs() < 1e-9);
         assert!(state.residual().abs() < 1e-9);
         assert!(agg.try_reserve_hedge(1).is_none());
         assert!(agg.flush_idle().is_empty());
