@@ -43,10 +43,6 @@ pub struct MakerOpenOrder {
     pub price: f64,
     pub initial_amount: f64,
     pub filled_amount: f64,
-    pub cancelled_amount: f64,
-    pub reduce_only: bool,
-    pub created_at: u64,
-    pub updated_at: u64,
 }
 
 /// Normalized signed position for one symbol: `+` long, `-` short, `0` flat.
@@ -68,11 +64,6 @@ pub struct MakerTrade {
     pub client_order_id: Option<String>,
     pub amount: f64,
     pub entry_price: f64,
-    pub fee: f64,
-    /// True when this row is the **maker** leg of a fill (Pacifica
-    /// `event_type == "fulfill_maker"`); taker fills are excluded by callers.
-    pub is_maker_fill: bool,
-    pub created_at: u64,
 }
 
 /// Weighted fill summary for one client order id.
@@ -92,7 +83,6 @@ pub enum MakerFillEvent {
         filled: f64,
         original: f64,
         avg_price: f64,
-        ts: u64,
     },
     Full {
         order_id: u64,
@@ -101,16 +91,12 @@ pub enum MakerFillEvent {
         side: OrderSide,
         filled: f64,
         avg_price: f64,
-        ts: u64,
     },
     Cancelled {
         order_id: u64,
         client_order_id: Option<String>,
-        symbol: String,
         side: OrderSide,
         filled: f64,
-        original: f64,
         reason: String,
-        ts: u64,
     },
 }

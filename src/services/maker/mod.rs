@@ -42,9 +42,6 @@ pub type MakerFillCallback = Box<dyn FnMut(MakerFillEvent) + Send + 'static>;
 /// market queries. Implemented once per maker venue in its connector module.
 #[async_trait]
 pub trait MakerExchange: Send + Sync + 'static {
-    /// Short label for logs (e.g. `"PACIFICA"`).
-    fn label(&self) -> &'static str;
-
     /// Tick / lot rules for `symbol` (the venue's market-info endpoint).
     async fn symbol_rules(&self, symbol: &str) -> Result<MakerSymbolRules>;
 
@@ -74,7 +71,9 @@ pub trait MakerExchange: Send + Sync + 'static {
     async fn open_orders(&self) -> Result<Vec<MakerOpenOrder>>;
 
     /// Signed position for `symbol` (+long / -short); zeroed when flat.
-    async fn position(&self, symbol: &str) -> Result<MakerPosition>;
+    async fn position(&self, symbol: &str) -> Result<MakerPosition> {
+        Ok(self.position_opt(symbol).await?.unwrap_or_default())
+    }
 
     /// Like [`MakerExchange::position`] but distinguishes "no position row"
     /// (`None`) from a flat/zero position. The position monitor needs that to
@@ -100,7 +99,6 @@ pub trait MakerExchange: Send + Sync + 'static {
 /// is permanently closed.
 #[async_trait]
 pub trait MakerFillStream: Send + 'static {
-    fn label(&self) -> &'static str;
     /// The readiness flag the stream flips on (re)connect. MUST be the same
     /// `Arc` the underlying client mutates, so startup gating observes it.
     fn ready_flag(&self) -> Arc<AtomicBool>;

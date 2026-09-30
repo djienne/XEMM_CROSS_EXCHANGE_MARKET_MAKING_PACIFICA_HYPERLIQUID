@@ -1,13 +1,9 @@
 //! Maker-venue factory.
 //!
-//! Builds everything the bot needs from its (swappable) maker venue behind the
+//! Builds everything the bot needs from the maker venue (Pacifica) behind the
 //! `MakerExchange` / `MakerFillStream` traits, plus the restartable data-plane
 //! builders (orderbook stream + REST poll). Hyperliquid is the permanent taker
-//! and is constructed separately in `app.rs`; it never passes through here.
-//!
-//! Adding a second maker venue = a new `src/connector/<venue>/` module that
-//! implements the two maker traits + one new arm in [`build_maker`]. No service
-//! edits, no hot-path changes.
+//! and is constructed separately in `app.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,27 +30,6 @@ pub type PriceStreamFactory = Arc<dyn Fn() -> Result<Box<dyn PriceStream>> + Sen
 /// a shared REST handle - and never on the hot path.
 pub type PricePollFactory = Arc<dyn Fn() -> Box<dyn PricePoll> + Send + Sync>;
 
-/// The maker venue to construct, parsed from [`Config::maker_venue`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MakerVenue {
-    Pacifica,
-}
-
-impl MakerVenue {
-    /// Parse the configured venue. An unknown value is a hard config error
-    /// rather than a silent fallback, so a typo cannot quietly run the wrong
-    /// venue.
-    pub fn from_config(config: &Config) -> Result<Self> {
-        match config.maker_venue.to_ascii_lowercase().as_str() {
-            "pacifica" => Ok(MakerVenue::Pacifica),
-            other => anyhow::bail!(
-                "Unknown maker_venue '{}' in config; supported: pacifica",
-                other
-            ),
-        }
-    }
-}
-
 /// Everything the app needs from the maker venue:
 /// - `maker`: the control-plane handle (shared, cloned into every service),
 /// - `fill_stream`: the fail-closed fill-event stream (built once),
@@ -66,25 +41,8 @@ pub struct MakerStack {
     pub price_poll_factory: PricePollFactory,
 }
 
-/// Construct the maker stack for `venue`. This is the single swap point: a new
-/// maker venue is one new arm here.
-pub fn build_maker(
-    venue: MakerVenue,
-    config: &Config,
-    credentials: &PacificaCredentials,
-) -> Result<MakerStack> {
-    match venue {
-        MakerVenue::Pacifica => build_pacifica(config, credentials),
-    }
-}
-
-fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<MakerStack> {
-    // The maker venue's own wire symbol for this asset. `config.symbol` is the
-    // canonical identifier (also the Hyperliquid taker symbol); the adapter maps
-    // canonical <-> wire internally, and the maker price feeds below subscribe to
-    // the wire symbol. Defaults to identity when `maker_symbol` is unset.
-    let wire_symbol = config.maker_symbol.as_deref().unwrap_or(&config.symbol);
-
+/// Construct the maker stack.
+pub fn build_maker(config: &Config, credentials: &PacificaCredentials) -> Result<MakerStack> {
     // Control plane: one shared REST client + one WS client, wrapped by the
     // `MakerExchange` adapter. Mirrors the construction previously inlined in
     // `XemmBot::new` (single shared instances across all services - the previous
@@ -100,8 +58,6 @@ fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<
     let maker: Arc<dyn MakerExchange> = Arc::new(PacificaMaker::new(
         pacifica_trading.clone(),
         pacifica_ws_trading.clone(),
-        config.symbol.clone(),
-        wire_symbol.to_string(),
     ));
 
     // Fail-closed fill stream (built once; the client is non-Clone and not
@@ -125,7 +81,7 @@ fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<
     // the factory then rebuilds the (non-Clone) client from this Clone config on
     // every restart.
     let ob_cfg = PacOrderbookConfig {
-        symbol: wire_symbol.to_string(),
+        symbol: config.symbol.clone(),
         agg_level: config.agg_level,
         reconnect_attempts: config.reconnect_attempts,
         ping_interval_secs: config.ping_interval_secs,
@@ -143,7 +99,7 @@ fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<
     // Data plane: REST poll (restartable, price redundancy).
     let price_poll_factory: PricePollFactory = {
         let trading = pacifica_trading.clone();
-        let symbol = wire_symbol.to_string();
+        let symbol = config.symbol.clone();
         let agg_level = config.agg_level;
         Arc::new(move || {
             Box::new(PacificaPoller {

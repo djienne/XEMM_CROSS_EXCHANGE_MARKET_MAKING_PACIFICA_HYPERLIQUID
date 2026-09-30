@@ -18,7 +18,7 @@ use crate::connector::hyperliquid::{
     OrderbookClient as HlOrderbookClient, OrderbookConfig as HlOrderbookConfig,
 };
 use crate::connector::maker_factory::{
-    build_maker, MakerStack, MakerVenue, PricePollFactory, PriceStreamFactory,
+    build_maker, MakerStack, PricePollFactory, PriceStreamFactory,
 };
 use crate::connector::pacifica::PacificaCredentials;
 use crate::services::{
@@ -144,9 +144,8 @@ pub struct XemmBot {
     pub config: Config,
     pub bot_state: Arc<RwLock<BotState>>,
 
-    /// Maker-venue control plane. One shared handle (today wrapping the Pacifica
-    /// REST + WS clients) cloned into every service; the single swap point for a
-    /// future maker venue. Built by `build_maker`.
+    /// Maker-venue control plane. One shared handle (wrapping the Pacifica
+    /// REST + WS clients) cloned into every service. Built by `build_maker`.
     pub maker: Arc<dyn MakerExchange>,
     /// Fail-closed maker fill-event stream, built once by `build_maker` and
     /// consumed (`take`n) when the fill-detection service is spawned.
@@ -293,18 +292,15 @@ impl XemmBot {
             "Credentials loaded successfully".green()
         );
 
-        // Build the (swappable) maker venue: control-plane handle, the
-        // fail-closed fill stream, and the restartable data-plane builders. This
-        // is the single swap point - a future maker venue is one new arm in
-        // `build_maker`. Hyperliquid (the permanent taker) is built separately
-        // below and never routed through the factory.
-        let venue = MakerVenue::from_config(&config)?;
+        // Build the maker venue: control-plane handle, the fail-closed fill
+        // stream, and the restartable data-plane builders. Hyperliquid (the
+        // permanent taker) is built separately below.
         let MakerStack {
             maker,
             fill_stream,
             price_stream_factory,
             price_poll_factory,
-        } = build_maker(venue, &config, &pacifica_credentials)
+        } = build_maker(&config, &pacifica_credentials)
             .context("Failed to build maker venue")?;
 
         let hyperliquid_trading = Arc::new(

@@ -261,8 +261,6 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `symbol` | "SOL" | Trading symbol (must exist on both exchanges) |
-| `maker_venue` | "pacifica" | Maker exchange. Currently only `pacifica`; the maker side is abstracted behind the `build_maker` factory so a new venue is one added arm (Hyperliquid stays the permanent taker). |
-| `maker_symbol` | (unset) | Optional maker-venue wire symbol when it differs from `symbol`. Defaults to `symbol`; the connector maps canonical `symbol` <-> wire internally. |
 | `reconnect_attempts` | 5 | Number of WebSocket reconnection attempts with exponential backoff |
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `ping_interval_secs` | 15 | WebSocket ping interval in seconds (max 30s) |
