@@ -8,9 +8,7 @@ use crate::bot::{BotState, BotStatus};
 use crate::services::cancel_manager::{request_cancel, CancelDemand, CancelIntent, CancelReason};
 use crate::services::fill_aggregator::{FillAggregator, HedgeReservation};
 use crate::services::fill_dedup::{FillDedup, FillKey};
-use crate::services::maker::{
-    MakerBaselineUpdater, MakerExchange, MakerFillEvent, MakerFillStream, MakerReconcileHook,
-};
+use crate::services::maker::{MakerExchange, MakerFillEvent, MakerFillStream, MakerReconcileHook};
 use crate::services::metrics;
 use crate::services::supervisor::spawn_supervised_fail_closed;
 use crate::services::trade_gate::TradeGate;
@@ -29,7 +27,6 @@ pub struct FillDetectionService {
     pub symbol: String,
     pub processed_fills: Arc<FillDedup>,
     pub fill_aggregator: Arc<FillAggregator>,
-    pub baseline_updater: Arc<dyn MakerBaselineUpdater>,
     pub atomic_status: Arc<std::sync::atomic::AtomicU8>,
     pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
     pub trade_gate: Arc<TradeGate>,
@@ -54,7 +51,6 @@ struct FillEventProcessor {
     symbol: String,
     processed_fills: Arc<FillDedup>,
     fill_aggregator: Arc<FillAggregator>,
-    baseline_updater: Arc<dyn MakerBaselineUpdater>,
     atomic_status: Arc<std::sync::atomic::AtomicU8>,
     order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
     low_latency_mode: bool,
@@ -152,8 +148,6 @@ impl FillEventProcessor {
                     self.symbol.clone(),
                     CancelReason::PartialFill,
                 );
-                self.baseline_updater
-                    .update_baseline(&self.symbol, order_side, filled_size, avg_px);
 
                 if !self.low_latency_mode {
                     info!(
@@ -259,12 +253,6 @@ impl FillEventProcessor {
                     self.symbol.clone(),
                     CancelReason::PartialFill,
                 );
-                self.baseline_updater.update_baseline(
-                    &self.symbol,
-                    order_side,
-                    reservation.size,
-                    reservation.avg_price,
-                );
 
                 enqueue_reserved_hedge(
                     &self.fill_aggregator,
@@ -366,7 +354,6 @@ impl FillEventProcessor {
                         | BotStatus::Reconciling
                         | BotStatus::PlacementUnknown
                         | BotStatus::CancelPending
-                        | BotStatus::HedgeUnknown
                         | BotStatus::ShuttingDown => {
                             debug!(
                                 "[BOT] Cancellation received in {:?} state (ignoring)",
@@ -375,9 +362,6 @@ impl FillEventProcessor {
                         }
                     }
                 }
-            }
-            MakerFillEvent::Position { .. } => {
-                debug!("[FILL_DETECTION] Position fill event handled by position monitor");
             }
         }
     }
@@ -489,7 +473,6 @@ impl FillDetectionService {
             symbol: self.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             fill_aggregator: self.fill_aggregator.clone(),
-            baseline_updater: self.baseline_updater.clone(),
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
             low_latency_mode: self.low_latency_mode,

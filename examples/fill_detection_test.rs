@@ -96,7 +96,6 @@ async fn main() -> anyhow::Result<()> {
         account: credentials.account.clone(),
         max_attempts: Some(5),
         ping_interval_secs: 30,
-        enable_position_fill_detection: true,
     };
 
     let mut fill_detection_client = FillDetectionClient::new(fill_detection_config, false)?;
@@ -186,24 +185,6 @@ async fn main() -> anyhow::Result<()> {
                     info!("Reason: {}", reason);
                     info!("Timestamp: {}", timestamp);
                     info!("[CANCEL] ════════════════════════════════════════════════");
-                    info!("");
-                    *fill_received_clone.lock().unwrap() = true;
-                }
-                FillEvent::PositionFill {
-                    symbol,
-                    side,
-                    filled_amount,
-                    avg_price,
-                    timestamp,
-                    ..
-                } => {
-                    info!("");
-                    info!("[POSITION] POSITION FILL DETECTED!");
-                    info!("Symbol: {}", symbol);
-                    info!("Side: {}", side);
-                    info!("Filled: {} SOL", filled_amount);
-                    info!("Average Price: ${}", avg_price);
-                    info!("Timestamp: {}", timestamp);
                     info!("");
                     *fill_received_clone.lock().unwrap() = true;
                 }

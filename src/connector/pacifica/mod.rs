@@ -6,9 +6,7 @@ mod types;
 pub mod ws_trading;
 
 pub use client::{OrderbookClient, OrderbookConfig};
-pub use fill_detection::{
-    FillDetectionClient, FillDetectionConfig, PositionBaselineUpdater, ReconcileHook,
-};
+pub use fill_detection::{FillDetectionClient, FillDetectionConfig, ReconcileHook};
 pub use trading::{
     OpenOrderItem, OrderSide, PacificaCredentials, PacificaTrading, PositionItem, PositionResponse,
     TradeHistoryItem,

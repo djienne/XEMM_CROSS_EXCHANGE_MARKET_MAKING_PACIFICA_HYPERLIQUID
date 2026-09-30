@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,10 +9,7 @@ use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-use super::types::{
-    AccountOrderUpdatesSubscribe, AccountPositionsResponse, AccountPositionsSubscribe, FillEvent,
-    OrderUpdate, PingMessage,
-};
+use super::types::{AccountOrderUpdatesSubscribe, FillEvent, OrderUpdate, PingMessage};
 
 /// Configuration for fill detection client
 #[derive(Debug, Clone)]
@@ -28,83 +24,11 @@ pub struct FillDetectionConfig {
     pub max_attempts: Option<u32>,
     /// Ping interval in seconds
     pub ping_interval_secs: u64,
-    /// Enable position-based fill detection (redundancy layer)
-    pub enable_position_fill_detection: bool,
 }
 
 /// A connection that survives this long is "healthy": it resets the reconnect
 /// budget so only consecutive rapid failures count toward `max_attempts`.
 const HEALTHY_CONNECTION_UPTIME: Duration = Duration::from_secs(10);
-
-/// Handle for updating position baselines from external fill sources
-///
-/// This allows order-based fill detection to update the position baseline
-/// so that position-based detection doesn't trigger duplicate hedges.
-#[derive(Clone)]
-pub struct PositionBaselineUpdater {
-    position_snapshots: Arc<Mutex<HashMap<String, PositionSnapshot>>>,
-    position_initialized: Arc<Mutex<HashSet<String>>>,
-}
-
-impl PositionBaselineUpdater {
-    /// Update position baseline when a fill is detected
-    ///
-    /// # Arguments
-    /// * `symbol` - Trading symbol
-    /// * `side` - Fill side ("buy" or "sell")
-    /// * `filled_amount` - Amount that was filled
-    /// * `avg_price` - Average fill price
-    pub fn update_baseline(&self, symbol: &str, side: &str, filled_amount: f64, avg_price: f64) {
-        // Batch lock acquisition for lower latency
-        let mut snapshots = self.position_snapshots.lock();
-        let mut initialized = self.position_initialized.lock();
-
-        // Get current snapshot or default to 0.0
-        let prev_qty = snapshots.get(symbol).map(|s| s.quantity).unwrap_or(0.0);
-
-        // Calculate new position based on fill
-        let delta = if side == "buy" {
-            filled_amount
-        } else {
-            -filled_amount
-        };
-        let new_qty = prev_qty + delta;
-
-        // Update snapshot
-        snapshots.insert(
-            symbol.to_string(),
-            PositionSnapshot {
-                quantity: new_qty,
-                entry_price: avg_price,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            },
-        );
-
-        // Mark as initialized
-        initialized.insert(symbol.to_string());
-
-        debug!(
-            "[POSITION SYNC] Updated {} baseline: {:.4} -> {:.4} ({} {:.4} @ ${:.4})",
-            symbol,
-            prev_qty,
-            new_qty,
-            side.to_uppercase(),
-            filled_amount,
-            avg_price
-        );
-    }
-}
-
-/// Position snapshot for tracking changes
-#[derive(Debug, Clone)]
-struct PositionSnapshot {
-    quantity: f64, // Signed quantity (+ for long, - for short)
-    entry_price: f64,
-    timestamp: u64,
-}
 
 /// Async hook invoked on every successful (re)connect so the caller can
 /// perform REST reconciliation (e.g. scan open_orders for fills that
@@ -119,12 +43,6 @@ pub type ReconcileHook = Arc<
 pub struct FillDetectionClient {
     config: FillDetectionConfig,
     ws_url: String,
-    /// Position snapshots per symbol for delta detection
-    position_snapshots: Arc<Mutex<HashMap<String, PositionSnapshot>>>,
-    /// Track last order fill time for cross-validation (symbol -> timestamp)
-    last_order_fill_time: Arc<Mutex<Instant>>,
-    /// Track which symbols have received their first position update (for baseline initialization)
-    position_initialized: Arc<Mutex<HashSet<String>>>,
     /// Optional hook called after each (re)connect. Populate to run REST
     /// reconciliation and catch up on fills that happened during the outage.
     reconcile_hook: Arc<Mutex<Option<ReconcileHook>>>,
@@ -147,9 +65,6 @@ impl FillDetectionClient {
         Ok(Self {
             config,
             ws_url,
-            position_snapshots: Arc::new(Mutex::new(HashMap::new())),
-            last_order_fill_time: Arc::new(Mutex::new(Instant::now())),
-            position_initialized: Arc::new(Mutex::new(HashSet::new())),
             reconcile_hook: Arc::new(Mutex::new(None)),
             ready: Arc::new(AtomicBool::new(false)),
         })
@@ -168,106 +83,6 @@ impl FillDetectionClient {
     /// that occurred during the WS outage are replayed into the fill pipeline.
     pub fn set_reconcile_hook(&self, hook: ReconcileHook) {
         *self.reconcile_hook.lock() = Some(hook);
-    }
-
-    /// Get a handle for updating position baselines from external sources
-    ///
-    /// CRITICAL: Use this to update baselines when order-based fills are detected,
-    /// preventing position-based detection from triggering duplicate hedges.
-    pub fn get_baseline_updater(&self) -> PositionBaselineUpdater {
-        PositionBaselineUpdater {
-            position_snapshots: self.position_snapshots.clone(),
-            position_initialized: self.position_initialized.clone(),
-        }
-    }
-
-    /// Initialize position snapshots from external source (e.g., REST API at startup)
-    ///
-    /// This method allows pre-populating position baselines before starting the WebSocket,
-    /// preventing false fill detection from pre-existing positions.
-    ///
-    /// # Arguments
-    /// * `positions` - Vector of (symbol, quantity, entry_price, timestamp) tuples
-    ///   where quantity is signed (+ for long, - for short)
-    pub fn initialize_positions(&self, positions: Vec<(String, f64, f64, u64)>) {
-        // Batch lock acquisition for lower latency
-        let mut snapshots = self.position_snapshots.lock();
-        let mut initialized = self.position_initialized.lock();
-
-        for (symbol, quantity, entry_price, timestamp) in positions {
-            snapshots.insert(
-                symbol.clone(),
-                PositionSnapshot {
-                    quantity,
-                    entry_price,
-                    timestamp,
-                },
-            );
-            initialized.insert(symbol.clone());
-            info!(
-                "[POSITION INIT] Pre-initialized {} position: {:.4} @ ${:.4}",
-                symbol, quantity, entry_price
-            );
-        }
-    }
-
-    /// Update position baseline when a fill is detected by other sources
-    ///
-    /// CRITICAL: This prevents position-based detection from triggering duplicate hedges
-    /// when order-based detection already processed the fill.
-    ///
-    /// # Arguments
-    /// * `symbol` - Trading symbol
-    /// * `side` - Fill side ("buy" or "sell")
-    /// * `filled_amount` - Amount that was filled
-    /// * `avg_price` - Average fill price
-    pub fn update_position_baseline(
-        &self,
-        symbol: &str,
-        side: &str,
-        filled_amount: f64,
-        avg_price: f64,
-    ) {
-        // Batch lock acquisition for lower latency
-        let mut snapshots = self.position_snapshots.lock();
-        let mut initialized = self.position_initialized.lock();
-
-        // Get current snapshot or default to 0.0
-        let prev_qty = snapshots.get(symbol).map(|s| s.quantity).unwrap_or(0.0);
-
-        // Calculate new position based on fill
-        let delta = if side == "buy" {
-            filled_amount
-        } else {
-            -filled_amount
-        };
-        let new_qty = prev_qty + delta;
-
-        // Update snapshot
-        snapshots.insert(
-            symbol.to_string(),
-            PositionSnapshot {
-                quantity: new_qty,
-                entry_price: avg_price,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            },
-        );
-
-        // Mark as initialized
-        initialized.insert(symbol.to_string());
-
-        debug!(
-            "[POSITION SYNC] Updated {} baseline: {:.4} -> {:.4} ({}  {:.4} @ ${:.4})",
-            symbol,
-            prev_qty,
-            new_qty,
-            side.to_uppercase(),
-            filled_amount,
-            avg_price
-        );
     }
 
     /// Start the fill detection client with a callback for fill events
@@ -362,16 +177,6 @@ impl FillDetectionClient {
             self.config.account
         );
 
-        // Subscribe to account positions (for position-based fill detection)
-        if self.config.enable_position_fill_detection {
-            let positions_subscribe = AccountPositionsSubscribe::new(self.config.account.clone());
-            let positions_json = serde_json::to_string(&positions_subscribe)?;
-            write.send(Message::Text(positions_json)).await?;
-            info!(
-                "Subscribed to account_positions for account: {}",
-                self.config.account
-            );
-        }
         self.ready.store(true, Ordering::Release);
 
         // Set up ping interval
@@ -466,9 +271,6 @@ impl FillDetectionClient {
                         .unwrap_or_default();
                     debug!("Received {} order update(s)", items.len());
 
-                    // Update last order fill time for cross-validation
-                    *self.last_order_fill_time.lock() = Instant::now();
-
                     for item in items {
                         // Deserialize from &Value (no clone): the raw item is
                         // still available for the error log below.
@@ -496,20 +298,6 @@ impl FillDetectionClient {
                         }
                     }
                 }
-                "account_positions" => {
-                    if self.config.enable_position_fill_detection {
-                        // Parse as account positions response
-                        let positions: AccountPositionsResponse = serde_json::from_str(text)?;
-                        debug!("Received {} position update(s)", positions.data.len());
-
-                        // Process each position update
-                        for position in positions.data {
-                            if let Some(fill_event) = self.detect_fill_from_position(&position) {
-                                callback(fill_event);
-                            }
-                        }
-                    }
-                }
                 _ => {
                     debug!("Received message on channel: {}", channel);
                 }
@@ -517,211 +305,5 @@ impl FillDetectionClient {
         }
 
         Ok(())
-    }
-
-    /// Detect fill from position change (redundancy layer)
-    ///
-    /// Optimized for low latency with batched lock acquisition.
-    fn detect_fill_from_position(
-        &self,
-        position: &super::types::PositionData,
-    ) -> Option<FillEvent> {
-        // Parse position data with validation (no locks needed)
-        let amount: f64 = match position.amount.parse::<f64>() {
-            Ok(val) if val >= 0.0 && val.is_finite() => val,
-            Ok(val) => {
-                warn!(
-                    "[POSITION VALIDATION] Invalid amount value: {} (must be non-negative and finite)",
-                    val
-                );
-                return None;
-            }
-            Err(e) => {
-                warn!(
-                    "[POSITION VALIDATION] Failed to parse amount '{}': {}",
-                    position.amount, e
-                );
-                return None;
-            }
-        };
-
-        let entry_price: f64 = match position.entry_price.parse::<f64>() {
-            Ok(val) if val > 0.0 && val.is_finite() => val,
-            Ok(val) => {
-                warn!(
-                    "[POSITION VALIDATION] Invalid entry_price value: {} (must be positive and finite)",
-                    val
-                );
-                return None;
-            }
-            Err(e) => {
-                warn!(
-                    "[POSITION VALIDATION] Failed to parse entry_price '{}': {}",
-                    position.entry_price, e
-                );
-                return None;
-            }
-        };
-
-        // Validate side field
-        if position.side != "ask" && position.side != "bid" {
-            warn!(
-                "[POSITION VALIDATION] Invalid side value: '{}' (must be 'ask' or 'bid')",
-                position.side
-            );
-            return None;
-        }
-
-        // Convert to signed quantity (+ for long, - for short)
-        let quantity = if position.side == "ask" {
-            -amount // Short position
-        } else {
-            amount // Long position
-        };
-
-        debug!(
-            "[POSITION UPDATE] {} | amount: {}, side: {}, entry: ${}, quantity: {}",
-            position.symbol, amount, position.side, entry_price, quantity
-        );
-
-        // BATCH LOCK ACQUISITION: Acquire all locks at once for lower latency
-        // This eliminates multiple lock/unlock cycles in the hot path
-        let mut initialized = self.position_initialized.lock();
-        let mut snapshots = self.position_snapshots.lock();
-
-        let is_first_update = !initialized.contains(&position.symbol);
-        let prev_snapshot = snapshots.get(&position.symbol).cloned();
-        let prev_qty = prev_snapshot.as_ref().map(|s| s.quantity).unwrap_or(0.0);
-        let delta = quantity - prev_qty;
-
-        // CRITICAL FIX: If this is the first position update for this symbol,
-        // treat it as baseline initialization ONLY (don't trigger fills)
-        // This prevents false positives from detecting pre-existing positions as new fills
-        if is_first_update {
-            info!(
-                "[POSITION BASELINE] Initializing position snapshot for {}: {:.4} (side: {}, entry: ${:.4})",
-                position.symbol, quantity, position.side, entry_price
-            );
-
-            // Mark this symbol as initialized and save baseline snapshot
-            initialized.insert(position.symbol.clone());
-            snapshots.insert(
-                position.symbol.clone(),
-                PositionSnapshot {
-                    quantity,
-                    entry_price,
-                    timestamp: position.timestamp,
-                },
-            );
-
-            return None; // Don't trigger fill detection on first update
-        }
-
-        // Validate timestamp - reject stale updates (older than previous snapshot)
-        if let Some(ref prev) = prev_snapshot {
-            if position.timestamp <= prev.timestamp {
-                warn!(
-                    "[POSITION VALIDATION] Stale position update detected for {} (current: {}, previous: {}). Ignoring.",
-                    position.symbol, position.timestamp, prev.timestamp
-                );
-                return None; // Ignore stale updates
-            }
-        }
-
-        // Only detect fills if there's a significant change (> 0.0001 for floating point tolerance)
-        if delta.abs() < 0.0001 {
-            // Update snapshot even if no change
-            snapshots.insert(
-                position.symbol.clone(),
-                PositionSnapshot {
-                    quantity,
-                    entry_price,
-                    timestamp: position.timestamp,
-                },
-            );
-            return None;
-        }
-
-        // Validate delta is reasonable (max 10 units for safety)
-        // This prevents triggering on obviously corrupted data
-        if delta.abs() > 10.0 {
-            warn!(
-                "[POSITION VALIDATION] Unreasonably large position delta detected: {:.4} (prev: {:.4}, new: {:.4}). Possible data corruption. NOT triggering hedge.",
-                delta, prev_qty, quantity
-            );
-
-            // Update snapshot but don't trigger fill
-            snapshots.insert(
-                position.symbol.clone(),
-                PositionSnapshot {
-                    quantity,
-                    entry_price,
-                    timestamp: position.timestamp,
-                },
-            );
-            return None;
-        }
-
-        // Determine fill side from delta
-        let side = if delta > 0.0 { "buy" } else { "sell" };
-
-        // Update snapshot before releasing locks
-        snapshots.insert(
-            position.symbol.clone(),
-            PositionSnapshot {
-                quantity,
-                entry_price,
-                timestamp: position.timestamp,
-            },
-        );
-
-        // Release position locks before acquiring last_order_fill_time lock
-        // to avoid potential deadlock and reduce lock hold time
-        drop(snapshots);
-        drop(initialized);
-
-        // Cross-validate: check if we received order fills recently (for logging purposes only)
-        let (cross_validated, seconds_since_last_fill) = {
-            let last_time = self.last_order_fill_time.lock();
-            let elapsed = last_time.elapsed().as_secs();
-            (elapsed < 60, elapsed)
-        };
-
-        // Log fill detection with cross-validation status (informational only)
-        if cross_validated {
-            info!(
-                "[POSITION FILL OK] {} {:.4} {} @ {:.4} (pos: {:.4} -> {:.4}, cross-validated with order updates)",
-                side.to_uppercase(),
-                delta.abs(),
-                position.symbol,
-                entry_price,
-                prev_qty,
-                quantity
-            );
-        } else {
-            info!(
-                "[POSITION FILL WARN] {} {:.4} {} @ {:.4} (pos: {:.4} -> {:.4}, {} sec since last order activity)",
-                side.to_uppercase(),
-                delta.abs(),
-                position.symbol,
-                entry_price,
-                prev_qty,
-                quantity,
-                seconds_since_last_fill
-            );
-        }
-
-        // Create position-based fill event
-        Some(FillEvent::PositionFill {
-            symbol: position.symbol.clone(),
-            side: side.to_string(),
-            filled_amount: delta.abs().to_string(),
-            avg_price: entry_price.to_string(),
-            timestamp: position.timestamp,
-            position_delta: delta.to_string(),
-            prev_position: prev_qty.to_string(),
-            new_position: quantity.to_string(),
-            cross_validated,
-        })
     }
 }

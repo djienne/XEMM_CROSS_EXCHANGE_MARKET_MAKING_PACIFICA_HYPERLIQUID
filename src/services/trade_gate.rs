@@ -18,7 +18,6 @@ pub enum GateReason {
     PlacementUnknown = 7,
     CancelPending = 8,
     HedgePending = 9,
-    HedgeUnknown = 10,
     Reconciling = 11,
     ShuttingDown = 12,
     LoggerBackpressure = 13,
@@ -43,7 +42,6 @@ impl GateReason {
             Self::PlacementUnknown => "placement_unknown",
             Self::CancelPending => "cancel_pending",
             Self::HedgePending => "hedge_pending",
-            Self::HedgeUnknown => "hedge_unknown",
             Self::Reconciling => "reconciling",
             Self::ShuttingDown => "shutting_down",
             Self::LoggerBackpressure => "logger_backpressure",
@@ -212,7 +210,6 @@ impl TradeGate {
             matches!(state, RunState::Cancelling | RunState::CancelPending),
         );
         self.set(GateReason::HedgePending, state == RunState::Hedging);
-        self.set(GateReason::HedgeUnknown, state == RunState::HedgeUnknown);
         self.set(GateReason::ShuttingDown, state == RunState::ShuttingDown);
     }
 
@@ -252,7 +249,6 @@ impl TradeGate {
             GateReason::PlacementUnknown,
             GateReason::CancelPending,
             GateReason::HedgePending,
-            GateReason::HedgeUnknown,
             GateReason::Reconciling,
             GateReason::ShuttingDown,
             GateReason::LoggerBackpressure,

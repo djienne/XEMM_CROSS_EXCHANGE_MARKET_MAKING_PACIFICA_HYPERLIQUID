@@ -115,7 +115,6 @@ fn build_pacifica(config: &Config, credentials: &PacificaCredentials) -> Result<
         // hook replays fills missed while disconnected.
         max_attempts: None,
         ping_interval_secs: config.ping_interval_secs,
-        enable_position_fill_detection: true,
     };
     let fill_client = FillDetectionClient::new(fill_config, false)
         .context("Failed to create fill detection client")?;

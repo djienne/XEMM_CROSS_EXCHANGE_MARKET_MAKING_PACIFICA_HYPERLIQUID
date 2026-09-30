@@ -113,16 +113,4 @@ pub enum MakerFillEvent {
         reason: String,
         ts: u64,
     },
-    /// Fill inferred from a position delta (redundancy layer).
-    Position {
-        symbol: String,
-        side: OrderSide,
-        filled: f64,
-        avg_price: f64,
-        ts: u64,
-        position_delta: f64,
-        prev_position: f64,
-        new_position: f64,
-        cross_validated: bool,
-    },
 }

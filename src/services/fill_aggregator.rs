@@ -31,7 +31,6 @@ pub struct OrderFillState {
     pub last_updated: Instant,
     pub created_at: Instant,
     pub next_hedge_seq: u64,
-    pub last_unknown_hedge: Option<Instant>,
     pub target_size: f64,
 }
 
@@ -278,7 +277,6 @@ impl FillAggregator {
             last_updated: now,
             created_at: now,
             next_hedge_seq: 0,
-            last_unknown_hedge: None,
             target_size: target_size.unwrap_or(0.0).max(0.0),
         });
 
@@ -400,7 +398,6 @@ impl FillAggregator {
                 // exposure and `resolve_unknowns_on_neutral` retires the
                 // quarantine once venue positions read neutral.
                 entry.unverified_unknown_qty += reserved - filled;
-                entry.last_unknown_hedge = Some(Instant::now());
             }
         }
     }
@@ -415,7 +412,6 @@ impl FillAggregator {
             if entry.unverified_unknown_qty > 0.0 {
                 entry.cumulative_hedged_confirmed += entry.unverified_unknown_qty;
                 entry.unverified_unknown_qty = 0.0;
-                entry.last_unknown_hedge = None;
             }
         }
     }
@@ -725,7 +721,6 @@ mod tests {
         let state = agg.snapshot(1).unwrap();
         assert!(state.unverified_unknown_qty.abs() < 1e-9);
         assert!((state.cumulative_hedged_confirmed - 1.0).abs() < 1e-9);
-        assert!(state.last_unknown_hedge.is_none());
 
         agg.gc(Duration::from_millis(1));
         assert_eq!(agg.len(), 0);

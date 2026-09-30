@@ -38,13 +38,6 @@ pub type MakerReconcileHook =
 /// Callback the fill stream pushes normalized events through.
 pub type MakerFillCallback = Box<dyn FnMut(MakerFillEvent) + Send + 'static>;
 
-/// Updates the fill stream's internal position baseline when an order-based
-/// detector observes a fill, so the position-redundancy layer does not emit a
-/// duplicate hedge for the same fill.
-pub trait MakerBaselineUpdater: Send + Sync {
-    fn update_baseline(&self, symbol: &str, side: OrderSide, filled: f64, avg_price: f64);
-}
-
 /// The maker venue control plane: order placement, cancellation, and account /
 /// market queries. Implemented once per maker venue in its connector module.
 #[async_trait]
@@ -112,6 +105,5 @@ pub trait MakerFillStream: Send + 'static {
     /// `Arc` the underlying client mutates, so startup gating observes it.
     fn ready_flag(&self) -> Arc<AtomicBool>;
     fn set_reconcile_hook(&self, hook: MakerReconcileHook);
-    fn baseline_updater(&self) -> Arc<dyn MakerBaselineUpdater>;
     async fn run_with(&mut self, cb: MakerFillCallback) -> Result<()>;
 }

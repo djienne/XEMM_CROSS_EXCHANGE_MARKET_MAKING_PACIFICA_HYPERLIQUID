@@ -18,7 +18,7 @@ use crate::services::maker::types::{
     MakerSymbolRules, MakerTrade,
 };
 use crate::services::maker::{
-    MakerBaselineUpdater, MakerExchange, MakerFillCallback, MakerFillStream, MakerReconcileHook,
+    MakerExchange, MakerFillCallback, MakerFillStream, MakerReconcileHook,
 };
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
@@ -26,7 +26,7 @@ use crate::util::cancel::dual_cancel;
 use super::trading::{
     OpenOrderItem, OrderData, OrderSide as PacOrderSide, PositionItem, TradeHistoryItem,
 };
-use super::{FillDetectionClient, FillEvent, PacificaTrading, PacificaWsTrading, PositionBaselineUpdater};
+use super::{FillDetectionClient, FillEvent, PacificaTrading, PacificaWsTrading};
 
 // ---------------------------------------------------------------------------
 // Boundary conversions (pure; unit-tested below)
@@ -176,27 +176,6 @@ fn maker_fill_event_from(fe: FillEvent) -> Option<MakerFillEvent> {
             original: parse_f64(&original_amount),
             reason,
             ts: timestamp,
-        },
-        FillEvent::PositionFill {
-            symbol,
-            side,
-            filled_amount,
-            avg_price,
-            timestamp,
-            position_delta,
-            prev_position,
-            new_position,
-            cross_validated,
-        } => MakerFillEvent::Position {
-            symbol,
-            side: side_from_str(&side)?,
-            filled: parse_f64(&filled_amount),
-            avg_price: parse_f64(&avg_price),
-            ts: timestamp,
-            position_delta: parse_f64(&position_delta),
-            prev_position: parse_f64(&prev_position),
-            new_position: parse_f64(&new_position),
-            cross_validated,
         },
     })
 }
@@ -403,23 +382,6 @@ impl MakerExchange for PacificaMaker {
 // MakerFillStream
 // ---------------------------------------------------------------------------
 
-/// Adapter that maps the connector's `PositionBaselineUpdater` (side as
-/// `"buy"`/`"sell"`) onto the trait's `OrderSide`-typed interface.
-struct PacificaBaselineUpdater(PositionBaselineUpdater);
-
-impl MakerBaselineUpdater for PacificaBaselineUpdater {
-    fn update_baseline(&self, symbol: &str, side: OrderSide, filled: f64, avg_price: f64) {
-        // Pass Pacifica's native side string ("bid"/"ask") — the exact value the
-        // legacy order-fill path fed to `PositionBaselineUpdater`, so the
-        // downstream snapshot math is byte-for-byte unchanged.
-        let s = match side {
-            OrderSide::Buy => "bid",
-            OrderSide::Sell => "ask",
-        };
-        self.0.update_baseline(symbol, s, filled, avg_price);
-    }
-}
-
 /// Maker fill stream over Pacifica's `FillDetectionClient`.
 pub struct PacificaFillStream {
     client: FillDetectionClient,
@@ -445,10 +407,6 @@ impl MakerFillStream for PacificaFillStream {
         // `MakerReconcileHook` and the connector's `ReconcileHook` are the same
         // type, so this passes straight through.
         self.client.set_reconcile_hook(hook);
-    }
-
-    fn baseline_updater(&self) -> Arc<dyn MakerBaselineUpdater> {
-        Arc::new(PacificaBaselineUpdater(self.client.get_baseline_updater()))
     }
 
     async fn run_with(&mut self, mut cb: MakerFillCallback) -> Result<()> {
@@ -611,30 +569,6 @@ mod tests {
                 assert_eq!(ts, 7);
             }
             other => panic!("expected Full, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn position_fill_uses_buy_sell_strings() {
-        let fe = FillEvent::PositionFill {
-            symbol: "SOL".to_string(),
-            side: "sell".to_string(),
-            filled_amount: "1.0".to_string(),
-            avg_price: "100.0".to_string(),
-            timestamp: 1,
-            position_delta: "-1.0".to_string(),
-            prev_position: "0.0".to_string(),
-            new_position: "-1.0".to_string(),
-            cross_validated: true,
-        };
-        match maker_fill_event_from(fe).unwrap() {
-            MakerFillEvent::Position { side, filled, position_delta, cross_validated, .. } => {
-                assert_eq!(side, OrderSide::Sell);
-                assert_eq!(filled, 1.0);
-                assert_eq!(position_delta, -1.0);
-                assert!(cross_validated);
-            }
-            other => panic!("expected Position, got {:?}", other),
         }
     }
 

@@ -542,15 +542,13 @@ impl XemmBot {
             );
         }
         // Fail-closed maker fill stream, built once by `build_maker`. Take it
-        // here (it is consumed by the fill-detection service); the ready-flag and
-        // baseline-updater handles are cloned out for the readiness gate and the
-        // safety monitor before the stream is moved.
+        // here (it is consumed by the fill-detection service); the ready flag is
+        // cloned out for the readiness gate and safety monitor before the move.
         let fill_stream = self
             .fill_stream
             .take()
             .expect("fill stream already taken (run called twice?)");
         let fill_ws_ready = fill_stream.ready_flag();
-        let baseline_updater = fill_stream.baseline_updater();
 
         let cancel_demand = CancelDemand::new();
         let (cancel_tx, cancel_rx) = CancelManagerService::channel();
@@ -585,14 +583,13 @@ impl XemmBot {
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             fill_aggregator: self.fill_aggregator.clone(),
-            baseline_updater,
             atomic_status: self.atomic_status.clone(),
             order_snapshot: self.order_snapshot.clone(),
             trade_gate: self.trade_gate.clone(),
             low_latency_mode: self.config.low_latency_mode,
         };
         // Fail-closed for now: the maker fill stream is non-Clone (built once by
-        // the factory and taken above) and its ready_flag/baseline_updater are
+        // the factory and taken above) and its ready_flag is
         // captured by wait_for_startup_readiness and safety_monitor before spawn,
         // so a naive restart would publish readiness to a flag those consumers
         // don't observe. Making it restartable requires injecting long-lived Arc

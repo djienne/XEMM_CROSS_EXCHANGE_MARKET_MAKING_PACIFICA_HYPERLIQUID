@@ -14,31 +14,6 @@ pub struct SubscriptionParams {
     pub coin: String,
 }
 
-/// L2 Book request (POST over WebSocket)
-#[derive(Debug, Serialize)]
-pub struct L2BookRequest {
-    pub method: String,
-    pub id: u64,
-    pub request: L2BookRequestInner,
-}
-
-#[derive(Debug, Serialize)]
-pub struct L2BookRequestInner {
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub payload: L2BookPayload,
-}
-
-#[derive(Debug, Serialize)]
-pub struct L2BookPayload {
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub coin: String,
-    #[serde(rename = "nSigFigs")]
-    pub n_sig_figs: Option<u32>,
-    pub mantissa: Option<u32>,
-}
-
 /// WebSocket response wrapper
 #[derive(Debug, Deserialize)]
 pub struct WebSocketResponse {
@@ -82,100 +57,13 @@ pub struct WsPostResponseInner {
     pub payload: serde_json::Value,
 }
 
-/// L2 Book response
-#[derive(Debug, Deserialize)]
-pub struct L2BookResponse {
-    pub channel: String,
-    pub data: L2BookResponseData,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct L2BookResponseData {
-    pub id: u64,
-    pub response: L2BookResponseInner,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct L2BookResponseInner {
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub payload: L2BookResponsePayload,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct L2BookResponsePayload {
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub data: L2BookData,
-}
-
-/// L2 orderbook data
-#[derive(Debug, Clone, Deserialize)]
-pub struct L2BookData {
-    pub coin: String,
-    pub time: u64,
-    pub levels: Vec<Vec<BookLevel>>, // [bids, asks]
-}
-
-/// Subscription response for l2Book
-#[derive(Debug, Deserialize)]
-pub struct L2BookSubscriptionResponse {
-    pub channel: String,
-    pub data: L2BookData,
-}
-
-/// Book level with price, size, and number of orders
-#[derive(Debug, Clone, Deserialize)]
-pub struct BookLevel {
-    pub px: String, // Price
-    pub sz: String, // Size
-    pub n: u32,     // Number of orders
-}
-
-/// Top of book (best bid and ask)
-#[derive(Debug, Clone)]
-pub struct TopOfBook {
-    pub best_bid: String,
-    pub best_ask: String,
-    pub coin: String,
-    pub timestamp: u64,
-}
-
-impl L2BookData {
-    /// Extract top of book (best bid and best ask)
-    pub fn get_top_of_book(&self) -> Option<TopOfBook> {
-        if self.levels.len() < 2 {
-            return None;
-        }
-
-        let bids = &self.levels[0];
-        let asks = &self.levels[1];
-
-        if bids.is_empty() || asks.is_empty() {
-            return None;
-        }
-
-        // First level is the best price
-        let best_bid = &bids[0];
-        let best_ask = &asks[0];
-
-        Some(TopOfBook {
-            best_bid: best_bid.px.clone(),
-            best_ask: best_ask.px.clone(),
-            coin: self.coin.clone(),
-            timestamp: self.time,
-        })
-    }
-}
-
 // ============================================================================
 // Hot-path top-of-book frame (single-pass, minimal allocation)
 // ============================================================================
 
 /// Hot-path l2Book frame: parses ONLY the best level per side, straight to
 /// f64, skipping deeper levels without allocating them. Mirrors the Pacifica
-/// `BookTopFrame`; the full `L2BookSubscriptionResponse` remains for
-/// depth-aware tooling.
+/// `BookTopFrame`.
 #[derive(Debug, Deserialize)]
 pub struct L2BookTopFrame {
     pub channel: String,

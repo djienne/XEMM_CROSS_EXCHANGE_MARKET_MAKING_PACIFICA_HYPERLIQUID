@@ -21,7 +21,6 @@ pub enum RunState {
     Reconciling = 6,
     PlacementUnknown = 7,
     CancelPending = 8,
-    HedgeUnknown = 9,
     ShuttingDown = 10,
     Complete = 11,
     Error = 12,
@@ -45,7 +44,6 @@ impl RunState {
             6 => Self::Reconciling,
             7 => Self::PlacementUnknown,
             8 => Self::CancelPending,
-            9 => Self::HedgeUnknown,
             10 => Self::ShuttingDown,
             11 => Self::Complete,
             12 => Self::Error,
@@ -107,8 +105,6 @@ pub enum BotStatus {
     PlacementUnknown,
     /// Cancellation is pending verification.
     CancelPending,
-    /// Hedge submit/fill state is uncertain and requires reconciliation.
-    HedgeUnknown,
     /// Shutdown has stopped new placement and is draining risk.
     ShuttingDown,
     /// Full cycle complete (order filled + hedged)
@@ -130,7 +126,6 @@ impl BotStatus {
             BotStatus::Reconciling => RunState::Reconciling,
             BotStatus::PlacementUnknown => RunState::PlacementUnknown,
             BotStatus::CancelPending => RunState::CancelPending,
-            BotStatus::HedgeUnknown => RunState::HedgeUnknown,
             BotStatus::ShuttingDown => RunState::ShuttingDown,
             BotStatus::Complete => RunState::Complete,
             BotStatus::Error(_) => RunState::Error,
@@ -276,11 +271,6 @@ impl BotState {
 
     pub fn mark_cancel_pending(&mut self) {
         self.status = BotStatus::CancelPending;
-        self.store_status();
-    }
-
-    pub fn mark_hedge_unknown(&mut self) {
-        self.status = BotStatus::HedgeUnknown;
         self.store_status();
     }
 

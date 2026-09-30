@@ -1,14 +1,13 @@
-/// Test Aggressive Fill Detection - All 5 Methods
+/// Test Aggressive Fill Detection - All 4 Methods
 ///
 /// This test places an aggressive post-only limit order (0.05% spread) and monitors
-/// all 5 fill detection methods to verify they work correctly and deduplicate properly.
+/// all 4 fill detection methods to verify they work correctly and deduplicate properly.
 ///
 /// Fill Detection Methods Tested:
 /// 1. WebSocket Fill Detection (primary, real-time, via account_order_updates)
-/// 2. WebSocket Position Detection (redundancy, real-time, via account_positions)
-/// 3. REST API Order Polling (backup, 500ms)
-/// 4. Position Monitor (ground truth, 500ms, REST-based)
-/// 5. Monitor Task Pre-Cancel Check (defensive)
+/// 2. REST API Order Polling (backup, 500ms)
+/// 3. Position Monitor (ground truth, 500ms, REST-based)
+/// 4. Monitor Task Pre-Cancel Check (defensive)
 ///
 /// Usage:
 /// ```bash
@@ -44,7 +43,6 @@ use xemm_rust::strategy::OrderSide;
 #[derive(Debug, Clone)]
 enum DetectionMethod {
     WebSocket,
-    WebSocketPosition, // Position-based fill detection via WebSocket
     RestOrderPoll,
     PositionMonitor,
     MonitorPreCancel,
@@ -69,7 +67,7 @@ async fn main() -> Result<()> {
     println!("{}", "═".repeat(80).bright_cyan());
     println!(
         "{}",
-        "  Test Aggressive Fill Detection - All 5 Methods"
+        "  Test Aggressive Fill Detection - All 4 Methods"
             .bright_white()
             .bold()
     );
@@ -262,7 +260,6 @@ async fn main() -> Result<()> {
         account: pacifica_creds.account.clone(),
         max_attempts: Some(3),
         ping_interval_secs: 15,
-        enable_position_fill_detection: true, // Enable position-based fill detection
     };
 
     let mut fill_client = FillDetectionClient::new(fill_config, false)?;
@@ -325,78 +322,6 @@ async fn main() -> Result<()> {
                                     };
 
                                     hedge_tx.send((order_side, fill_size, cloid)).await.ok();
-                                }
-                            }
-                        }
-                        FillEvent::PositionFill {
-                            symbol: fill_symbol,
-                            side,
-                            filled_amount,
-                            avg_price,
-                            cross_validated,
-                            position_delta,
-                            prev_position,
-                            new_position,
-                            ..
-                        } if fill_symbol == symbol => {
-                            // Position-based fill detection (redundancy layer)
-                            let placed = placed_id.read().await;
-
-                            // For position fills, we don't have client_order_id, so we trigger
-                            // regardless if we have an active order and position changed
-                            if placed.is_some() {
-                                drop(placed);
-
-                                let fill_id = format!("ws_pos_{}_{}", position_delta, new_position);
-                                let mut processed = processed_clone.lock().await;
-
-                                if !processed.contains(&fill_id) {
-                                    processed.insert(fill_id.clone());
-                                    drop(processed);
-
-                                    let fill_size: f64 = filled_amount.parse().unwrap_or(0.0);
-
-                                    if cross_validated {
-                                        info!("{} {} POSITION FILL (cross-validated): {} {} @ {} | delta: {} -> {}",
-                                            "[WS_POS_FILL]".bright_blue().bold(),
-                                            "OK".green().bold(),
-                                            side.bright_white(),
-                                            fill_size,
-                                            avg_price.cyan(),
-                                            prev_position,
-                                            new_position
-                                        );
-                                    } else {
-                                        warn!("{} {} POSITION FILL (MISSED BY PRIMARY!): {} {} @ {} | delta: {} -> {}",
-                                            "[WS_POS_FILL]".bright_yellow().bold(),
-                                            "WARN".yellow().bold(),
-                                            side.bright_white(),
-                                            fill_size,
-                                            avg_price.cyan(),
-                                            prev_position,
-                                            new_position
-                                        );
-                                    }
-
-                                    let mut events = detection_clone.lock().await;
-                                    events.push(FillDetectionEvent {
-                                        method: DetectionMethod::WebSocketPosition,
-                                        timestamp: Instant::now(),
-                                        fill_size,
-                                        client_order_id: fill_id.clone(),
-                                    });
-                                    drop(events);
-
-                                    // Only trigger hedge if NOT cross-validated (safety net)
-                                    if !cross_validated {
-                                        let order_side = if side == "buy" {
-                                            OrderSide::Buy
-                                        } else {
-                                            OrderSide::Sell
-                                        };
-
-                                        hedge_tx.send((order_side, fill_size, fill_id)).await.ok();
-                                    }
                                 }
                             }
                         }
