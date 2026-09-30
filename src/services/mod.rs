@@ -33,9 +33,7 @@ use crate::strategy::OrderSide;
 /// The maker leg comes from `MakerExchange::position` (already signed: +long /
 /// -short); Hyperliquid's `szi` is already signed. Shared by the reconciler,
 /// safety monitor, hedge executor, and shutdown path so every exposure decision
-/// uses the same sign convention. The maker and taker may use different symbol
-/// tickers; pass the maker symbol here (taker symbol handled by the caller until
-/// the symbol split lands).
+/// uses the same sign convention.
 pub async fn signed_positions(
     maker: &dyn MakerExchange,
     hyperliquid: &HyperliquidTrading,

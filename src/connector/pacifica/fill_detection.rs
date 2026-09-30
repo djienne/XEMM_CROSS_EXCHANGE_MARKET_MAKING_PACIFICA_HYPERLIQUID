@@ -16,18 +16,12 @@ use super::types::{AccountOrderUpdatesSubscribe, FillEvent, OrderUpdate, PingMes
 pub struct FillDetectionConfig {
     /// Account address to monitor
     pub account: String,
-    /// Maximum number of CONSECUTIVE failed reconnection attempts before
-    /// giving up; a connection that stays up for `HEALTHY_CONNECTION_UPTIME`
-    /// resets the budget. `None` = retry forever (the production setting: the
-    /// fill stream is fail-closed and supervised, so exhausting reconnects
-    /// would permanently halt quoting until a manual restart).
-    pub max_attempts: Option<u32>,
     /// Ping interval in seconds
     pub ping_interval_secs: u64,
 }
 
 /// A connection that survives this long is "healthy": it resets the reconnect
-/// budget so only consecutive rapid failures count toward `max_attempts`.
+/// backoff so only consecutive rapid failures grow it.
 const HEALTHY_CONNECTION_UPTIME: Duration = Duration::from_secs(10);
 
 /// Async hook invoked on every successful (re)connect so the caller can
@@ -85,13 +79,11 @@ impl FillDetectionClient {
         *self.reconcile_hook.lock() = Some(hook);
     }
 
-    /// Start the fill detection client with a callback for fill events
+    /// Start the fill detection client with a callback for fill events.
     ///
-    /// There is no legitimate "graceful permanent close" for an account-stream
-    /// subscriber: a server-initiated close or stream end is treated as a
-    /// reconnect trigger, exactly like an error. A connection that lives at
-    /// least `HEALTHY_CONNECTION_UPTIME` resets the attempt budget so only
-    /// consecutive rapid failures can exhaust `max_attempts`.
+    /// Reconnects forever: the fill stream is fail-closed, so giving up would
+    /// halt quoting until a manual restart. A server close or stream end is a
+    /// reconnect trigger, exactly like an error.
     ///
     /// # Arguments
     /// * `callback` - Function called for each fill event (partial fill, full fill, cancellation)
@@ -103,10 +95,7 @@ impl FillDetectionClient {
 
         loop {
             attempt = attempt.saturating_add(1);
-            match self.config.max_attempts {
-                Some(max) => info!("Fill detection attempt {}/{}", attempt, max),
-                None => info!("Fill detection attempt {} (unbounded)", attempt),
-            }
+            info!("Fill detection attempt {}", attempt);
 
             let connected_at = Instant::now();
             match self.connect_and_run(&mut callback).await {
@@ -121,16 +110,6 @@ impl FillDetectionClient {
 
             if connected_at.elapsed() >= HEALTHY_CONNECTION_UPTIME {
                 attempt = 0;
-            }
-
-            if let Some(max) = self.config.max_attempts {
-                if attempt >= max {
-                    error!("Max consecutive fill-detection reconnection attempts reached");
-                    anyhow::bail!(
-                        "fill detection exhausted {} consecutive reconnect attempts",
-                        max
-                    );
-                }
             }
 
             // Fast first reconnect (1s), then exponential backoff, capped at 30s

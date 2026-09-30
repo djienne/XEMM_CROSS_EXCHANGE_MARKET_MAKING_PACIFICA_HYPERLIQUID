@@ -43,7 +43,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(writer)
-        .with_ansi(true)
         .init();
 
     // Create and initialize bot (all wiring happens in XemmBot::new())

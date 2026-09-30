@@ -6,7 +6,6 @@
 //! and is constructed separately in `app.rs`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -51,10 +50,7 @@ pub fn build_maker(config: &Config, credentials: &PacificaCredentials) -> Result
         PacificaTrading::new(credentials.clone())
             .context("Failed to create Pacifica trading client")?,
     );
-    let pacifica_ws_trading = Arc::new(
-        PacificaWsTrading::new(credentials.clone(), false) // false = mainnet
-            .with_request_timeout(Duration::from_millis(config.pacifica_ws_request_timeout_ms)),
-    );
+    let pacifica_ws_trading = Arc::new(PacificaWsTrading::new(credentials.clone(), false)); // false = mainnet
     let maker: Arc<dyn MakerExchange> = Arc::new(PacificaMaker::new(
         pacifica_trading.clone(),
         pacifica_ws_trading.clone(),
@@ -65,11 +61,6 @@ pub fn build_maker(config: &Config, credentials: &PacificaCredentials) -> Result
     // so building it here (rather than later in `run`) is behavior-preserving.
     let fill_config = FillDetectionConfig {
         account: credentials.account.clone(),
-        // Unbounded: the fill stream is fail-closed (a permanent exit latches
-        // ServiceDown and halts quoting until manual restart), so it must keep
-        // reconnecting; FillWsDown gates quoting during gaps and the reconcile
-        // hook replays fills missed while disconnected.
-        max_attempts: None,
         ping_interval_secs: config.ping_interval_secs,
     };
     let fill_client = FillDetectionClient::new(fill_config, false)

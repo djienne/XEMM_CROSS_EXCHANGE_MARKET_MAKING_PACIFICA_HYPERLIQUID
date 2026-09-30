@@ -239,7 +239,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
   `panic = "abort"` in `[profile.release]`). Both supervisors detect task
   panics via `JoinError` to drive the fail-closed `ServiceDown` latch and the
   restart-with-backoff logic; abort would bypass that entire safety design.
-- **The fill WebSocket reconnects forever** (`max_attempts: None` internally).
+- **The fill WebSocket reconnects forever**.
   A healthy connection (≥10s uptime) resets the attempt budget; server-side
   closes are reconnect triggers, never a permanent stop. Quoting is gated by
   `FillWsDown` during gaps and the reconcile hook replays missed fills on
@@ -274,7 +274,6 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
 | `hyperliquid_use_ws_for_hedge` | true | Use WebSocket for hedge execution (faster) vs REST |
 | `pacifica_rest_poll_interval_secs` | 2 | REST API fallback polling interval in seconds |
-| `pacifica_ws_request_timeout_ms` | 2000 | Pacifica trading-WS request/response timeout (placement is post-only, so tighter is safe) |
 | `shutdown_drain_timeout_secs` | 5 | How long shutdown waits for in-flight hedges to drain |
 
 ## Trading Workflow

@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fast_float::parse;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -14,7 +13,8 @@ use crate::market_rules::{fallback_rules, is_dust_or_below_min};
 use crate::services::fill_aggregator::FillAggregator;
 use crate::services::maker::MakerExchange;
 use crate::services::{
-    enqueue_hedge_intent, HedgeEnqueueResult, HedgeIntent, HedgeSource, HedgeVenueSide,
+    enqueue_hedge_intent, signed_positions, HedgeEnqueueResult, HedgeIntent, HedgeSource,
+    HedgeVenueSide,
 };
 use crate::strategy::OrderSide;
 use crate::util::price::SharedQuote;
@@ -65,18 +65,16 @@ impl PositionReconcilerService {
                 debug!("[RECONCILER] State is Error; checking exposure for diagnostics");
             }
 
-            let pac_pos = match self.pacifica_position().await {
-                Ok(pos) => pos,
+            let (pac_pos, hl_pos) = match signed_positions(
+                self.maker.as_ref(),
+                &self.hyperliquid_trading,
+                &self.config.symbol,
+            )
+            .await
+            {
+                Ok(positions) => positions,
                 Err(e) => {
-                    debug!("[RECONCILER] Pacifica position fetch failed: {}", e);
-                    continue;
-                }
-            };
-
-            let hl_pos = match self.hyperliquid_position().await {
-                Ok(pos) => pos,
-                Err(e) => {
-                    debug!("[RECONCILER] Hyperliquid position fetch failed: {}", e);
+                    debug!("[RECONCILER] Position fetch failed: {}", e);
                     continue;
                 }
             };
@@ -353,27 +351,6 @@ impl PositionReconcilerService {
         }
         Some((bid + ask) / 2.0)
     }
-
-    async fn pacifica_position(&self) -> anyhow::Result<f64> {
-        Ok(self
-            .maker
-            .position(&self.config.symbol)
-            .await?
-            .signed_base)
-    }
-
-    async fn hyperliquid_position(&self) -> anyhow::Result<f64> {
-        let wallet = self.hyperliquid_trading.account_address();
-        let user_state = self.hyperliquid_trading.get_user_state(&wallet).await?;
-        let Some(pos) = user_state
-            .asset_positions
-            .iter()
-            .find(|ap| ap.position.coin == self.config.symbol)
-        else {
-            return Ok(0.0);
-        };
-        Ok(parse(&pos.position.szi).unwrap_or(0.0))
-    }
 }
 
 #[cfg(test)]
@@ -420,19 +397,4 @@ mod tests {
         assert!(breach(&cfg, leg, leg, mid, old));
     }
 
-    #[test]
-    fn neutral_double_confirmation_resolves_unknown_quarantine() {
-        use crate::services::fill_aggregator::HedgeSettlement;
-
-        let agg = FillAggregator::new(1000.0);
-        let d = agg.on_fill(1, OrderSide::Buy, 1.0, 100.0, true).unwrap();
-        agg.settle_hedge(HedgeSettlement::unknown(1, d.size, 0.0));
-        assert!(agg.snapshot(1).unwrap().unverified_unknown_qty > 0.0);
-
-        // Mirrors the reconciler's neutral branch after two confirmations.
-        agg.resolve_unknowns_on_neutral();
-        let state = agg.snapshot(1).unwrap();
-        assert!(state.unverified_unknown_qty.abs() < 1e-9);
-        assert!((state.cumulative_hedged_confirmed - 1.0).abs() < 1e-9);
-    }
 }

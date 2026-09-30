@@ -258,7 +258,6 @@ async fn main() -> Result<()> {
 
     let fill_config = FillDetectionConfig {
         account: pacifica_creds.account.clone(),
-        max_attempts: Some(3),
         ping_interval_secs: 15,
     };
 

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -13,7 +13,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::trading::canonicalize_json;
+use super::trading::{cached_signing_key, canonicalize_json};
 use crate::connector::pacifica::trading::{OrderData, OrderSide, SIGNED_EXPIRY_WINDOW_MS};
 use crate::connector::pacifica::PacificaCredentials;
 use crate::market_rules::{pacifica_maker_price_for_is_buy, pacifica_size_floor};
@@ -38,8 +38,6 @@ pub struct PacificaWsTrading {
     /// Ed25519 key decoded once; previously every order/cancel re-decoded the
     /// bs58 private key and re-derived the key (SHA-512 expansion) per call.
     signing_key: OnceLock<SigningKey>,
-    /// Per-request response timeout (see `with_request_timeout`).
-    request_timeout: Duration,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<String>,
     pending: PendingMap,
     connected: Arc<AtomicBool>,
@@ -70,44 +68,14 @@ impl PacificaWsTrading {
         Self {
             credentials,
             signing_key: OnceLock::new(),
-            request_timeout: REQUEST_TIMEOUT,
             outbound_tx,
             pending,
             connected,
         }
     }
 
-    /// Override the request/response round-trip timeout (default 2s).
-    /// Placement is post-only, so a tighter timeout is safe: an abandoned
-    /// request falls into the PlacementUnknown recovery path, which verifies
-    /// via open-orders/trade-history and adopts or clears the order.
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
-        self
-    }
-
-    /// Lazily decode and cache the Ed25519 signing key.
     fn signing_key(&self) -> Result<&SigningKey> {
-        if let Some(key) = self.signing_key.get() {
-            return Ok(key);
-        }
-        let private_key_bytes = bs58::decode(&self.credentials.private_key)
-            .into_vec()
-            .context("Failed to decode private key")?;
-        if private_key_bytes.len() != 64 {
-            anyhow::bail!(
-                "Invalid private key length: expected 64 bytes, got {}",
-                private_key_bytes.len()
-            );
-        }
-        let seed_bytes: [u8; 32] = private_key_bytes[0..32]
-            .try_into()
-            .context("Failed to extract 32-byte seed")?;
-        let _ = self.signing_key.set(SigningKey::from_bytes(&seed_bytes));
-        Ok(self
-            .signing_key
-            .get()
-            .expect("signing key initialized above"))
+        cached_signing_key(&self.signing_key, &self.credentials.private_key)
     }
 
     /// Returns true if the underlying WebSocket is currently connected.
@@ -305,7 +273,7 @@ impl PacificaWsTrading {
             anyhow::bail!("Pacifica WS outbound channel closed");
         }
 
-        match timeout(self.request_timeout, rx).await {
+        match timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => {
                 self.pending.lock().remove(&request_id);
@@ -315,7 +283,7 @@ impl PacificaWsTrading {
                 self.pending.lock().remove(&request_id);
                 anyhow::bail!(
                     "Pacifica WS request timed out after {:?}",
-                    self.request_timeout
+                    REQUEST_TIMEOUT
                 )
             }
         }

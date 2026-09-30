@@ -240,7 +240,7 @@ impl HedgeService {
             // plus a non-blocking try_send (the cancel manager does the actual
             // I/O), so it runs inline - no spawn needed.
             if !self.config.low_latency_mode {
-                info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
+                info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders...",
                     tag(&self.config.symbol, "HEDGE", Color::BrightMagenta),
                     "FAST".yellow().bold()
                 );

@@ -251,30 +251,8 @@ impl PacificaTrading {
         })
     }
 
-    /// Lazily decode and cache the Ed25519 signing key.
     fn signing_key(&self) -> Result<&SigningKey> {
-        if let Some(key) = self.signing_key.get() {
-            return Ok(key);
-        }
-        let private_key_bytes = bs58::decode(&self.credentials.private_key)
-            .into_vec()
-            .context("Failed to decode private key")?;
-        // Solana/Pacifica private keys are 64 bytes (32 bytes seed + 32 bytes
-        // public key); Ed25519 SigningKey needs only the seed.
-        if private_key_bytes.len() != 64 {
-            anyhow::bail!(
-                "Invalid private key length: expected 64 bytes, got {}",
-                private_key_bytes.len()
-            );
-        }
-        let seed_bytes: [u8; 32] = private_key_bytes[0..32]
-            .try_into()
-            .context("Failed to extract seed from private key")?;
-        let _ = self.signing_key.set(SigningKey::from_bytes(&seed_bytes));
-        Ok(self
-            .signing_key
-            .get()
-            .expect("signing key initialized above"))
+        cached_signing_key(&self.signing_key, &self.credentials.private_key)
     }
 
     /// Fetch market info for all symbols
@@ -1101,6 +1079,27 @@ impl PacificaTrading {
 
         Ok(position_response.data.unwrap_or_default())
     }
+}
+
+/// Decode the bs58 Solana/Pacifica private key (32-byte seed + 32-byte public
+/// key) into an Ed25519 signing key once, caching it in `cell`.
+pub(crate) fn cached_signing_key<'a>(
+    cell: &'a OnceLock<SigningKey>,
+    private_key: &str,
+) -> Result<&'a SigningKey> {
+    if let Some(key) = cell.get() {
+        return Ok(key);
+    }
+    let bytes = bs58::decode(private_key)
+        .into_vec()
+        .context("Failed to decode private key")?;
+    if bytes.len() != 64 {
+        anyhow::bail!("Invalid private key length: expected 64 bytes, got {}", bytes.len());
+    }
+    let seed: [u8; 32] = bytes[0..32]
+        .try_into()
+        .context("Failed to extract seed from private key")?;
+    Ok(cell.get_or_init(|| SigningKey::from_bytes(&seed)))
 }
 
 /// Canonicalize JSON by sorting keys alphabetically
