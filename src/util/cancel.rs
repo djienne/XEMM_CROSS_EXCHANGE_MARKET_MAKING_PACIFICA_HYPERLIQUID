@@ -1,43 +1,28 @@
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
 use anyhow::Result;
 
-/// Performs dual cancellation (REST + WebSocket) for redundancy
+/// Cancel all `symbol` orders via REST and WebSocket concurrently (redundancy).
 ///
-/// This function attempts to cancel orders via both REST API and WebSocket
-/// to maximize the chance of successful cancellation. Both methods are attempted
-/// regardless of individual failures.
-///
-/// # Arguments
-/// * `rest` - REST API trading client
-/// * `ws` - WebSocket trading client
-/// * `symbol` - Symbol to cancel orders for
-///
-/// # Returns
-/// * `Ok((rest_count, ws_count))` - Number of orders cancelled by each method
+/// Returns `(rest_count, ws_count)`; a failed leg logs and counts 0. Errors only
+/// when BOTH legs fail, so callers can tell "both transports failed" apart from
+/// "nothing to cancel".
 pub async fn dual_cancel(
     rest: &PacificaTrading,
     ws: &PacificaWsTrading,
     symbol: &str,
 ) -> Result<(u32, u32)> {
-    let rest_cancel = rest.cancel_all_orders(false, Some(symbol), false);
-    let ws_cancel = ws.cancel_all_orders_ws(false, Some(symbol), false);
-    let (rest_result, ws_result) = tokio::join!(rest_cancel, ws_cancel);
-
-    let rest_count = match rest_result {
-        Ok(count) => count,
-        Err(e) => {
-            tracing::warn!("REST cancel_all_orders failed: {}", e);
+    let (rest_result, ws_result) = tokio::join!(
+        rest.cancel_all_orders(false, Some(symbol), false),
+        ws.cancel_all_orders_ws(false, Some(symbol), false)
+    );
+    if let (Err(r), Err(w)) = (&rest_result, &ws_result) {
+        anyhow::bail!("REST and WS cancel_all both failed: {}; {}", r, w);
+    }
+    let count = |res: Result<u32>, leg: &str| {
+        res.unwrap_or_else(|e| {
+            tracing::warn!("{} cancel_all failed: {}", leg, e);
             0
-        }
+        })
     };
-
-    let ws_count = match ws_result {
-        Ok(count) => count,
-        Err(e) => {
-            tracing::warn!("WS cancel_all_orders_ws failed: {}", e);
-            0
-        }
-    };
-
-    Ok((rest_count, ws_count))
+    Ok((count(rest_result, "REST"), count(ws_result, "WS")))
 }

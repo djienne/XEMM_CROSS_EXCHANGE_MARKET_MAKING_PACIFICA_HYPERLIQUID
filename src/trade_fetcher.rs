@@ -11,7 +11,7 @@ use crate::connector::hyperliquid::types::UserFill;
 use crate::connector::pacifica::trading::{PacificaTrading, TradeHistoryItem};
 
 /// Result of fetching trade data from an exchange
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TradeFetchResult {
     pub fill_price: Option<f64>,
     pub actual_fee: Option<f64>,

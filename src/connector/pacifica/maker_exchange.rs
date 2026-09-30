@@ -80,11 +80,12 @@ fn ack_from_order_data(d: OrderData) -> MakerOrderAck {
     }
 }
 
-/// Normalize an open order; `None` (skipped) on an unrecognized side string,
-/// matching the existing reconcile-hook behaviour.
-fn open_order_from(o: OpenOrderItem) -> Option<MakerOpenOrder> {
-    let side = side_from_str(&o.side)?;
-    Some(MakerOpenOrder {
+/// Normalize an open order. An unrecognized side is an error, not a skipped
+/// row: dropping it would make open-order safety checks see "no order".
+fn open_order_from(o: OpenOrderItem) -> Result<MakerOpenOrder> {
+    let side = side_from_str(&o.side)
+        .with_context(|| format!("unknown open-order side '{}'", o.side))?;
+    Ok(MakerOpenOrder {
         order_id: o.order_id,
         client_order_id: o.client_order_id,
         symbol: o.symbol,
@@ -347,14 +348,14 @@ impl MakerExchange for PacificaMaker {
         let orders = self.rest.get_open_orders().await?;
         // Map each order's wire symbol back to the canonical one so the services
         // (which compare against the canonical `config.symbol`) still match.
-        Ok(orders
+        orders
             .into_iter()
-            .filter_map(open_order_from)
-            .map(|mut o| {
+            .map(|o| {
+                let mut o = open_order_from(o)?;
                 o.symbol = self.symbols.to_canonical(&o.symbol);
-                o
+                Ok(o)
             })
-            .collect())
+            .collect()
     }
 
     async fn position(&self, symbol: &str) -> Result<MakerPosition> {
@@ -387,20 +388,14 @@ impl MakerExchange for PacificaMaker {
         client_order_id: &str,
         max_attempts: u32,
     ) -> MakerFillSummary {
-        let r = crate::trade_fetcher::fetch_pacifica_trade(
+        crate::trade_fetcher::fetch_pacifica_trade(
             self.rest.clone(),
             self.symbols.to_wire(symbol),
             client_order_id,
             max_attempts,
-            |_| {},
+            |msg| tracing::info!("[PACIFICA] {}", msg),
         )
-        .await;
-        MakerFillSummary {
-            fill_price: r.fill_price,
-            actual_fee: r.actual_fee,
-            total_size: r.total_size,
-            total_notional: r.total_notional,
-        }
+        .await
     }
 }
 
@@ -458,10 +453,9 @@ impl MakerFillStream for PacificaFillStream {
 
     async fn run_with(&mut self, mut cb: MakerFillCallback) -> Result<()> {
         self.client
-            .start(move |fe| {
-                if let Some(mfe) = maker_fill_event_from(fe) {
-                    cb(mfe);
-                }
+            .start(move |fe| match maker_fill_event_from(fe) {
+                Some(mfe) => cb(mfe),
+                None => tracing::error!("[PACIFICA] Fill event with unknown side dropped (not hedged)"),
             })
             .await
     }
@@ -530,8 +524,8 @@ mod tests {
         assert_eq!(o.filled_amount, 0.5);
 
         assert_eq!(open_order_from(open_order("ask")).unwrap().side, OrderSide::Sell);
-        // Unknown side is dropped (skipped), never mis-hedged.
-        assert!(open_order_from(open_order("weird")).is_none());
+        // Unknown side fails the whole read (fail closed), never silently dropped.
+        assert!(open_order_from(open_order("BID")).is_err());
     }
 
     #[test]

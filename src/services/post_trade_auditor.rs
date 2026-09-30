@@ -117,24 +117,13 @@ impl PostTradeAuditorService {
         &self,
         event: &PostTradeAuditEvent,
     ) -> trade_fetcher::TradeFetchResult {
-        if let Some(cloid) = &event.client_order_id {
-            let s = self
-                .maker
-                .maker_fill_summary(&self.config.symbol, cloid, 3)
-                .await;
-            trade_fetcher::TradeFetchResult {
-                fill_price: s.fill_price,
-                actual_fee: s.actual_fee,
-                total_size: s.total_size,
-                total_notional: s.total_notional,
+        match &event.client_order_id {
+            Some(cloid) => {
+                self.maker
+                    .maker_fill_summary(&self.config.symbol, cloid, 3)
+                    .await
             }
-        } else {
-            trade_fetcher::TradeFetchResult {
-                fill_price: None,
-                actual_fee: None,
-                total_size: None,
-                total_notional: None,
-            }
+            None => Default::default(),
         }
     }
 

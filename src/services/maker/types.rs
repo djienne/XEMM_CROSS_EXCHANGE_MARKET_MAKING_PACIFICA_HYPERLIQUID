@@ -75,16 +75,8 @@ pub struct MakerTrade {
     pub created_at: u64,
 }
 
-/// Weighted fill summary for one client order id (mirrors the connector-level
-/// `TradeFetchResult`): encapsulates any venue-specific maker/taker filtering
-/// and multi-fill weighting so callers get a single rolled-up result.
-#[derive(Debug, Clone, Default)]
-pub struct MakerFillSummary {
-    pub fill_price: Option<f64>,
-    pub actual_fee: Option<f64>,
-    pub total_size: Option<f64>,
-    pub total_notional: Option<f64>,
-}
+/// Weighted fill summary for one client order id.
+pub use crate::trade_fetcher::TradeFetchResult as MakerFillSummary;
 
 /// Normalized fill / order-lifecycle event emitted by a [`super::MakerFillStream`].
 ///

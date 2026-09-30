@@ -213,8 +213,7 @@ impl PacificaWsTrading {
     /// Cancel all orders via WebSocket. Returns the number of orders cancelled.
     ///
     /// Uses the long-lived connection established by `new()`. If the socket is
-    /// currently down, returns an error so the caller (dual_cancel) can fall
-    /// back to REST.
+    /// currently down, returns an error (dual_cancel runs REST concurrently).
     pub async fn cancel_all_orders_ws(
         &self,
         all_symbols: bool,
